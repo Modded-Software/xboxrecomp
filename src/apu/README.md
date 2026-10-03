@@ -9,11 +9,11 @@ Hardware emulation of the Xbox's MCPX APU (Audio Processing Unit), extracted fro
 Audio output uses Windows XAudio2, with `waveOut` as a fallback, at 48kHz
 stereo 16-bit.
 
-## Output and DMA integration
+## Output and DMA Integration
 
-Ghost uses `mcpx_apu_init_standalone_mapped` with the contiguous-bank base and
-`xbox_DmaPhysicalPointer`. Voice/descriptor allocations normally occupy that
-bank, but payloads can occupy ordinary low RAM. `MmGetPhysicalAddress` records
+For separate memory banks, use `mcpx_apu_init_standalone_mapped` with the
+contiguous-bank base and `xbox_DmaPhysicalPointer`. Voice/descriptor allocations
+normally occupy that bank, but payloads can occupy ordinary low RAM. `MmGetPhysicalAddress` records
 page provenance so the resolver selects the correct, separate storage for
 physical reads/writes, streaming ADPCM copies and diagnostic acknowledgements.
 Invalid or mixed-bank extents are reported instead of reading unrelated data.
@@ -44,7 +44,7 @@ correct DMA mapping, effects fidelity or a complete soundtrack.
 GP/EP remain passthrough stubs; the AC97-ready/DSP-ack bring-up overrides are
 not DSP56300 emulation.
 
-### Diagnostic DSP command completion
+### Diagnostic DSP Command Completion
 
 `RECOMP_APU_DSP_ACK` accepts comma-separated aligned physical addresses,
 `gp:<byte offset>` or `ep:<byte offset>`. The processor-relative forms resolve
@@ -52,24 +52,21 @@ through the programmed scratch scatter/gather table (`GPSADDR`/`EPSADDR`),
 with its SGE limit checked before accessing the selected page. These registers
 point to tables, not directly to the command buffer.
 
-Ghost defaults to `RECOMP_APU_DSP_ACK=gp:0x810` only when neither that setting
-nor the legacy `RECOMP_DSP_ACK` was supplied. An explicitly empty setting
-disables this acknowledgement. The old fixed mailbox at guest `0x80C30810`
-became stale after USB callback recovery changed allocation order; the command
-word moved to `0x80C38810`, leaving audio initialization spinning and preventing
-rendering. SG-relative addressing follows the actual allocation instead.
+An unset or empty `RECOMP_APU_DSP_ACK` disables acknowledgement. Command offsets are
+title-specific; do not assume a universal mailbox address. Fixed guest
+addresses can become stale when allocation order changes, while SG-relative
+addressing follows the programmed allocation.
 
 Diagnostic command acknowledgement runs in the regular APU frame loop after
-throttling, independently of voice-front-end execution. Keeping it inside the
-voice-gated DSP slice left Ghost's level-loading audio worker spinning on the
-mailbox while holding the XACT lock when voice processing stopped. Emulator
-pause still suspends frame servicing. This scheduling repair does not add DSP
-instruction execution.
+throttling, independently of voice-front-end execution. Gating it on voice
+processing can deadlock a guest audio worker polling the mailbox while holding
+a lock after voices stop. Emulator pause still suspends frame servicing.
+Acknowledgement scheduling does not add DSP instruction execution.
 
 This mode explicitly logs **diagnostic passthrough** and clears command words
 without executing their DSP programs. It does not implement effects or prove
-correct command results. The user confirmed audible intro-movie sound;
-sustained menu/gameplay sound and the complete soundtrack remain unverified.
+correct command results. Validate sustained output, DMA mapping and DSP behavior
+separately; audible samples alone do not establish complete audio compatibility.
 
 ## Files
 

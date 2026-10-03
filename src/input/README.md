@@ -2,12 +2,12 @@
 
 Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGetState` with a slightly different structure layout than the XInput API on Windows. This layer translates between them.
 
-## Ghost's hardware input path
+## Hardware Input Integration
 
-Ghost runs its statically linked Xbox XAPI driver, rather than calling these
-host wrappers directly. Its startup initializes the host input layer and the
-OHCI model after the kernel bridge. Its fault handler routes USB-register
-accesses to OHCI. The path is:
+Games with statically linked Xbox XAPI drivers can access input through the
+OHCI model rather than calling the host wrappers directly. Initialize the host
+input layer and OHCI after the kernel bridge, and route trapped USB-register
+accesses through the fault handler:
 
 ```text
 guest XAPI -> OHCI registers/interrupts -> Controller S XID report -> host XInput
@@ -19,16 +19,12 @@ translation provenance, and the DMA resolver selects the corresponding bank.
 The banks are separate storage, not aliases. This is a bring-up translation
 model, not a general solution for overlapping physical offsets.
 
-Ghost's USB class registry contains callbacks that seeded function discovery
-missed. `Ghost/tools/recover_usb_callbacks.py` translates eight bounded original
-SDK functions into a separate generated file and registers them through the
-manual dispatch. These are real initialization/AddDevice/RemoveDevice bodies
-and XID report parsers, not replacements that fabricate connected-device state.
-The report parsers at `0x0035D763` and `0x0035D7B5` are referenced by the XID
-type registry, not the USB class registry. Their external tail jumps preserve
-the caller's return stack; recovery permits only their verified existing
-target `0x001B858A`, rather than arbitrary branches outside the recovered body.
-The user confirmed working physical-controller input after this repair.
+Seeded function discovery can miss callbacks referenced by USB class and XID
+type registries. Ensure initialization, AddDevice/RemoveDevice and report-parser
+functions are translated and reachable through dispatch. If callback recovery
+is needed, validate registry membership, instruction boundaries and external
+tail-call targets. Preserve the caller's return stack rather than substituting
+connected-device or input-processing stubs.
 
 On Windows, Xbox ports enumerate the currently connected native XInput slots
 in ascending order. A single USB Xbox One controller in native slot 1, 2 or 3
@@ -37,8 +33,8 @@ capabilities, connectivity and direct API vibration use the same selection.
 Adding/removing a controller can renumber this compact port list. The OHCI
 model currently exposes one virtual gamepad, not four independent USB pads.
 
-Ghost defaults to `RECOMP_USB=1` and `RECOMP_USB_NDP=2` (root-hub ports, not
-controller count). `RECOMP_USB_PADS` was not consumed by the OHCI model.
+Use `RECOMP_USB=1` to enable the USB path. `RECOMP_USB_NDP` configures root-hub
+ports, not controller count. `RECOMP_USB_PADS` is not consumed by the OHCI model.
 For diagnostics, `RECOMP_USB_TRACE=1` traces enumeration and
 `RECOMP_INPUT_DIAG=1` reports host-to-XID button delivery. With no physical
 controller, `RECOMP_KEYBOARD=1` maps Enter to Start; this is a guest-path probe,
@@ -46,29 +42,22 @@ not proof of physical XInput acceptance.
 The input diagnostic prints the actual keyboard environment value, including
 `0`, rather than treating the presence of the variable as enablement.
 
-## Windows launcher and remapping
+## Input Configuration
 
-From the workspace root:
+Environment settings select automatic or fixed native slots, remap Xbox
+buttons, configure radial deadzones and stick transforms, and enable optional
+keyboard input. Set them before starting the game:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Ghost\launch.ps1
+$env:RECOMP_XINPUT_SLOT = 'auto'
+$env:RECOMP_INPUT_MAP = 'BLACK=RB,WHITE=LB'
+$env:RECOMP_INPUT_DEADZONE_LEFT = '8000'
 ```
 
-The WinForms launcher displays live XInput connections, selects an automatic
-or fixed native slot, remaps all sixteen Xbox buttons, and configures radial
-deadzones, stick swapping/inversion, and optional keyboard fallback. Menu maps
-to Start and View to Back. Its bundled Xbox One profile uses RB for Black and
-LB for White; change those dropdowns to reproduce the legacy mapping below.
-Face buttons/bumpers provide pressure 0 or 255, while triggers retain 0-255.
-There is no way to recover pressure-sensitive face buttons from Xbox One hardware.
-
-The bundled profile is `Ghost/input-profile.json`. Save writes a per-user
-profile to `%LOCALAPPDATA%\XboxRecomp\Ghost\input-profile.json`, not the bundled
-file. `-ConfigPath` selects another profile/save destination; `-ExecutablePath`
-selects another build. `-ValidateOnly` validates the JSON and prints the child
-environment without launching. `-NoUI` launches with the same profile, and
-`-Wait` additionally waits and returns the game's exit code. The launcher
-disables the diagnostic watchdog unless the parent explicitly supplied it.
+The example swaps the legacy Black/White bumper bindings. Menu maps to Start
+and View to Back. Face buttons and bumpers provide pressure 0 or 255, while
+triggers retain 0-255. Xbox One hardware cannot reproduce pressure-sensitive
+face buttons.
 
 Settings are parsed once by `xbox_InputInit`, shared by the direct and USB
 input paths, and rejected explicitly when malformed:
