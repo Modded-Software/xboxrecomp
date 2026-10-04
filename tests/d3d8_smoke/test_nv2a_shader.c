@@ -13,6 +13,7 @@ void nv2a_pb_exec_method(uint32_t subchannel, uint32_t method, uint32_t paramete
 void nv2a_pb_scan(uint32_t start_address, uint32_t end_address);
 
 static uint32_t memory[32768];
+static uint32_t nv2a_registers[0x1000000 / sizeof(uint32_t)];
 static int failures;
 uint32_t g_xbox_image_lo, g_xbox_image_hi;
 size_t g_xbox_total_ram = sizeof memory;
@@ -20,6 +21,40 @@ size_t g_xbox_map_size;
 
 ptrdiff_t xbox_GetMemoryOffset(void) { return (ptrdiff_t)memory; }
 uint32_t xbox_ContiguousAllocatedBytes(void) { return 0; }
+uint32_t xbox_ContiguousBlockSize(uint32_t guest_va)
+{
+    (void)guest_va;
+    return 0; /* The harness has no contiguous allocations. */
+}
+
+uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes)
+{
+    if (physical >= sizeof memory || bytes > sizeof memory - physical)
+        return NULL;
+    return (uint8_t *)memory + (size_t)physical;
+}
+
+volatile uint32_t *xbox_Nv2aRegisterPointer(uint32_t offset, uint32_t bytes)
+{
+    if ((offset & 3u) || offset >= sizeof nv2a_registers
+            || bytes > sizeof nv2a_registers - offset)
+        return NULL;
+    return nv2a_registers + offset / sizeof(uint32_t);
+}
+
+int xbox_Nv2aSoftwareMethod(uint32_t parameter, uint32_t depth_clear,
+                            uint32_t color_clear)
+{
+    fprintf(stderr, "Unexpected guest software method in shader harness: "
+            "0x%08X (depth=0x%08X, color=0x%08X)\n",
+            parameter, depth_clear, color_clear);
+    exit(EXIT_FAILURE);
+}
+
+void xbox_Nv2aSoftwareMethodReport(void)
+{
+    /* No guest software callbacks are registered by this harness. */
+}
 void xbox_FramebufferWindowSet(uint32_t address, uint32_t pitch) { (void)address; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowPresent(uint32_t address, uint32_t pitch) { (void)address; (void)pitch; }
@@ -1080,6 +1115,18 @@ int main(int argument_count, char **arguments)
     TestVertex *vertices = (TestVertex *)((uint8_t *)memory + 0x4000);
     const uint32_t attributes[] = {0, 3, 9, 10};
     uint32_t index, attribute;
+    check("DMA resolves harness memory",
+          xbox_DmaPhysicalPointer(0x1000, 4) == (uint8_t *)memory + 0x1000);
+    check("DMA rejects out-of-bounds span",
+          xbox_DmaPhysicalPointer(sizeof memory - 1, 4) == NULL);
+    check("DMA rejects overflowing address",
+          xbox_DmaPhysicalPointer(UINT64_MAX, 4) == NULL);
+    check("register aperture resolves DMA registers",
+          xbox_Nv2aRegisterPointer(0x800040, 8) == nv2a_registers + 0x800040 / 4);
+    check("register aperture rejects unaligned address",
+          xbox_Nv2aRegisterPointer(1, 4) == NULL);
+    check("register aperture rejects out-of-bounds span",
+          xbox_Nv2aRegisterPointer(sizeof nv2a_registers - 4, 8) == NULL);
     if (argument_count == 2 && !strncmp(arguments[1], "--pb-", 5)) return invalid_pushbuffer_case(arguments[1]);
     if (getenv("NV2A_GPU_DEPTH_ONLY")) {
         _putenv_s("RECOMP_GPU_EXPERIMENTAL_DEPTH", "1");
