@@ -124,7 +124,7 @@ struct Surface {
 
 struct CachedTexture {
     const uint8_t *source;
-    uint32_t width, height, format, cube, pitch, linear, face_stride;
+    uint32_t width, height, format, cube, pitch, linear, face_stride, depth;
     uint32_t mip_levels;
     uint64_t bytes;
     std::vector<uint8_t> source_snapshot;
@@ -930,8 +930,11 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
 {
     GpuTimer texture_timer(gpu_timing.texture);
     if (!binding.source || (binding.cube ? !binding.decode_face : !binding.decode) || !binding.width || !binding.height || binding.width > 4096 || binding.height > 4096) return nullptr;
+    if (binding.depth && (!binding.decode_volume || binding.cube ||
+        std::max({binding.width, binding.height, binding.depth}) > D3D11_REQ_TEXTURE3D_U_V_OR_W_DIMENSION)) return nullptr;
     uint32_t levels = binding.mip_levels ? binding.mip_levels : 1;
     uint32_t maximum_levels = 1, dimension = std::max(binding.width, binding.height);
+    dimension = std::max(dimension, binding.depth);
     while (dimension > 1) { dimension >>= 1; maximum_levels++; }
     if (levels > maximum_levels || (levels > 1 && (!binding.decode_level || binding.linear))) return nullptr;
     if (binding.cube && (binding.width != binding.height || !binding.face_stride ||
@@ -947,7 +950,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                          (const void *)surface.memory, surface.width, surface.height, surface.pitch);
             return nullptr;
         }
-        if (levels == 1 && !binding.cube && surface.memory == binding.source && surface.width == binding.width && surface.height == binding.height &&
+        if (levels == 1 && !binding.cube && !binding.depth && surface.memory == binding.source && surface.width == binding.width && surface.height == binding.height &&
             surface.pitch == binding.pitch && binding.linear && (binding.format == 0x12 || binding.format == 0x1E)) {
             refresh_surface(surface);
             return surface.view.Get();
@@ -964,7 +967,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         gpu_timing.hash_bytes += binding.source_bytes;
         for (auto &texture : textures)
             if (texture.source == binding.source && texture.width == binding.width && texture.height == binding.height &&
-                texture.format == binding.format && texture.cube == binding.cube && texture.pitch == binding.pitch &&
+                texture.format == binding.format && texture.cube == binding.cube && texture.depth == binding.depth && texture.pitch == binding.pitch &&
                 texture.linear == binding.linear && texture.face_stride == binding.face_stride &&
                 texture.mip_levels == levels &&
                 texture.source_snapshot.size() == binding.source_bytes) {
@@ -983,12 +986,17 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     if (compressed && (binding.width % 4 || binding.height % 4)) {
         compressed = false; format = DXGI_FORMAT_B8G8R8A8_UNORM;
     }
+    if (binding.depth) {
+        // D3D11 block-compressed resources are 2D; volumes need decoded texels.
+        compressed = false;
+        format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
     std::vector<std::vector<uint32_t>> pixels(faces * levels);
     std::vector<D3D11_SUBRESOURCE_DATA> data(faces * levels);
     uint64_t resource_bytes = 0;
     for (uint32_t face = 0; face < faces; face++) {
         uint64_t source_offset = (uint64_t)face * binding.face_stride;
-        uint32_t width = binding.width, height = binding.height;
+        uint32_t width = binding.width, height = binding.height, depth = binding.depth ? binding.depth : 1;
         for (uint32_t level = 0; level < levels; level++) {
             uint32_t subresource = face * levels + level;
             if (compressed) {
@@ -1002,20 +1010,25 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                 source_offset += level_bytes;
             } else {
                 auto &image = pixels[subresource];
-                image.resize((size_t)width * height);
-                for (uint32_t row = 0; row < height; row++)
+                image.resize((size_t)width * height * depth);
+                for (uint32_t slice = 0; slice < depth; slice++)
+                 for (uint32_t row = 0; row < height; row++)
                     for (uint32_t column = 0; column < width; column++) {
-                        uint32_t *pixel = &image[(size_t)row * width + column];
-                        bool decoded = binding.decode_level ? binding.decode_level(binding.decode_context, face, level, column, row, pixel) :
+                        uint32_t *pixel = &image[((size_t)slice * height + row) * width + column];
+                        bool decoded = binding.depth ? binding.decode_volume(binding.decode_context, level, column, row, slice, pixel) :
+                            binding.decode_level ? binding.decode_level(binding.decode_context, face, level, column, row, pixel) :
                             binding.cube ? binding.decode_face(binding.decode_context, face, column, row, pixel) :
                                            binding.decode(binding.decode_context, column, row, pixel);
                         if (!decoded) return nullptr;
+                        if (binding.depth) *pixel = (*pixel & 0xFF00FF00u) | ((*pixel & 255u) << 16) | ((*pixel >> 16) & 255u);
                     }
                 data[subresource].pSysMem = image.data(); data[subresource].SysMemPitch = width * 4;
-                resource_bytes += (uint64_t)width * height * 4;
+                data[subresource].SysMemSlicePitch = width * height * 4;
+                resource_bytes += (uint64_t)width * height * depth * 4;
             }
             if (width > 1) width >>= 1;
             if (height > 1) height >>= 1;
+            if (depth > 1) depth >>= 1;
         }
     }
     if (refresh) {
@@ -1023,7 +1036,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         refresh->view->GetResource(&resource);
         for (uint32_t subresource = 0; subresource < faces * levels; subresource++)
             context->UpdateSubresource(resource.Get(), subresource, nullptr,
-                                      data[subresource].pSysMem, data[subresource].SysMemPitch, 0);
+                                      data[subresource].pSysMem, data[subresource].SysMemPitch, data[subresource].SysMemSlicePitch);
         refresh->source_snapshot.assign(binding.source, binding.source + binding.source_bytes);
         gpu_timing.texture_updated++;
         gpu_timing.texture_update_bytes += resource_bytes;
@@ -1039,8 +1052,17 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     entry.source = binding.source; entry.width = binding.width; entry.height = binding.height; entry.format = binding.format;
     entry.pitch = binding.pitch; entry.linear = binding.linear; entry.face_stride = binding.face_stride;
     entry.cube = binding.cube;
+    entry.depth = binding.depth;
     entry.mip_levels = levels; entry.bytes = resource_bytes;
-    if (FAILED(device->CreateTexture2D(&description, data.data(), &texture)) ||
+    if (binding.depth) {
+        D3D11_TEXTURE3D_DESC volume_description = {};
+        volume_description.Width = binding.width; volume_description.Height = binding.height;
+        volume_description.Depth = binding.depth; volume_description.MipLevels = levels;
+        volume_description.Format = format; volume_description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture3D> volume;
+        if (FAILED(device->CreateTexture3D(&volume_description, data.data(), &volume)) ||
+            FAILED(device->CreateShaderResourceView(volume.Get(), nullptr, &entry.view))) return nullptr;
+    } else if (FAILED(device->CreateTexture2D(&description, data.data(), &texture)) ||
         FAILED(device->CreateShaderResourceView(texture.Get(), nullptr, &entry.view))) return nullptr;
     gpu_timing.texture_created++;
     entry.source_snapshot.assign(binding.source, binding.source + binding.source_bytes);
@@ -1480,7 +1502,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vert
         bool diffuse_reflection = mode == 11;
         bool reflection = diffuse_reflection || mode == 12 || mode == 14 || mode == 18;
         bool dot_stage = mode == 9 || mode == 17 || reflection;
-        if (mode != 0 && mode != 1 && mode != 3 && mode != 4 && mode != 5 && !dependent && !bump && !dot_stage) return reject("texture shader mode");
+        if (mode != 0 && mode != 1 && mode != 2 && mode != 3 && mode != 4 && mode != 5 && !dependent && !bump && !dot_stage) return reject("texture shader mode");
         if (dot_stage) {
             if ((mode == 17 && stage != 1 && stage != 2) || (mode == 9 && stage < 2)) return reject("dot texture stage");
             if (diffuse_reflection) {
@@ -1529,6 +1551,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vert
         if (!nv2a_gpu_texture_mode_samples(mode)) continue;
         const auto &binding = state->textures[stage];
         if (!nv2a_gpu_texture_enabled(&binding)) return reject("disabled texture used by sampling shader mode");
+        if ((mode == 2) != (binding.depth != 0) || (binding.depth && (binding.cube || binding.linear)))
+            return reject("projective volume texture dimensionality");
         uint32_t sign_mask = binding.filter >> 28;
         uint32_t key_mode = binding.control0_valid ? binding.control0 & 3u : 0;
         if (sign_mask && key_mode) return reject("signed-channel texture color-key ordering");
@@ -1548,7 +1572,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vert
         for (uint32_t vertex = 0; !dependent && !state->vertex_program && vertex < count; vertex++) {
             for (uint32_t component = 0; component < 4; component++)
                 if (!nv_cpu_finite(vertices[vertex].texture[stage][component])) return reject("nonfinite texture coordinate");
-            if (mode == 1 && vertices[vertex].texture[stage][3] == 0) return reject("zero projective texture coordinate");
+            if ((mode == 1 || mode == 2) && vertices[vertex].texture[stage][3] == 0) return reject("zero projective texture coordinate");
         }
         if (!binding.source_bytes) return reject("missing texture data");
         views[stage] = get_texture(binding, *surface);
@@ -1562,7 +1586,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vert
         constants.texture_key[stage][3] = sign_mask;
         constants.texture_info[stage][3] = (float)((binding.format == 0x1E ? 1u : 0u) | (binding.cube ? 2u : 0u) |
             (binding.address_u == 5 ? 4u : 0u) | (binding.address_v == 5 ? 8u : 0u) |
-            (binding.control0_valid && (binding.control0 & 4u) ? 16u : 0u));
+            (binding.control0_valid && (binding.control0 & 4u) ? 16u : 0u) |
+            (binding.address_w == 5 ? 32u : 0u));
         if (sign_mask) signed_texture_stages++;
         switch (binding.format) {
         case 0x01: case 0x16: case 0x17: case 0x1A: case 0x1B: case 0x20: case 0x28: case 0x29:
@@ -1618,9 +1643,9 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vert
     UINT stride = vertex_stride, offset = 0;
     ID3D11Buffer *buffers[] = {vertex_buffer.Get()}, *constants_buffer[] = {constant_buffer.Get()};
     ID3D11RenderTargetView *target = surface->target.Get();
-    ID3D11ShaderResourceView *resources[8] = {}; ID3D11SamplerState *sampler_states[4];
+    ID3D11ShaderResourceView *resources[12] = {}; ID3D11SamplerState *sampler_states[4];
     for (uint32_t stage = 0; stage < 4; stage++) {
-        resources[state->textures[stage].cube ? stage + 4 : stage] = views[stage].Get();
+        resources[state->textures[stage].depth ? stage + 8 : state->textures[stage].cube ? stage + 4 : stage] = views[stage].Get();
         sampler_states[stage] = samplers[stage].Get();
     }
     float blend_color[4]; nv_cpu_unpack_argb(state->blend_constant, blend_color);
@@ -1638,7 +1663,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vert
     context->PSSetShader(program, nullptr, 0);
     context->VSSetConstantBuffers(0, 1, constants_buffer); context->PSSetConstantBuffers(0, 1, constants_buffer);
     context->GSSetConstantBuffers(0, 1, constants_buffer);
-    context->PSSetShaderResources(0, 8, resources); context->PSSetSamplers(0, 4, sampler_states);
+    context->PSSetShaderResources(0, 12, resources); context->PSSetSamplers(0, 4, sampler_states);
     D3D11_VIEWPORT viewport = {0,0,(float)state->width,(float)state->height,0,1};
     D3D11_BOX region = {};
     region.left = clip.left > 0 ? (UINT)clip.left : 0;
@@ -1681,8 +1706,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vert
     bool stencil_writes = state->stencil_enable && (state->stencil_write_mask & 255u) &&
         (state->stencil_fail != 0x1E00 || state->stencil_depth_fail != 0x1E00 || state->stencil_pass != 0x1E00);
     if (depth && ((state->depth_enable && state->depth_mask) || stencil_writes) && writes) mark_written_region(*depth, region);
-    ID3D11ShaderResourceView *empty[8] = {};
-    context->PSSetShaderResources(0, 8, empty);
+    ID3D11ShaderResourceView *empty[12] = {};
+    context->PSSetShaderResources(0, 12, empty);
     return 1;
 }
 
