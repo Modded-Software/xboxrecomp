@@ -129,9 +129,14 @@ static void wr32(uint32_t va, uint32_t v);
  * kernel is slower than the console by a wide and variable margin, and the
  * section XAPI holds while it opens the gamepad's interrupt pipe overran it.
  * The interrupt then landed in the middle of that setup and the title faulted
- * on a half-built structure. Two seconds is still not forever -- a guest that
- * genuinely never lowers is still not allowed to switch the device off -- but
- * it is long enough that a slow critical section is not mistaken for one. */
+ * on a half-built structure.
+ *
+ * It now applies only until the pad's interrupt pipe is open
+ * (hc->pad_live). Holding past that is what killed input: the guest's IRQL is
+ * modelled per-processor but our guest threads run concurrently, so a
+ * mismatched save/restore can leave it raised, and every report would then be
+ * held off for the full two seconds -- which reads as input that arrives
+ * tens of seconds late. Opening is the only window that needed the grace. */
 #define OHCI_IRQ_HOLDOFF        500
 
 /* Milliseconds per pass of the controller thread, which is also how many USB
@@ -153,6 +158,10 @@ typedef struct {
     int      index;
     int      periodic_seen;
     int      ple_seen;
+    /* Set once the pad's interrupt endpoint has delivered a report, i.e. the
+     * interrupt pipe is open. The IRQL holdoff exists only to survive that
+     * opening; after it, a stuck guest IRQL must not gate the pad. */
+    int      pad_live;
     /* Bumped every time the driver writes HcInterruptStatus. The interrupt
      * thread watches it to tell a source nobody is servicing from one that
      * is simply busy -- see the delivery loop. */
@@ -564,6 +573,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             /* The pad's report, on its interrupt endpoint. */
             uint8_t rep[32];
             int n = usb_gamepad_report(rep, (int)sizeof rep);
+            hc->pad_live = 1;   /* pipe open: the IRQL holdoff is over */
             if (n > len) n = len;
             if (n > 0) {
                 uint8_t *p = xbox_DmaPhysicalPointer(cbp, (uint32_t)n);
@@ -573,8 +583,13 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             moved = n;
         }
     } else {
-        /* OUT: the status stage of an IN control transfer, or rumble. Both
-         * are accepted and discarded. */
+        /* OUT: the status stage of an IN control transfer, or a report on the
+         * pad's interrupt endpoint (rumble). Endpoint 0 is the control pipe;
+         * anything else is the device, so hand it the bytes. */
+        if (endpoint != 0 && len > 0) {
+            const uint8_t *p = xbox_DmaPhysicalPointer(cbp, (uint32_t)len);
+            if (p) usb_gamepad_output(p, len);
+        }
         moved = len;
         g_setup_pending = 0;
     }
@@ -753,7 +768,26 @@ static int ohci_call_isr(OhciController *hc)
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
 
-    fn();
+    /*
+     * Hardware runs an ISR at DISPATCH_LEVEL, and the guest's own raise/lower
+     * bookkeeping assumes that baseline: the OHCI driver's transfer-queue
+     * routine lowers back to the level it was entered at. Entering at IRQL 0
+     * made that a lower-to-a-higher-level, which our IRQL model counts as a
+     * stuck raise, so the guest TIB byte at fs:[0x24] (what KeGetCurrentIrql
+     * and the CRT's getptd read) stayed >= DISPATCH and getptd took its
+     * KeBugCheck(0xA) path tens of thousands of times a boot. Raise the host
+     * TLS level and mirror it into the guest TIB across the call, and restore
+     * both afterwards.
+     */
+    {
+        KIRQL saved_irql = xbox_KfRaiseIrql(DISPATCH_LEVEL);
+        *(uint8_t *)(mem + g_fs_base + XBOX_KPCR_IRQL_OFFSET) = DISPATCH_LEVEL;
+
+        fn();
+
+        *(uint8_t *)(mem + g_fs_base + XBOX_KPCR_IRQL_OFFSET) = (uint8_t)saved_irql;
+        xbox_KfLowerIrql(saved_irql);
+    }
 
     xbox_worker_stack_free(slot);
     return (int)(g_eax & 1u);
@@ -1025,7 +1059,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * asserted anyway. The common case still holds the ISR out of the
          * guest's critical section; the pathological case costs a delay
          * instead of the device. */
-        if (xbox_IrqlBlocksInterrupts() && ++held_off <= OHCI_IRQ_HOLDOFF) {
+        if (!hc->pad_live && xbox_IrqlBlocksInterrupts()
+                && ++held_off <= OHCI_IRQ_HOLDOFF) {
             if (!held_off_warned) {
                 held_off_warned = 1;
                 fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "

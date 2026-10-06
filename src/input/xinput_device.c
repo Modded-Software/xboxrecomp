@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 /* ======================================================================== */
 #if defined(_WIN32)
@@ -222,6 +223,212 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     pState->dwPacketNumber = ++packet;
 }
 
+/* ---- keyboard + mouse (RECOMP_KBM) ---------------------------------------
+ *
+ * A playing control scheme rather than the RECOMP_KEYBOARD bring-up probe:
+ * WASD moves, the mouse aims, and the triggers land on the mouse buttons.
+ * Enabled by RECOMP_KBM (set by the game's --kbm flag), port 0 only, and
+ * merged on top of a pad like the probe so a controller keeps working.
+ *
+ * Mouse movement is read as a per-frame velocity: the right stick deflects in
+ * proportion to how far the mouse moved since the last poll and centres the
+ * moment it stops, which is how a stick-driven camera expects to be steered.
+ * The window clips and recentres the cursor while this is on (see
+ * xbox_FramebufferMouseCapture), so motion never runs into a screen edge.
+ */
+extern int xbox_FramebufferMouseDelta(int *dx, int *dy);
+extern int xbox_FramebufferMouseButton(int which);
+extern int xbox_FramebufferMouseWheel(void);
+
+static BOOL kbm_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_KBM");
+        on = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return on ? TRUE : FALSE;
+}
+
+static BOOL overlay_enabled(void)
+{
+    return kbm_enabled() || keyboard_enabled();
+}
+
+static unsigned kbm_number(const char *name, unsigned maximum, unsigned fallback)
+{
+    const char *value = getenv(name);
+    char *end;
+    unsigned long number;
+    if (!value || !*value) return fallback;
+    number = strtoul(value, &end, 10);
+    if (*end || number > maximum) return fallback;
+    return (unsigned)number;
+}
+
+static SHORT kbm_clamp(long v)
+{
+    if (v > 32767) return 32767;
+    if (v < -32767) return -32767;
+    return (SHORT)v;
+}
+
+/* Face/triggers, matching what the build actually does (not what the docs
+ * guess): A is jump, B is use, X is melee, LT is crouch. So jump is on Space,
+ * melee on F, crouch on Control. A pad is expected to be the primary device,
+ * so this is the "there is no pad" scheme. Override any binding with
+ *   RECOMP_KBM_MAP="A=Return,B=E,X=Space,Y=R,BLACK=Shift,WHITE=Q,LT=Control,START=Tab,BACK=Escape" */
+static int k_a = VK_SPACE, k_b = 'E', k_x = 'F', k_y = 'R',
+           k_black = VK_SHIFT, k_white = 'Q', k_lt = VK_CONTROL,
+           k_start = VK_TAB, k_back = VK_ESCAPE;
+
+struct kbm_bind { const char *name; int *vk; };
+static struct kbm_bind kbm_binds[] = {
+    { "A", &k_a }, { "B", &k_b }, { "X", &k_x }, { "Y", &k_y },
+    { "BLACK", &k_black }, { "WHITE", &k_white }, { "LT", &k_lt },
+    { "START", &k_start }, { "BACK", &k_back },
+};
+
+static int kbm_vk_name(const char *name)
+{
+    if (!strcmp(name, "Return"))  return VK_RETURN;
+    if (!strcmp(name, "Space"))   return VK_SPACE;
+    if (!strcmp(name, "Tab"))     return VK_TAB;
+    if (!strcmp(name, "Escape"))  return VK_ESCAPE;
+    if (!strcmp(name, "Back"))    return VK_BACK;
+    if (!strcmp(name, "Shift"))   return VK_SHIFT;
+    if (!strcmp(name, "Control")) return VK_CONTROL;
+    if (!strcmp(name, "Alt"))     return VK_MENU;
+    if (name[0] && !name[1])      return (unsigned char)name[0];
+    return 0;
+}
+
+static void kbm_load_map(void)
+{
+    char *spec = getenv("RECOMP_KBM_MAP");
+    char *tok;
+    if (!spec || !*spec) return;
+    spec = strdup(spec);
+    for (tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
+        char *eq = strchr(tok, '=');
+        unsigned i;
+        int vk;
+        if (!eq) continue;
+        *eq = '\0';
+        vk = kbm_vk_name(eq + 1);
+        if (!vk) continue;
+        for (i = 0; i < sizeof(kbm_binds) / sizeof(kbm_binds[0]); i++)
+            if (!strcmp(kbm_binds[i].name, tok)) *kbm_binds[i].vk = vk;
+    }
+    free(spec);
+}
+
+static void kbm_state(XBOX_INPUT_STATE *pState)
+{
+    static DWORD packet;
+    static int configured;
+    static unsigned sens, deadzone, invert_y, maxdelta, decay_ms;
+    static float vx, vy;      /* decaying right-stick velocity, stick units */
+    static unsigned long last_ms;
+    WORD b = 0;
+    int dx, dy, wheel;
+
+    if (!configured) {
+        /* sens is stick units per pixel of mouse travel; decay_ms is how long
+         * that deflection is held, so the camera integrates over the motion
+         * rather than seeing a one-poll blip.
+         *
+         * The hold has to be measured in time, not in polls. The title polls
+         * this ~400 times a second, so a per-call decay halved the deflection
+         * every call and it was gone inside 25 ms -- which reads as small,
+         * stuttering camera steps no matter how large sens is. Decaying by
+         * elapsed milliseconds makes the feel independent of the poll rate. */
+        sens     = kbm_number("RECOMP_KBM_SENS", 65536, 140);
+        decay_ms = kbm_number("RECOMP_KBM_DECAY_MS", 1000, 120);
+        deadzone = kbm_number("RECOMP_KBM_DEADZONE", 64, 2);
+        invert_y = kbm_number("RECOMP_KBM_INVERT_Y", 1, 0);
+        maxdelta = kbm_number("RECOMP_KBM_MAXDELTA", 8192, 512);
+        kbm_load_map();
+        configured = 1;
+        fprintf(stderr, "[KBM] profile: sens=%u decay_ms=%u deadzone=%u invert_y=%u maxdelta=%u "
+                "A=%d B=%d X=%d Y=%d BLACK=%d WHITE=%d LT=%d START=%d BACK=%d\n",
+                sens, decay_ms, deadzone, invert_y, maxdelta,
+                k_a, k_b, k_x, k_y, k_black, k_white, k_lt, k_start, k_back);
+    }
+
+    memset(pState, 0, sizeof(*pState));
+
+    /* Left stick: WASD, full deflection. */
+    pState->Gamepad.sThumbLX = axis_from_keys('A', 'D');
+    pState->Gamepad.sThumbLY = axis_from_keys('S', 'W');
+
+    /* Right stick: mouse velocity, held for decay_ms. A single poll can carry a
+     * whole frame's worth of motion; clamp that to maxdelta so a focus change
+     * or a stuck cursor cannot slam the camera, while real flicks still scale. */
+    xbox_FramebufferMouseDelta(&dx, &dy);
+    if (dx >  (int)maxdelta) dx =  (int)maxdelta;
+    if (dx < -(int)maxdelta) dx = -(int)maxdelta;
+    if (dy >  (int)maxdelta) dy =  (int)maxdelta;
+    if (dy < -(int)maxdelta) dy = -(int)maxdelta;
+    if (dx > -(int)deadzone && dx < (int)deadzone) dx = 0;
+    if (dy > -(int)deadzone && dy < (int)deadzone) dy = 0;
+
+    {
+        unsigned long now = (unsigned long)GetTickCount();
+        float dt = last_ms ? (float)(now - last_ms) / 1000.0f : 0.0f;
+        float tau = (float)decay_ms / 1000.0f;
+        float alpha;
+        last_ms = now;
+        if (dt > 0.25f) dt = 0.25f;      /* do not let a focus pause clear it */
+        alpha = (dt > 0.0f) ? expf(-dt / tau) : 1.0f;
+        vx = vx * alpha + (float)dx * (float)sens;
+        vy = vy * alpha + (float)dy * (float)sens;
+    }
+    pState->Gamepad.sThumbRX = kbm_clamp((long)vx);
+    pState->Gamepad.sThumbRY = kbm_clamp((long)(invert_y ? vy : -vy));
+    if (dx || dy) {
+        static int trace = -1;
+        static unsigned long moves;
+        if (trace < 0) {
+            const char *v = getenv("RECOMP_KBM_TRACE");
+            trace = (v && *v && *v != '0') ? 1 : 0;
+        }
+        moves++;
+        if (trace)
+            fprintf(stderr, "[KBM] mouse dx=%d dy=%d rx=%d ry=%d moves=%lu\n",
+                    dx, dy, pState->Gamepad.sThumbRX, pState->Gamepad.sThumbRY, moves);
+    }
+
+    /* Digital: d-pad on the arrows (and 1-4); Start/Back from the map. */
+    if (key_down(VK_UP)    || key_down('1')) b |= XBOX_GAMEPAD_DPAD_UP;
+    if (key_down(VK_DOWN)  || key_down('2')) b |= XBOX_GAMEPAD_DPAD_DOWN;
+    if (key_down(VK_LEFT)  || key_down('3')) b |= XBOX_GAMEPAD_DPAD_LEFT;
+    if (key_down(VK_RIGHT) || key_down('4')) b |= XBOX_GAMEPAD_DPAD_RIGHT;
+    wheel = xbox_FramebufferMouseWheel();
+    if (wheel > 0) b |= XBOX_GAMEPAD_DPAD_UP;
+    if (wheel < 0) b |= XBOX_GAMEPAD_DPAD_DOWN;
+    if (key_down(k_start)) b |= XBOX_GAMEPAD_START;
+    /* BackSpace stays a Back alias regardless of the configured Back key. */
+    if (key_down(k_back) || key_down(VK_BACK)) b |= XBOX_GAMEPAD_BACK;
+    pState->Gamepad.wButtons = b;
+
+    /* Analog face buttons and triggers. Right mouse is aim (White); crouch
+     * lives on the LT button, which the map puts on Control. */
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]     = key_down(k_a) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]     = key_down(k_b) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]     = key_down(k_x) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]     = key_down(k_y) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] = key_down(k_black) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
+        (key_down(k_white) || xbox_FramebufferMouseButton(1)) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] =
+        key_down(k_lt) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] =
+        xbox_FramebufferMouseButton(0) ? 255 : 0;
+
+    pState->dwPacketNumber = ++packet;
+}
+
 static DWORD poll_host(DWORD port, XINPUT_STATE *state, DWORD *host_slot)
 {
     DWORD connected = 0;
@@ -275,13 +482,35 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     XINPUT_STATE xi_state;
     DWORD result, host_slot;
 
+    /* RECOMP_POLL_TRACE: how often the title actually asks for input. A menu
+     * that renders at 30 FPS but polls the pad at 1 Hz is the difference
+     * between "laggy" and "broken", and nothing else in the chain shows it. */
+    {
+        static int trace = -1;
+        static unsigned long last;
+        static unsigned calls;
+        if (trace < 0)
+            trace = getenv("RECOMP_POLL_TRACE") != NULL;
+        if (trace) {
+            unsigned long now = GetTickCount();
+            calls++;
+            if (now - last >= 1000) {
+                fprintf(stderr, "  [POLL] xbox_InputGetState %u/s\n", calls);
+                fflush(stderr);
+                last = now;
+                calls = 0;
+            }
+        }
+    }
+
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
     result = poll_host(dwPort, &xi_state, &host_slot);
     if (result != ERROR_SUCCESS) {
-        if (dwPort == 0 && keyboard_enabled()) {
-            keyboard_state(pState);
+        if (dwPort == 0 && overlay_enabled()) {
+            if (kbm_enabled()) kbm_state(pState);
+            else               keyboard_state(pState);
             return ERROR_SUCCESS;
         }
         return result;
@@ -316,10 +545,11 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
      * Merging is also the better rule. A real pad keeps working -- its
      * buttons are already in pState and the keyboard only adds to them --
      * and there is no special case left to get wrong. */
-    if (dwPort == 0 && keyboard_enabled()) {
+    if (dwPort == 0 && overlay_enabled()) {
         XBOX_INPUT_STATE kb;
         int i;
-        keyboard_state(&kb);
+        if (kbm_enabled()) kbm_state(&kb);
+        else               keyboard_state(&kb);
         pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
         for (i = 0; i < 8; i++)
             if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
@@ -358,7 +588,7 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
     DWORD slot;
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
     return poll_host(dwPort, &state, &slot) == ERROR_SUCCESS ||
-        (dwPort == 0 && keyboard_enabled());
+        (dwPort == 0 && overlay_enabled());
 }
 
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
