@@ -1074,6 +1074,9 @@
 #       define NV097_SET_TEXGEN_VIEW_MODEL_INFINITE_VIEWER        1
 #   define NV097_SET_FOG_PLANE                                0x000009D0
 #   define NV097_SET_SPECULAR_PARAMS                          0x000009E0
+#   define NV097_SET_SWATH_WIDTH                              0x000009F8
+#       define NV097_SET_SWATH_WIDTH_OFF                          0x0000000F
+#       define NV097_SET_SWATH_WIDTH_ON                           0x00000004
 #   define NV097_SET_PROVOKING_VERTEX                         0x000009FC
 #       define NV097_SET_PROVOKING_VERTEX_LAST                    0
 #       define NV097_SET_PROVOKING_VERTEX_FIRST                   1
@@ -1101,6 +1104,9 @@
 #   define NV097_SET_LIGHT_INFINITE_DIRECTION                 0x00001034
 #   define NV097_SET_LIGHT_SPOT_FALLOFF                       0x00001040
 #   define NV097_SET_LIGHT_SPOT_DIRECTION                     0x0000104C
+/* Polygon stipple (the NV20 3D_POLYGON_STIPPLE_ENABLE method). */
+#   define NV097_SET_STIPPLE_ENABLE                           0x0000147C
+#   define NV097_SET_STIPPLE_PATTERN                          0x00001480
 #   define NV097_SET_LIGHT_LOCAL_POSITION                     0x0000105C
 #   define NV097_SET_LIGHT_LOCAL_ATTENUATION                  0x00001068
 #   define NV097_SET_VERTEX4F                                 0x00001518
@@ -1273,6 +1279,7 @@
 #       define NV097_SET_ZMIN_MAX_CONTROL_ZCLAMP_EN_CLAMP             1
 #   define NV097_SET_ANTI_ALIASING_CONTROL                    0x00001D7C
 #       define NV097_SET_ANTI_ALIASING_CONTROL_ENABLE             (1 << 0)
+#   define NV097_SET_OCCLUDE_ZSTENCIL_EN                      0x00001D84
 #   define NV097_SET_ZSTENCIL_CLEAR_VALUE                     0x00001D8C
 #   define NV097_SET_COLOR_CLEAR_VALUE                        0x00001D90
 #   define NV097_CLEAR_SURFACE                                0x00001D94

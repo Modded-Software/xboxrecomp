@@ -781,12 +781,13 @@ static int ohci_call_isr(OhciController *hc)
      */
     {
         KIRQL saved_irql = xbox_KfRaiseIrql(DISPATCH_LEVEL);
-        *(uint8_t *)(mem + g_fs_base + XBOX_KPCR_IRQL_OFFSET) = DISPATCH_LEVEL;
+        uint8_t *guest_irql = (uint8_t *)(mem + g_fs_base + XBOX_KPCR_IRQL_OFFSET);
+        *guest_irql = (uint8_t)xbox_KeGetCurrentIrql();
 
         fn();
 
-        *(uint8_t *)(mem + g_fs_base + XBOX_KPCR_IRQL_OFFSET) = (uint8_t)saved_irql;
         xbox_KfLowerIrql(saved_irql);
+        *guest_irql = (uint8_t)xbox_KeGetCurrentIrql();
     }
 
     xbox_worker_stack_free(slot);

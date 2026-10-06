@@ -37,41 +37,49 @@
  * allows code that checks IRQL to function correctly.
  * ============================================================================ */
 
-/* The processor's interrupt request level.
+/* The calling thread's interrupt request level.
  *
- * The console has one processor, so IRQL is a per-processor value that every
- * guest thread shares and every device model reads -- not a per-thread one.
- * Modelling it per host thread was the bug: a guest thread that lowers IRQL
- * against a level another thread raised reads its own stale PASSIVE_LEVEL,
- * the lower looks like a raise, and the raised-count that gated every
- * interrupt climbed and never came back down. Once stuck, OHCI held the
- * gamepad interrupt off for seconds at a time and input appeared dead.
+ * A uniprocessor runs one context at a time and the scheduler saves and
+ * restores the processor IRQL across a context switch, so "the IRQL" belongs
+ * to the current thread. Modelling it as one global level let a device ISR on
+ * one host thread -- entered at its device IRQL, 3, 4 or 5 -- leak that level
+ * into an unrelated guest thread. A spinlock acquire there then saw the
+ * polluted level as the IRQL it had saved, and the matching lower looked like
+ * a raise: the mismatch trace fired and fs:[0x24] could stay at DISPATCH,
+ * which ran the CRT's getptd down its KeBugCheck path. Each host thread has
+ * its own level now.
  *
- * A single level, swapped atomically, is the correct model: a lower always
- * sets the level rather than moving a counter, so a mismatched pair can be
- * momentarily wrong but can never wedge the gate shut. */
-static volatile LONG g_cpu_irql = PASSIVE_LEVEL;
+ * Raising is also a no-op at or below the current level, exactly as on the
+ * hardware. KeAcquireSpinLock only raises to DISPATCH, so at a device IRQL it
+ * must return the device level and leave it set; setting the level down to 2
+ * was the other half of the stale saved value.
+ *
+ * The interrupt gate still has to answer the processor-wide question -- is
+ * any context at DISPATCH -- so a count of raised contexts is kept for device
+ * models. It moves only on a DISPATCH boundary crossing, and with the clamp a
+ * valid raise/lower pair always crosses back. */
+static XBOX_THREAD_LOCAL KIRQL g_thread_irql = PASSIVE_LEVEL;
+static volatile LONG g_irql_raised = 0;
 
 KIRQL __stdcall xbox_KeGetCurrentIrql(void)
 {
-    return (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0);
+    return g_thread_irql;
 }
 
-/* Non-zero while the processor is at or above DISPATCH_LEVEL. Device models
- * call this before delivering an interrupt; OHCI and the NV2A are
- * level-triggered, so a deferred interrupt is delivered on the next poll
- * rather than lost. */
+/* Non-zero while any context is at or above DISPATCH_LEVEL. Device models call
+ * this before delivering an interrupt; OHCI and the NV2A are level-triggered,
+ * so a deferred interrupt is delivered on the next poll rather than lost. */
 int xbox_IrqlBlocksInterrupts(void)
 {
-    return xbox_KeGetCurrentIrql() >= DISPATCH_LEVEL;
+    return InterlockedCompareExchange(&g_irql_raised, 0, 0) > 0;
 }
 
-/* The current level, for callers that want to report it. A level that stays
- * at DISPATCH across a quiet thread is a guest that genuinely raised and
- * never lowered, not a counter artefact. */
+/* How many contexts are at or above DISPATCH, for callers that want to report
+ * it. A count that only ever grows is a leaked raise somewhere in the
+ * raise/lower pairs, and the number says so where a yes/no cannot. */
 int xbox_IrqlRaisedCount(void)
 {
-    return (int)xbox_KeGetCurrentIrql();
+    return (int)InterlockedCompareExchange(&g_irql_raised, 0, 0);
 }
 
 static int  s_trace = -1;
@@ -148,10 +156,13 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
         return;
 
     InterlockedIncrement(&s_transitions);
-    if (now)
+    if (now) {
+        InterlockedIncrement(&g_irql_raised);
         irql_holder_add(ra);
-    else
+    } else {
+        InterlockedDecrement(&g_irql_raised);
         irql_holder_drop();
+    }
 
     /* RECOMP_IRQL_TRACE prints the first few transitions. The pairing is what
      * matters: a raise to 2 followed by a lower from 2 nets out, and a lower
@@ -174,15 +185,17 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  */
 KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 {
-    KIRQL old = (KIRQL)InterlockedExchange(&g_cpu_irql, (LONG)NewIrql);
+    KIRQL old = g_thread_irql;
 
-    if (NewIrql < old) {
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
-            "KfRaiseIrql: attempt to lower IRQL from %d to %d (use KfLowerIrql)",
-            old, NewIrql);
+    /* Raising to at or below the current level is a no-op, as on hardware.
+     * The decisive case is a spinlock taken inside a device ISR: the acquire
+     * raises only to DISPATCH, so at IRQL 3/4/5 it must return that device
+     * level and leave it set. Dropping the level to 2 here made the matching
+     * KfLowerIrql(device_level) look like a raise. */
+    if (NewIrql > old) {
+        g_thread_irql = NewIrql;
+        irql_track(old, NewIrql, IRQL_CALLER());
     }
-
-    irql_track(old, NewIrql, IRQL_CALLER());
     return old;
 }
 
@@ -192,14 +205,13 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
  */
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
-    KIRQL old = (KIRQL)InterlockedExchange(&g_cpu_irql, (LONG)NewIrql);
+    KIRQL old = g_thread_irql;
 
     if (NewIrql > old) {
-        /* A lower that sets a higher level than the processor is at. That is
-         * still a calling-convention mismatch upstream, but with the level
-         * model it can no longer wedge the interrupt gate: the next genuine
-         * lower sets the level back down. Kept loud so the caller can still
-         * be found, just named a warning rather than a fatal bug. */
+        /* A lower above the current level would raise. On hardware that is
+         * undefined; here it used to set the level up and leave fs:[0x24]
+         * stuck at DISPATCH, which ran getptd down its KeBugCheck path.
+         * Name the caller, then ignore it and keep the current level. */
         static volatile LONG n;
         if (InterlockedIncrement(&n) <= 20) {
             fprintf(stderr, "  [IRQLWARN] tid %lu KfLowerIrql(%d) while at %d\n",
@@ -210,8 +222,10 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
             old, NewIrql);
+        NewIrql = old;
     }
 
+    g_thread_irql = NewIrql;
     irql_track(old, NewIrql, IRQL_CALLER());
 }
 
@@ -220,9 +234,12 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
  */
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
-    KIRQL old = (KIRQL)InterlockedExchange(&g_cpu_irql, DISPATCH_LEVEL);
+    KIRQL old = g_thread_irql;
 
-    irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
+    if (DISPATCH_LEVEL > old) {
+        g_thread_irql = DISPATCH_LEVEL;
+        irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
+    }
     return old;
 }
 

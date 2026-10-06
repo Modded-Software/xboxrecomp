@@ -1297,7 +1297,11 @@ static void bridge_ExAllocatePoolWithTag(void)
 static KIRQL bridge_raise_irql(KIRQL new_irql)
 {
     KIRQL old_irql = xbox_KfRaiseIrql(new_irql);
-    BRIDGE_MEM8(g_fs_base + XBOX_KPCR_IRQL_OFFSET) = new_irql;
+    /* fs:[0x24] is what guest code reads directly, so mirror the level the
+     * runtime actually ended at -- not new_irql, which is a no-op at or below
+     * the current level (a spinlock acquired inside a device ISR). */
+    BRIDGE_MEM8(g_fs_base + XBOX_KPCR_IRQL_OFFSET) =
+        (uint8_t)xbox_KeGetCurrentIrql();
     return old_irql;
 }
 
@@ -1315,7 +1319,8 @@ static void bridge_lower_irql(KIRQL new_irql)
                     g_xbox_kernel_caller);
     }
     xbox_KfLowerIrql(new_irql);
-    BRIDGE_MEM8(g_fs_base + XBOX_KPCR_IRQL_OFFSET) = new_irql;
+    BRIDGE_MEM8(g_fs_base + XBOX_KPCR_IRQL_OFFSET) =
+        (uint8_t)xbox_KeGetCurrentIrql();
 }
 
 static void bridge_KfRaiseIrql(void)
