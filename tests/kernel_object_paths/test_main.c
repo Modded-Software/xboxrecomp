@@ -13,6 +13,7 @@ void *recomp_lookup_manual(ULONG a) { (void)a; abort(); }
 static uint8_t *mem;
 int main(void) {
     char root[MAX_PATH], path[MAX_PATH];
+    WCHAR resolved[MAX_PATH], expected[MAX_PATH];
     GetTempPathA(MAX_PATH,root); sprintf(path,"%sxml1-dir-test-%lu",root,GetCurrentProcessId());
     if(!CreateDirectoryA(path,NULL)) return 10;
     char child[MAX_PATH]; sprintf(child,"%s\\SaveSlot",path); CreateDirectoryA(child,NULL);
@@ -29,6 +30,14 @@ int main(void) {
     /* XFindFirstFile shortens ANSI_STRING.Length to exclude its wildcard,
      * without inserting a NUL at the new end of the directory name. */
     xbox_path_init(path,NULL);
+    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, expected, MAX_PATH) ||
+        wcscat_s(expected, MAX_PATH, L"\\strings") != 0 ||
+        !xbox_translate_path("strings\\", resolved, MAX_PATH) ||
+        wcscmp(resolved, expected) != 0) {
+        fprintf(stderr, "FAIL relative game path: %S (expected %S)\n",
+                resolved, expected);
+        return 13;
+    }
     *(uint32_t *)(mem+0x40000)=0;
     *(uint32_t *)(mem+0x40004)=0x40100;
     *(uint32_t *)(mem+0x40008)=0;

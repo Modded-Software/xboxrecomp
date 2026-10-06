@@ -14,7 +14,7 @@ else()
 endif()
 
 if(MSVC)
-    target_compile_options(xbox_input PRIVATE /W4 /O2)
+    target_compile_options(xbox_input PRIVATE /W4)
 else()
     target_compile_options(xbox_input PRIVATE -Wall -Wextra -O2)
 endif()

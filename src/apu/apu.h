@@ -17,6 +17,9 @@ typedef struct MCPXAPUState MCPXAPUState;
  * ram_ptr: pointer to the base of Xbox physical RAM (64MB).
  * Returns the APU state, or NULL on failure. */
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
+typedef uint8_t *(*APUPhysicalMemoryMapper)(uint64_t physical, uint32_t bytes);
+MCPXAPUState *mcpx_apu_init_standalone_mapped(
+    uint8_t *ram_ptr, APUPhysicalMemoryMapper mapper);
 
 /* Shut down and free the APU state. */
 void mcpx_apu_shutdown(MCPXAPUState *d);
@@ -26,6 +29,8 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
 
 /* MMIO write to APU register space (addr is offset from 0xFE800000). */
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size);
+
+int mcpx_apu_irq_pending(void);
 
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */

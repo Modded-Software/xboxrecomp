@@ -130,6 +130,20 @@ static inline uint32_t swizzle_offset(uint32_t x, uint32_t y,
     return swizzle_deposit(x, mask_x) | swizzle_deposit(y, mask_y);
 }
 
+static inline uint32_t swizzle_volume_offset(uint32_t x, uint32_t y, uint32_t z,
+                                              uint32_t width, uint32_t height, uint32_t depth)
+{
+    uint32_t mask_x = 0, mask_y = 0, mask_z = 0;
+    uint32_t bit = 1, mask_bit = 1;
+    while (bit < width || bit < height || bit < depth) {
+        if (bit < width) { mask_x |= mask_bit; mask_bit <<= 1; }
+        if (bit < height) { mask_y |= mask_bit; mask_bit <<= 1; }
+        if (bit < depth) { mask_z |= mask_bit; mask_bit <<= 1; }
+        bit <<= 1;
+    }
+    return swizzle_deposit(x, mask_x) | swizzle_deposit(y, mask_y) | swizzle_deposit(z, mask_z);
+}
+
 
 /**
  * Unswizzle a texture from Xbox swizzled (Z-order/Morton) layout
@@ -412,6 +426,52 @@ static inline int d3d8_dxt_decode_texel(const uint8_t *base, uint32_t fmt,
         alpha = 0;                         /* DXT1's one bit of alpha */
 
     *argb = (alpha << 24) | (c[idx] & 0x00FFFFFFu);
+    return 1;
+}
+
+typedef struct d3d8_dxt_cache_entry {
+    const uint8_t *block;
+    uint32_t format, valid_texels;
+    uint8_t source[16];
+    uint32_t colors[16];
+} d3d8_dxt_cache_entry;
+
+typedef struct d3d8_dxt_texel_cache {
+    d3d8_dxt_cache_entry entries[64];
+} d3d8_dxt_texel_cache;
+
+static inline int d3d8_dxt_decode_texel_cached(d3d8_dxt_texel_cache *cache,
+                                               const uint8_t *base, uint32_t fmt,
+                                               uint32_t u, uint32_t v,
+                                               uint32_t width, uint32_t *argb)
+{
+    uint32_t block_bytes = d3d8_format_dxt_block_bytes(fmt);
+    uint32_t blocks_per_row = (width + 3u) / 4u;
+    uint32_t texel = (v & 3u) * 4u + (u & 3u);
+    uint32_t texel_bit = 1u << texel;
+    const uint8_t *block;
+    uintptr_t key;
+    d3d8_dxt_cache_entry *entry;
+
+    if (!block_bytes || !blocks_per_row)
+        return 0;
+    block = base + ((size_t)(v >> 2) * blocks_per_row + (u >> 2)) * block_bytes;
+    key = (uintptr_t)block;
+    entry = &cache->entries[((key >> 3) ^ (key >> 12)) & 63u];
+    if (entry->block != block || entry->format != fmt ||
+        memcmp(entry->source, block, block_bytes) != 0) {
+        entry->block = block;
+        entry->format = fmt;
+        entry->valid_texels = 0;
+        memcpy(entry->source, block, block_bytes);
+    }
+    if (!(entry->valid_texels & texel_bit)) {
+        if (!d3d8_dxt_decode_texel(entry->source, fmt, u & 3u, v & 3u,
+                                  4, &entry->colors[texel]))
+            return 0;
+        entry->valid_texels |= texel_bit;
+    }
+    *argb = entry->colors[texel];
     return 1;
 }
 

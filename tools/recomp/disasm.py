@@ -233,6 +233,11 @@ class Disassembler:
                                            point):
                 if cs_insn.address in decoded:
                     break          # rejoined a stream we already have
+                # Newly aligned instructions can cover bogus starts decoded
+                # from the preceding jump table.
+                for addr in [a for a in decoded
+                             if cs_insn.address < a < cs_insn.address + cs_insn.size]:
+                    del decoded[addr]
                 decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
         return [decoded[a] for a in sorted(decoded)]

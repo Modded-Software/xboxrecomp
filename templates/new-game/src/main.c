@@ -224,7 +224,7 @@ extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
  * 512 KB, not the whole MCPX aperture. AC'97 above it stays plain memory,
  * which is what the codec-ready bit needs. */
 #define APU_TRAP_BASE 0xFE800000u
-#define APU_TRAP_END  0xFE880000u
+#define APU_TRAP_END  0xFE830000u
 
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {

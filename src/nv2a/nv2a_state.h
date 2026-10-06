@@ -230,4 +230,11 @@ void nv2a_mmio_write(NV2AState *d, hwaddr addr, uint64_t val, unsigned int size)
 /* Get the global NV2A state instance */
 NV2AState *nv2a_get_state(void);
 
+/* Snapshot the active PVIDEO overlay for the lightweight guest framebuffer
+ * presenter. Returns zero when the overlay is not enabled. */
+int nv2a_get_pvideo_overlay(uint32_t *offset, uint32_t *pitch,
+                            uint32_t *width, uint32_t *height,
+                            uint32_t *out_x, uint32_t *out_y,
+                            uint32_t *out_width, uint32_t *out_height);
+
 #endif /* BURNOUT3_NV2A_STATE_H */

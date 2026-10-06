@@ -47,6 +47,9 @@ extern "C" {
 #define XBOX_TOTAL_RAM          (64 * 1024 * 1024)  /* 64 MB (default) */
 #define XBOX_DEVKIT_RAM         (128 * 1024 * 1024) /* 128 MB (debug kit) */
 #define XBOX_GPU_RESERVED       (4 * 1024 * 1024)   /* ~4 MB for GPU */
+#define XBOX_MCPX_BASE          0xFE800000u
+#define XBOX_MCPX_APU_MMIO_END  0xFE830000u
+#define XBOX_MCPX_APU_MMIO_SIZE (XBOX_MCPX_APU_MMIO_END - XBOX_MCPX_BASE)
 
 /* Actual mapped RAM for this run. Defaults to XBOX_TOTAL_RAM; a title with a
  * devkit build calls xbox_SetTotalRam(XBOX_DEVKIT_RAM) before init. Heap top and
@@ -184,10 +187,27 @@ void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */
 uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 
-/* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
- * below 256 MB, or 0 when the arena is exhausted. */
+/* Allocate zeroed pages in the contiguous physical mirror, or return 0. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t low, uint32_t high,
+                               uint32_t alignment);
+void xbox_ContiguousFree(uint32_t guest_va);
+uint32_t xbox_ContiguousBlockSize(uint32_t guest_va);
 uint32_t xbox_ContiguousAllocatedBytes(void);
+void xbox_RecordDmaTranslation(uint32_t guest_va, uint32_t physical);
+uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes);
+volatile uint32_t *xbox_Nv2aRegisterPointer(uint32_t offset, uint32_t bytes);
+void xbox_Nv2aAcknowledgeHandshakes(void);
+int xbox_Nv2aNativeFencesEnabled(void);
+/* Guest software-method dispatcher: ECX=context, one stdcall parameter. */
+int xbox_Nv2aSoftwareMethodHandler(uint32_t routine, uint32_t context);
+int xbox_Nv2aSoftwareMethod(uint32_t parameter, uint32_t depth_clear,
+                            uint32_t color_clear);
+void xbox_Nv2aSoftwareMethodReport(void);
+/* Recursive guest audio exclusion; worker callbacks defer with TryEnter. */
+void xbox_GuestAudioGuardEnter(void);
+int xbox_GuestAudioGuardTryEnter(void);
+void xbox_GuestAudioGuardLeave(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
@@ -359,6 +379,7 @@ typedef union RecompXmm {
 #define XBOX_TIB_MAIN       0x00004000
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
+#define XBOX_KPCR_IRQL_OFFSET 0x24u
 
 #define XBOX_STACK_BASE     0x00780000
 

@@ -28,7 +28,7 @@ static const uint8_t s_device_desc[18] = {
     0x00,           /* bDeviceClass: per interface                */
     0x00,           /* bDeviceSubClass                            */
     0x00,           /* bDeviceProtocol                            */
-    0x08,           /* bMaxPacketSize0: 8                         */
+    0x40,           /* bMaxPacketSize0: 64                        */
     0x5E, 0x04,     /* idVendor  0x045E Microsoft                 */
     0x89, 0x02,     /* idProduct 0x0289 Controller S              */
     0x21, 0x01,     /* bcdDevice                                  */
@@ -45,8 +45,8 @@ static const uint8_t s_config_desc[32] = {
     9, 0x02, 32, 0x00, 0x01, 0x01, 0x00, 0x80, 50,
     /* interface: class 0x58 subclass 0x42, the Xbox gamepad's own */
     9, 0x04, 0x00, 0x00, 0x02, 0x58, 0x42, 0x00, 0x00,
-    /* endpoint 0x81 IN, interrupt, 32 bytes, 4 ms */
-    7, 0x05, 0x81, 0x03, 0x20, 0x00, 0x04,
+    /* endpoint 0x82 IN, interrupt, 32 bytes, 4 ms */
+    7, 0x05, 0x82, 0x03, 0x20, 0x00, 0x04,
     /* endpoint 0x02 OUT, interrupt, 32 bytes, 4 ms -- rumble */
     7, 0x05, 0x02, 0x03, 0x20, 0x00, 0x04
 };
@@ -594,9 +594,9 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
                 XBOX_INPUT_STATE probe;
                 DWORD rc = xbox_InputGetState(0, &probe);
                 last = now;
-                fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
+                fprintf(stderr, "  [INPUT] kbd_env=%s window_has_RETURN=%d "
                         "InputGetState=%lu buttons=0x%04X\n",
-                        getenv("RECOMP_KEYBOARD") ? 1 : 0,
+                        getenv("RECOMP_KEYBOARD") ? getenv("RECOMP_KEYBOARD") : "(unset)",
                         xbox_FramebufferKeyDown(0x0D),
                         (unsigned long)rc,
                         rc == 0 ? probe.Gamepad.wButtons : 0);

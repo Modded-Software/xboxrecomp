@@ -66,11 +66,21 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * Filter helpers
  * ============================================================ */
 
+static void voice_reset_resampler(MCPXAPUVoiceFilter *filter)
+{
+    filter->resample_position = 0.0;
+    filter->resample_count = filter->resample_offset = 0;
+    filter->resample_current_valid = false;
+    filter->resample_source_ended = false;
+}
+
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
+    voice_reset_resampler(&d->vp.filters[v]);
+    g_dbg.vp.v[v].starved_reads = 0;
     if (d->vp.filters[v].resampler) {
         src_reset(d->vp.filters[v].resampler);
     }
@@ -276,6 +286,19 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
 
+        if (mcpx_apu_diagnostics_enabled()) {
+            fprintf(stderr, "[APU-START] id=%u list=%u fmt=%08X ba=%08X ebo=%u\n",
+                    selected_handle, list,
+                    voice_get_mask(d, (uint16_t)selected_handle,
+                                   NV_PAVS_VOICE_CFG_FMT, UINT32_MAX),
+                    voice_get_mask(d, (uint16_t)selected_handle,
+                                   NV_PAVS_VOICE_CUR_PSL_START,
+                                   NV_PAVS_VOICE_CUR_PSL_START_BA),
+                    voice_get_mask(d, (uint16_t)selected_handle,
+                                   NV_PAVS_VOICE_PAR_NEXT,
+                                   NV_PAVS_VOICE_PAR_NEXT_EBO));
+        }
+
         if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
         break;
     }
@@ -402,6 +425,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        (argument & NV1BA0_PIO_SET_VOICE_TAR_PITCH_STEP) >> 16);
         break;
     case NV1BA0_PIO_SET_VOICE_CFG_BUF_BASE:
+        voice_reset_resampler(&d->vp.filters[(uint16_t)d->regs[NV_PAPU_FECV]]);
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_CUR_PSL_START,
                        NV_PAVS_VOICE_CUR_PSL_START_BA, argument);
@@ -412,6 +436,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_BUF_CBO:
+        voice_reset_resampler(&d->vp.filters[(uint16_t)d->regs[NV_PAPU_FECV]]);
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_PAR_OFFSET,
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, argument);
@@ -759,6 +784,13 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                            NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK);
     bool persist = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
                                   NV_PAVS_VOICE_CFG_FMT_PERSIST) != 0;
+    struct McpxApuDebugVoice *dbg = &g_dbg.vp.v[v];
+    dbg->stream = stream;
+    dbg->loop = loop;
+    dbg->persist = persist;
+    dbg->cbo = cbo;
+    dbg->ebo = ebo;
+    dbg->ba = ba;
 
     int ssl_index = 0, ssl_seg = 0, page = 0, count = 0;
     int seg_len = 0, seg_cs = 0, seg_spb = 0, seg_s = 0;
@@ -792,6 +824,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         count = d->vp.ssl[v].count[ssl_index];
 
         if (count == 0) {
+            if (persist) dbg->starved_reads++;
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
             d->vp.ssl[v].ssl_seg = 0;
@@ -843,7 +876,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, mcpx_apu_phys(addr),
+                    memcpy(adpcm_block, mcpx_apu_ram_address(addr, (uint32_t)block_size),
                            block_size);
                 } else {
                     linear_addr += ba;
@@ -911,7 +944,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
     }
 
-    if (cbo >= ebo) {
+    if (cbo > ebo) {
         if (stream) {
             d->vp.ssl[v].ssl_seg += 1;
             cbo = 0;
@@ -929,7 +962,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 cbo = lbo;
             } else {
                 cbo = ebo;
-                voice_off(d, (uint16_t)v);
+                d->vp.filters[v].resample_source_ended = true;
             }
         }
     }
@@ -940,32 +973,67 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
- *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * Stateful linear voice resampling
  * ============================================================ */
+
+static bool voice_resample_fill(MCPXAPUState *d, uint16_t v)
+{
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    if (filter->resample_offset < filter->resample_count)
+        return true;
+    if (filter->resample_source_ended)
+        return false;
+    int count = voice_get_samples(d, v, filter->resample_buf, NUM_SAMPLES_PER_FRAME);
+    filter->resample_offset = 0;
+    filter->resample_count = count > 0 ? count : 0;
+    return count > 0;
+}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
-
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    if (!isfinite(rate) || rate <= 0.0f) {
+        fprintf(stderr, "[APU] invalid resampling ratio %.9g for voice %u\n", rate, v);
+        return -1;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+    if (!filter->resample_current_valid) {
+        if (!voice_resample_fill(d, v)) return 0;
+        for (int channel = 0; channel < 2; channel++)
+            filter->resample_current[channel] =
+                filter->resample_buf[filter->resample_offset][channel];
+        filter->resample_offset++;
+        filter->resample_current_valid = true;
+    }
+
+    double step = 1.0 / rate;
+    for (int output = 0; output < requested_num; output++) {
+        bool available = voice_resample_fill(d, v);
+        for (int channel = 0; channel < 2; channel++) {
+            float current = filter->resample_current[channel];
+            float next = available
+                ? filter->resample_buf[filter->resample_offset][channel] : current;
+            samples[output][channel] =
+                current + (float)filter->resample_position * (next - current);
+        }
+        filter->resample_position += step;
+        while (filter->resample_position >= 1.0) {
+            filter->resample_position -= 1.0;
+            if (!available) {
+                filter->resample_current_valid = false;
+                filter->resample_position = 0.0;
+                if (filter->resample_source_ended) voice_off(d, v);
+                return output + 1;
+            }
+            for (int channel = 0; channel < 2; channel++)
+                filter->resample_current[channel] =
+                    filter->resample_buf[filter->resample_offset][channel];
+            filter->resample_offset++;
+            if (filter->resample_position >= 1.0)
+                available = voice_resample_fill(d, v);
+        }
+    }
+    return requested_num;
 }
 
 /* ============================================================
@@ -1015,6 +1083,8 @@ static void voice_process(MCPXAPUState *d,
         NV_PAVS_VOICE_CUR_ECNT_EACOUNT, NV_PAVS_VOICE_PAR_STATE_EACUR);
     if (ea_value < 0.0f) ea_value = 0.0f;
     if (ea_value > 1.0f) ea_value = 1.0f;
+    dbg->amplitude_envelope = ea_value;
+    dbg->source_peak = 0.0f;
 
     float samples[NUM_SAMPLES_PER_FRAME][2];
     memset(samples, 0, sizeof(samples));
@@ -1038,28 +1108,31 @@ static void voice_process(MCPXAPUState *d,
             memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
         }
     } else {
-        int empty = 0;
         for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-            if (!active) return;
+            if (!active) break;
             int count = voice_resample(d, v, &samples[sample_count],
                                        NUM_SAMPLES_PER_FRAME - sample_count, rate);
-            if (count < 0) break;
-            /* An active voice that keeps producing nothing is an underrun,
-             * not a reason to spin. Asking it again at once cannot change the
-             * answer, and this loop holds d->lock: Burnout 3's vehicle select
-             * sat here indefinitely while the title waited in voice_lock. */
-            if (count == 0 && ++empty > 4) break;
+            if (count <= 0) break;
             sample_count += count;
         }
     }
 
-    int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-    if (!active) return;
-
     /* Get volume bins */
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+        for (int channel = 0; channel < 2; channel++)
+            dbg->source_peak = fmaxf(dbg->source_peak, fabsf(samples[i][channel]));
+    bool diagnostic = mcpx_apu_diagnostics_enabled();
+    if (diagnostic) {
+        dbg->source_peak_since_report =
+            fmaxf(dbg->source_peak_since_report, dbg->source_peak);
+        if (dbg->min_rate_since_report == 0.0f ||
+            rate < dbg->min_rate_since_report)
+            dbg->min_rate_since_report = rate;
+        dbg->max_rate_since_report = fmaxf(dbg->max_rate_since_report, rate);
+    }
+
     int bin[8];
     bin[0] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, NV_PAVS_VOICE_CFG_VBIN_V0BIN);
     bin[1] = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, NV_PAVS_VOICE_CFG_VBIN_V1BIN);
@@ -1101,6 +1174,12 @@ static void voice_process(MCPXAPUState *d,
     /* Low-pass filter */
     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
                                NV_PAVS_VOICE_CFG_MISC_FMODE);
+    if (diagnostic) {
+        dbg->filter_mode = (uint32_t)fmode;
+        for (int ch = 0; ch < 2; ch++)
+            dbg->filter_coeff[ch] = voice_get_mask(
+                d, v, NV_PAVS_VOICE_TAR_FCA + (ch % channels) * 4, UINT32_MAX);
+    }
     bool lpf = false;
     if (v < MCPX_HW_MAX_3D_VOICES) {
         lpf = (fmode == 1);
@@ -1121,6 +1200,10 @@ static void voice_process(MCPXAPUState *d,
             setup_svf(filter, fc_f, q_f, F_LP);
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                 samples[i][ch] = run_svf(filter, samples[i][ch]);
+                if (diagnostic && fabsf(samples[i][ch]) > 1.0f)
+                    dbg->filter_clipped_since_report++;
+                if (diagnostic && !isfinite(samples[i][ch]))
+                    dbg->filter_nonfinite_since_report++;
                 samples[i][ch] = fminf(fmaxf(samples[i][ch], -1.0f), 1.0f);
             }
         }
@@ -1137,6 +1220,16 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /* Mix into bins */
+    float filtered_peak[2] = { 0.0f, 0.0f };
+    if (diagnostic) {
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            for (int channel = 0; channel < 2; channel++)
+                filtered_peak[channel] =
+                    fmaxf(filtered_peak[channel], fabsf(samples[i][channel]));
+        dbg->filtered_peak_since_report = fmaxf(
+            dbg->filtered_peak_since_report,
+            fmaxf(filtered_peak[0], filtered_peak[1]));
+    }
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
@@ -1146,6 +1239,9 @@ static void voice_process(MCPXAPUState *d,
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
         g *= attenuate(vol[b]) / hr;
+        if (diagnostic)
+            dbg->mixed_peak_since_report = fmaxf(dbg->mixed_peak_since_report,
+                                                fabsf(g) * filtered_peak[b % channels]);
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             mixbins[bin[b]][i] += g * samples[i][b % channels];
         }
@@ -1201,12 +1297,18 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
                 fe_method(d, SE2FE_IDLE_VOICE, v);
-            } else {
+            } else if (!is_voice_locked(d, v)) {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }
+            if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+                break;
             d->regs[current] = d->regs[next];
         }
+        if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+            == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+            break;
     }
 
     /* VP monitor output */
@@ -1248,6 +1350,7 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
     memset(d->vp.voice_locked, 0, sizeof(d->vp.voice_locked));
     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        voice_reset_resampler(&d->vp.filters[v]);
         hrtf_filter_init(&d->vp.filters[v].hrtf);
     }
 }

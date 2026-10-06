@@ -12,7 +12,6 @@
  */
 
 #include "kernel.h"
-#include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
 #include <stdlib.h>
 #if defined(_WIN32)
@@ -40,25 +39,9 @@
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
-/* The current IRQL, where guest code reads it: KPCR.Irql, fs:[0x24].
- *
- * The XDK does not always ask the kernel. DirectSound's lock
- * (sub_002F4175 in Burnout 3) reads fs:[0x24] directly and skips its
- * critical section at raised IRQL, because a DPC must never block. Nothing
- * wrote that byte, so it read 0 everywhere: DirectSound's DPC took the
- * critical section, blocked against the thread that held it, and the title
- * froze with IRQL raised on the blocked thread. Every change of
- * g_current_irql is published here. */
-extern RECOMP_TLS uint32_t g_fs_base;
-/* The offset lifted code adds to every guest address; host code that reads
- * guest memory on its behalf uses the same one. */
-extern ptrdiff_t g_xbox_mem_offset;
-
-static void irql_publish(void)
+KIRQL __stdcall xbox_KeGetCurrentIrql(void)
 {
-    if (g_fs_base)
-        *(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + g_fs_base
-                              + 0x24) = (uint8_t)g_current_irql;
+    return g_current_irql;
 }
 
 /* How many threads are holding IRQL at or above DISPATCH_LEVEL.
@@ -118,12 +101,7 @@ int xbox_IrqlTransitions(void)
  * name: these are host addresses inside the recompiled image, so nm resolves
  * them to the generated function, which is the guest function. */
 #define IRQL_HOLDERS 8
-static struct {
-    volatile LONG tid;
-    void *ra;
-    uint32_t guest_ra, guest_esp;   /* the host ra only ever names the bridge */
-} s_holders[IRQL_HOLDERS];
-extern RECOMP_TLS uint32_t g_esp;
+static struct { volatile LONG tid; void *ra; } s_holders[IRQL_HOLDERS];
 
 static void irql_holder_add(void *ra)
 {
@@ -133,9 +111,6 @@ static void irql_holder_add(void *ra)
     for (i = 0; i < IRQL_HOLDERS; i++)
         if (InterlockedCompareExchange(&s_holders[i].tid, me, 0) == 0) {
             s_holders[i].ra = ra;
-            s_holders[i].guest_esp = g_esp;
-            s_holders[i].guest_ra = g_esp
-                ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
             return;
         }
 }
@@ -159,10 +134,8 @@ void xbox_IrqlDumpHolders(void)
     for (i = 0; i < IRQL_HOLDERS; i++) {
         LONG t = InterlockedCompareExchange(&s_holders[i].tid, 0, 0);
         if (t)
-            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p, "
-                    "guest ret %08X (esp %08X)\n",
-                    (unsigned long)t, s_holders[i].ra,
-                    s_holders[i].guest_ra, s_holders[i].guest_esp);
+            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p\n",
+                    (unsigned long)t, s_holders[i].ra);
     }
     fflush(stderr);
 }
@@ -198,37 +171,6 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     }
 }
 
-/* Bracket a host-delivered ISR or DPC.
- *
- * The kernel's interrupt and DPC dispatchers put the processor back at the
- * interrupted IRQL when the routine returns, whatever the routine left it at.
- * The host threads that deliver interrupts and drain DPCs here had no such
- * epilogue, so a routine that returned at DISPATCH_LEVEL left its thread
- * there and the global depth at one -- and every later USB interrupt then
- * sat out the forced-delivery timeout, a pad polled twice a second.
- *
- * They also run the routine at the level it expects -- DISPATCH_LEVEL for a
- * DPC, the device level for an ISR -- and code checks: see irql_publish. */
-int xbox_IrqlEnterInterrupt(int level)
-{
-    int saved = (int)g_current_irql;
-    if (g_current_irql != (KIRQL)level) {
-        irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
-        g_current_irql = (KIRQL)level;
-        irql_publish();
-    }
-    return saved;
-}
-
-void xbox_IrqlLeaveInterrupt(int saved)
-{
-    if (g_current_irql != (KIRQL)saved) {
-        irql_track(g_current_irql, (KIRQL)saved, IRQL_CALLER());
-        g_current_irql = (KIRQL)saved;
-        irql_publish();
-    }
-}
-
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
@@ -245,7 +187,6 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 
     irql_track(old, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
-    irql_publish();
     return old;
 }
 
@@ -282,7 +223,6 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 
     irql_track(g_current_irql, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
-    irql_publish();
 }
 
 /*
@@ -294,7 +234,6 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 
     irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
     g_current_irql = DISPATCH_LEVEL;
-    irql_publish();
     return old;
 }
 

@@ -27,6 +27,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 /* ── DSP command doorbell acknowledgement ────────────────────────────────
  *
@@ -45,16 +46,20 @@
  * the title reads back will still be wrong. The real fix is DSP56300 emulation
  * in the GP/EP; this exists so audio init stops blocking everything behind it.
  *
- * The address is not derivable from the APU registers: GPSADDR/GPFADDR/
- * EPSADDR/EPFADDR point at the DSP's own scratch and frame memory, while the
- * command block is a DirectSound heap allocation. On Wreckless the registers
- * read 0x01504000 / 0x014EC000 / 0x0151C000 / 0x014F0000 and the doorbell is at
- * 0x014F8810 -- inside none of them. So it has to be observed: run with
- * RECOMP_WATCHDOG_SECS and the spin shows up as ebx plus the poll offset.
+ * gp:<byte offset> and ep:<byte offset> resolve through the programmed scratch
+ * scatter/gather tables. Those registers contain table addresses, not the
+ * payload base; a fixed guest heap address becomes stale when allocation
+ * order changes. This remains an explicitly enabled diagnostic bypass.
  */
 #define APU_DSP_ACK_MAX 8
-static uint32_t s_dsp_ack[APU_DSP_ACK_MAX];
+static struct { uint32_t offset, processor; } s_dsp_ack[APU_DSP_ACK_MAX];
 static int s_dsp_ack_count = -1;
+
+static void dsp_ack_config_error(const char *spec)
+{
+    fprintf(stderr, "[APU] invalid RECOMP_APU_DSP_ACK '%s'; expected aligned addresses or gp:/ep: offsets\n", spec);
+    exit(EXIT_FAILURE);
+}
 
 static void dsp_ack_init(void)
 {
@@ -64,19 +69,29 @@ static void dsp_ack_init(void)
     s_dsp_ack_count = 0;
     if (!spec || !*spec)
         return;
-    strncpy(buf, spec, sizeof buf - 1);
-    buf[sizeof buf - 1] = 0;
-    for (p = buf; *p && s_dsp_ack_count < APU_DSP_ACK_MAX; ) {
-        unsigned long v = strtoul(p, &end, 0);
-        if (end == p)
-            break;
-        if (v)
-            s_dsp_ack[s_dsp_ack_count++] = (uint32_t)v;
-        p = (*end == ',') ? end + 1 : end;
+    if (strlen(spec) >= sizeof buf) dsp_ack_config_error(spec);
+    memcpy(buf, spec, strlen(spec) + 1);
+    for (p = buf; *p; ) {
+        uint32_t processor = 0;
+        if (!strncmp(p, "gp:", 3)) { processor = 1; p += 3; }
+        else if (!strncmp(p, "ep:", 3)) { processor = 2; p += 3; }
+        errno = 0;
+        unsigned long long v = strtoull(p, &end, 0);
+        if (*p < '0' || *p > '9' || end == p || errno ||
+            v > UINT32_MAX || (v & 3) || (*end && *end != ','))
+            dsp_ack_config_error(spec);
+        if (v || processor) {
+            if (s_dsp_ack_count == APU_DSP_ACK_MAX) dsp_ack_config_error(spec);
+            s_dsp_ack[s_dsp_ack_count].offset = (uint32_t)v;
+            s_dsp_ack[s_dsp_ack_count++].processor = processor;
+        }
+        if (!*end) break;
+        p = end + 1;
+        if (!*p) dsp_ack_config_error(spec);
     }
     if (s_dsp_ack_count)
-        fprintf(stderr, "[APU] DSP doorbell ack: %d address(es), first 0x%08X\n",
-                s_dsp_ack_count, s_dsp_ack[0]);
+        fprintf(stderr, "[APU] diagnostic DSP passthrough ack: %d mailbox(es); DSP commands are NOT emulated\n",
+                s_dsp_ack_count);
 }
 
 /* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
@@ -94,7 +109,7 @@ static int mcpx_apu_mixdown_all(void)
     return on;
 }
 
-void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
+void mcpx_apu_dsp_ack_frame(MCPXAPUState *d)
 {
     int i;
 
@@ -103,12 +118,28 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
     if (!d->ram_ptr)
         return;
     for (i = 0; i < s_dsp_ack_count; i++) {
-        uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
+        uint64_t physical = s_dsp_ack[i].offset;
+        uint32_t processor = s_dsp_ack[i].processor;
+        if (processor) {
+            uint32_t table = qatomic_read(&d->regs[processor == 1 ? NV_PAPU_GPSADDR : NV_PAPU_EPSADDR]);
+            if (!table) continue;
+            uint32_t page = s_dsp_ack[i].offset >> 12;
+            uint32_t last = qatomic_read(&d->regs[processor == 1 ? NV_PAPU_GPSMAXSGE : NV_PAPU_EPSMAXSGE]);
+            if (page > last) {
+                fprintf(stderr, "[APU] DSP ack offset 0x%08X exceeds scratch SGE limit %u\n",
+                        s_dsp_ack[i].offset, last);
+                exit(EXIT_FAILURE);
+            }
+            uint32_t base = ldl_le_phys(address_space_memory, (uint64_t)table + page * NV_PSGE_SIZE) & 0xFFFFF000u;
+            if (!base) continue;
+            physical = (uint64_t)base + (s_dsp_ack[i].offset & 0xFFFu);
+        }
+        volatile uint32_t *slot = (volatile uint32_t *)mcpx_apu_ram_address(physical, 4);
         if (*slot) {
             static int shown[APU_DSP_ACK_MAX];
             if (shown[i]++ < 3)
-                fprintf(stderr, "[APU] DSP doorbell 0x%08X: command 0x%08X"
-                                " acknowledged\n", s_dsp_ack[i], *slot);
+                fprintf(stderr, "[APU] diagnostic DSP doorbell physical 0x%08llX: command 0x%08X"
+                                " bypassed (passthrough)\n", (unsigned long long)physical, *slot);
             *slot = 0;
         }
     }
@@ -156,6 +187,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
      */
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+    bool diagnostic = mcpx_apu_diagnostics_enabled();
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
@@ -199,6 +231,15 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 right = mixbins[1][i];
             }
             /* Clamp to [-1, 1] range */
+            if (diagnostic) {
+                g_dbg.ep.mix_peak_since_report = fmaxf(
+                    g_dbg.ep.mix_peak_since_report,
+                    fmaxf(fabsf(left), fabsf(right)));
+                g_dbg.ep.clipped_since_report +=
+                    (fabsf(left) > 1.0f) + (fabsf(right) > 1.0f);
+                g_dbg.ep.nonfinite_since_report +=
+                    !isfinite(left) + !isfinite(right);
+            }
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;

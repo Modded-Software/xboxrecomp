@@ -4,7 +4,7 @@
  * A host controller moves bytes; it does not know what they mean. This is the
  * thing that answers them: an Xbox controller, as the console's own USB stack
  * expects to find it -- standard descriptors over endpoint 0, and a 20-byte
- * report over interrupt endpoint 1.
+ * report over interrupt endpoint 2.
  *
  * Kept apart from ohci.c because it is a different concern. The controller
  * walks descriptor lists and raises interrupts and would do the same for a

@@ -174,6 +174,7 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
     case  98: return (ULONG_PTR)xbox_KeConnectInterrupt;
     case  99: return (ULONG_PTR)xbox_KeDelayExecutionThread;
     case 100: return (ULONG_PTR)xbox_KeDisconnectInterrupt;
+    case 103: return (ULONG_PTR)xbox_KeGetCurrentIrql;
     case 107: return (ULONG_PTR)xbox_KeInitializeDpc;
     case 109: return (ULONG_PTR)xbox_KeInitializeInterrupt;
     case 113: return (ULONG_PTR)xbox_KeInitializeTimerEx;

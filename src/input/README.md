@@ -2,6 +2,82 @@
 
 Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGetState` with a slightly different structure layout than the XInput API on Windows. This layer translates between them.
 
+## Hardware Input Integration
+
+Games with statically linked Xbox XAPI drivers can access input through the
+OHCI model rather than calling the host wrappers directly. Initialize the host
+input layer and OHCI after the kernel bridge, and route trapped USB-register
+accesses through the fault handler:
+
+```text
+guest XAPI -> OHCI registers/interrupts -> Controller S XID report -> host XInput
+```
+
+OHCI resolves descriptor/HCCA metadata through the contiguous-memory window.
+Payloads can also occupy ordinary low RAM: `MmGetPhysicalAddress` records
+translation provenance, and the DMA resolver selects the corresponding bank.
+The banks are separate storage, not aliases. This is a bring-up translation
+model, not a general solution for overlapping physical offsets.
+
+Seeded function discovery can miss callbacks referenced by USB class and XID
+type registries. Ensure initialization, AddDevice/RemoveDevice and report-parser
+functions are translated and reachable through dispatch. If callback recovery
+is needed, validate registry membership, instruction boundaries and external
+tail-call targets. Preserve the caller's return stack rather than substituting
+connected-device or input-processing stubs.
+
+On Windows, Xbox ports enumerate the currently connected native XInput slots
+in ascending order. A single USB Xbox One controller in native slot 1, 2 or 3
+therefore supplies Xbox port 0. Every poll rediscovers connected devices;
+capabilities, connectivity and direct API vibration use the same selection.
+Adding/removing a controller can renumber this compact port list. The OHCI
+model currently exposes one virtual gamepad, not four independent USB pads.
+
+Use `RECOMP_USB=1` to enable the USB path. `RECOMP_USB_NDP` configures root-hub
+ports, not controller count. `RECOMP_USB_PADS` is not consumed by the OHCI model.
+For diagnostics, `RECOMP_USB_TRACE=1` traces enumeration and
+`RECOMP_INPUT_DIAG=1` reports host-to-XID button delivery. With no physical
+controller, `RECOMP_KEYBOARD=1` maps Enter to Start; this is a guest-path probe,
+not proof of physical XInput acceptance.
+The input diagnostic prints the actual keyboard environment value, including
+`0`, rather than treating the presence of the variable as enablement.
+
+## Input Configuration
+
+Environment settings select automatic or fixed native slots, remap Xbox
+buttons, configure radial deadzones and stick transforms, and enable optional
+keyboard input. Set them before starting the game:
+
+```powershell
+$env:RECOMP_XINPUT_SLOT = 'auto'
+$env:RECOMP_INPUT_MAP = 'BLACK=RB,WHITE=LB'
+$env:RECOMP_INPUT_DEADZONE_LEFT = '8000'
+```
+
+The example swaps the legacy Black/White bumper bindings. Menu maps to Start
+and View to Back. Face buttons and bumpers provide pressure 0 or 255, while
+triggers retain 0-255. Xbox One hardware cannot reproduce pressure-sensitive
+face buttons.
+
+Settings are parsed once by `xbox_InputInit`, shared by the direct and USB
+input paths, and rejected explicitly when malformed:
+
+| Environment | Meaning / default |
+|-------------|-------------------|
+| `RECOMP_XINPUT_SLOT` | `auto` compacts connected slots; `0`-`3` reserves that native slot for Xbox port zero. Other ports exclude the reserved slot. |
+| `RECOMP_INPUT_MAP` | Comma-separated `TARGET=SOURCE` overrides; unspecified targets keep their legacy bindings. |
+| `RECOMP_INPUT_THRESHOLD` | Digital targets activate above this source pressure; integer 0-254, default 30. |
+| `RECOMP_INPUT_DEADZONE_LEFT`, `RECOMP_INPUT_DEADZONE_RIGHT` | Radial center deadzones, 0-32767; default zero. Outside the deadzone, values are not rescaled. |
+| `RECOMP_INPUT_AXES` | Bitmask: 1 swaps sticks; 2/4 invert left X/Y; 8/16 invert right X/Y. Default zero; applied to destination sticks. |
+| `RECOMP_KEYBOARD` | Optional fixed Xbox keyboard overlay on port zero; disabled by default and not controller-remapped. |
+
+Targets: `UP,DOWN,LEFT,RIGHT,START,BACK,LCLICK,RCLICK,A,B,X,Y,BLACK,WHITE,LT,RT`.
+Sources use those names except that native bumpers are `LB,RB`, not
+`BLACK,WHITE`; `NONE` disables a binding. Triggers mapped to a digital target
+use the threshold, while analog targets retain their source pressure.
+Duplicate/unknown bindings, empty entries and out-of-range numbers fail
+startup rather than silently substituting defaults.
+
 ## Files
 
 | File | LOC | Purpose |
@@ -110,7 +186,7 @@ XBOX_BUTTON_RTRIGGER   7    // Right trigger
 XBOX_ANALOG_BUTTON_THRESHOLD  30   // Recommended press threshold
 ```
 
-### Xbox → Modern Controller Mapping
+### Legacy direct-executable mapping (without profile overrides)
 
 | Xbox Button | XInput Equivalent | Notes |
 |-------------|------------------|-------|
@@ -118,8 +194,8 @@ XBOX_ANALOG_BUTTON_THRESHOLD  30   // Recommended press threshold
 | B | B | Red button |
 | X | X | Blue button |
 | Y | Y | Yellow button |
-| Black | Right Bumper | Mapped to RB |
-| White | Left Bumper | Mapped to LB |
+| Black | Left Bumper | Mapped to LB |
+| White | Right Bumper | Mapped to RB |
 | L Trigger | Left Trigger | Analog 0-255 |
 | R Trigger | Right Trigger | Analog 0-255 |
 | Start | Start/Menu | |

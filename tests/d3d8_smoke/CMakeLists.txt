@@ -15,6 +15,16 @@ if(WIN32)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/d3d
     )
     target_link_libraries(d3d8_smoke PRIVATE platform d3d11 dxgi dxguid d3dcompiler)
+    add_executable(nv2a_shader_smoke
+        test_nv2a_shader.c
+        ../../src/kernel/nv2a_pb_scan.c
+        ../../src/kernel/nv2a_pb_exec.c
+        ../../src/kernel/nv2a_gpu_d3d11.cpp
+    )
+    target_include_directories(nv2a_shader_smoke PRIVATE ../../src)
+    target_link_libraries(nv2a_shader_smoke PRIVATE platform d3d11 d3dcompiler)
+    target_compile_features(nv2a_shader_smoke PRIVATE cxx_std_17)
+    target_compile_definitions(nv2a_shader_smoke PRIVATE _CRT_SECURE_NO_WARNINGS)
     if(MSVC)
         target_compile_options(d3d8_smoke PRIVATE /W3)
     endif()

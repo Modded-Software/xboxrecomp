@@ -40,9 +40,13 @@ target_include_directories(xbox_kernel PUBLIC
 )
 
 if(WIN32)
+    target_sources(xbox_kernel PRIVATE nv2a_gpu_d3d11.cpp)
+    target_compile_features(xbox_kernel PRIVATE cxx_std_17)
+    target_link_libraries(xbox_kernel PRIVATE d3d11 d3dcompiler)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+    target_link_libraries(xbox_kernel PRIVATE dbghelp)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)
@@ -50,8 +54,12 @@ else()
 endif()
 
 if(MSVC)
-    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /O2 /GS- /Gy)
+    target_compile_options(xbox_kernel PRIVATE /W4 /WX- /GS- /Gy)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
+    set_property(SOURCE nv2a_pb_exec.c nv2a_gpu_d3d11.cpp APPEND PROPERTY
+        COMPILE_OPTIONS "$<$<CONFIG:Debug>:/O2>" "$<$<CONFIG:Debug>:/Ob2>")
+    set_property(SOURCE nv2a_pb_exec.c nv2a_gpu_d3d11.cpp APPEND PROPERTY
+        VS_SETTINGS "BasicRuntimeChecks=Default")
 else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()

@@ -12,6 +12,7 @@
 
 #include "xinput_xbox.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 /* ======================================================================== */
@@ -22,8 +23,105 @@
 #include <xinput.h>
 #pragma comment(lib, "xinput.lib")
 
-static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
-static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+static LONG g_reported_slot[XBOX_MAX_CONTROLLERS] = { -1, -1, -1, -1 };
+static int g_host_slot = -1;
+static unsigned g_button_map[16] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+static unsigned g_button_threshold = 30, g_deadzone[2], g_axis_flags;
+static const char *const g_button_names[16] = {
+    "UP","DOWN","LEFT","RIGHT","START","BACK","LCLICK","RCLICK",
+    "A","B","X","Y","BLACK","WHITE","LT","RT"
+};
+static const char *const g_source_names[17] = {
+    "UP","DOWN","LEFT","RIGHT","START","BACK","LCLICK","RCLICK",
+    "A","B","X","Y","LB","RB","LT","RT","NONE"
+};
+
+static void input_config_error(const char *name, const char *value)
+{
+    fprintf(stderr, "[XINPUT] invalid %s: '%s'; input configuration rejected\n", name, value);
+    exit(EXIT_FAILURE);
+}
+
+static unsigned input_number(const char *name, unsigned maximum, unsigned fallback)
+{
+    const char *value = getenv(name);
+    if (!value) return fallback;
+    char *end;
+    unsigned long number = strtoul(value, &end, 10);
+    if (*value < '0' || *value > '9' || *end || number > maximum)
+        input_config_error(name, value);
+    return (unsigned)number;
+}
+
+static void input_configure(void)
+{
+    const char *slot = getenv("RECOMP_XINPUT_SLOT");
+    g_host_slot = -1;
+    if (slot && _stricmp(slot, "auto"))
+        g_host_slot = (int)input_number("RECOMP_XINPUT_SLOT", 3, 0);
+    g_button_threshold = input_number("RECOMP_INPUT_THRESHOLD", 254, 30);
+    g_deadzone[0] = input_number("RECOMP_INPUT_DEADZONE_LEFT", 32767, 0);
+    g_deadzone[1] = input_number("RECOMP_INPUT_DEADZONE_RIGHT", 32767, 0);
+    g_axis_flags = input_number("RECOMP_INPUT_AXES", 31, 0);
+    for (unsigned i = 0; i < 16; i++) g_button_map[i] = i;
+    const char *mapping = getenv("RECOMP_INPUT_MAP");
+    if (mapping) {
+        char buffer[1024], *context;
+        unsigned seen = 0;
+        size_t length = strlen(mapping);
+        if (!length || length >= sizeof(buffer) || mapping[0] == ',' ||
+            mapping[length - 1] == ',' || strstr(mapping, ",,"))
+            input_config_error("RECOMP_INPUT_MAP", mapping);
+        memcpy(buffer, mapping, length + 1);
+        char *entry = strtok_s(buffer, ",", &context);
+        while (entry) {
+            char *source = strchr(entry, '=');
+            if (!source) input_config_error("RECOMP_INPUT_MAP", mapping);
+            *source++ = '\0';
+            unsigned target = 0, host = 0;
+            while (target < 16 && _stricmp(entry, g_button_names[target])) target++;
+            while (host < 17 && _stricmp(source, g_source_names[host])) host++;
+            if (target == 16 || host == 17 || (seen & (1u << target)))
+                input_config_error("RECOMP_INPUT_MAP", mapping);
+            seen |= 1u << target;
+            g_button_map[target] = host;
+            entry = strtok_s(NULL, ",", &context);
+        }
+    }
+    fprintf(stderr, "[XINPUT] profile: slot=%d (-1=auto) threshold=%u deadzones=%u/%u axes=%u\n",
+            g_host_slot, g_button_threshold, g_deadzone[0], g_deadzone[1], g_axis_flags);
+}
+
+static BYTE source_pressure(const XINPUT_GAMEPAD *pad, unsigned source)
+{
+    static const WORD masks[14] = {
+        XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN,
+        XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT,
+        XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_BACK,
+        XINPUT_GAMEPAD_LEFT_THUMB, XINPUT_GAMEPAD_RIGHT_THUMB,
+        XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
+        XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_RIGHT_SHOULDER
+    };
+    if (source < 14) return (pad->wButtons & masks[source]) ? 255 : 0;
+    if (source == 14) return pad->bLeftTrigger;
+    if (source == 15) return pad->bRightTrigger;
+    return 0;
+}
+
+static SHORT mapped_axis(SHORT value, unsigned flag)
+{
+    int axis = (g_axis_flags & flag) ? -(int)value : (int)value;
+    return (SHORT)(axis > 32767 ? 32767 : axis);
+}
+
+static void map_stick(SHORT x, SHORT y, unsigned stick, SHORT *out_x, SHORT *out_y)
+{
+    int64_t radius = (int64_t)x * x + (int64_t)y * y;
+    if (radius <= (int64_t)g_deadzone[stick] * g_deadzone[stick])
+        x = y = 0;
+    *out_x = mapped_axis(x, 2u << (stick * 2));
+    *out_y = mapped_axis(y, 4u << (stick * 2));
+}
 
 /* ---- keyboard, when there is no pad --------------------------------------
  *
@@ -124,26 +222,64 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     pState->dwPacketNumber = ++packet;
 }
 
+static DWORD poll_host(DWORD port, XINPUT_STATE *state, DWORD *host_slot)
+{
+    DWORD connected = 0;
+    if (g_host_slot >= 0 && port == 0) {
+        DWORD result = XInputGetState((DWORD)g_host_slot, state);
+        LONG selected = result == ERROR_SUCCESS ? g_host_slot : -1;
+        LONG previous = InterlockedExchange(&g_reported_slot[port], selected);
+        if (selected >= 0 && previous != selected)
+            fprintf(stderr, "[XINPUT] selected host slot %d -> Xbox port 0\n", g_host_slot);
+        if (result != ERROR_SUCCESS && result != ERROR_DEVICE_NOT_CONNECTED)
+            fprintf(stderr, "[XINPUT] selected slot query failed: %lu\n", result);
+        *host_slot = (DWORD)g_host_slot;
+        return result;
+    }
+    DWORD wanted = g_host_slot >= 0 ? port - 1 : port;
+    for (DWORD slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
+        if ((int)slot == g_host_slot) continue;
+        DWORD result = XInputGetState(slot, state);
+        if (result != ERROR_SUCCESS) {
+            if (result != ERROR_DEVICE_NOT_CONNECTED) {
+                fprintf(stderr, "[XINPUT] slot %lu query failed: %lu\n", slot, result);
+                return result;
+            }
+            continue;
+        }
+        if (connected++ == wanted) {
+            LONG previous = InterlockedExchange(&g_reported_slot[port], (LONG)slot);
+            if (previous != (LONG)slot)
+                fprintf(stderr, "[XINPUT] host slot %lu -> Xbox port %lu\n", slot, port);
+            *host_slot = slot;
+            return ERROR_SUCCESS;
+        }
+    }
+    if (InterlockedExchange(&g_reported_slot[port], -1) != -1)
+        fprintf(stderr, "[XINPUT] Xbox port %lu disconnected\n", port);
+    return ERROR_DEVICE_NOT_CONNECTED;
+}
+
 void xbox_InputInit(void)
 {
-    for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
-        XINPUT_STATE state;
-        DWORD result = XInputGetState(i, &state);
-        g_controller_connected[i] = (result == ERROR_SUCCESS);
-    }
+    input_configure();
+    XINPUT_STATE state;
+    DWORD slot;
+    for (DWORD port = 0; port < XBOX_MAX_CONTROLLERS; port++)
+        poll_host(port, &state, &slot);
+    fprintf(stderr, "[XINPUT] live controller discovery enabled\n");
 }
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state;
-    DWORD result;
+    DWORD result, host_slot;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetState(dwPort, &xi_state);
+    result = poll_host(dwPort, &xi_state, &host_slot);
     if (result != ERROR_SUCCESS) {
-        g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0 && keyboard_enabled()) {
             keyboard_state(pState);
             return ERROR_SUCCESS;
@@ -151,32 +287,22 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         return result;
     }
 
-    g_controller_connected[dwPort] = TRUE;
-    g_last_packet[dwPort] = xi_state.dwPacketNumber;
-
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
     pState->dwPacketNumber = xi_state.dwPacketNumber;
-    pState->Gamepad.wButtons = xi_state.Gamepad.wButtons & 0x00FF;
-
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_A) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_B) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
-
-    pState->Gamepad.sThumbLX = xi_state.Gamepad.sThumbLX;
-    pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
-    pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
-    pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
+    for (unsigned target = 0; target < 16; target++) {
+        BYTE pressure = source_pressure(&xi_state.Gamepad, g_button_map[target]);
+        if (target < 8) {
+            if (pressure > g_button_threshold)
+                pState->Gamepad.wButtons |= (WORD)(1u << target);
+        } else pState->Gamepad.bAnalogButtons[target - 8] = pressure;
+    }
+    const XINPUT_GAMEPAD *pad = &xi_state.Gamepad;
+    map_stick(g_axis_flags & 1 ? pad->sThumbRX : pad->sThumbLX,
+              g_axis_flags & 1 ? pad->sThumbRY : pad->sThumbLY, 0,
+              &pState->Gamepad.sThumbLX, &pState->Gamepad.sThumbLY);
+    map_stick(g_axis_flags & 1 ? pad->sThumbLX : pad->sThumbRX,
+              g_axis_flags & 1 ? pad->sThumbLY : pad->sThumbRY, 1,
+              &pState->Gamepad.sThumbRX, &pState->Gamepad.sThumbRY);
 
     /* Merge the keyboard on top rather than only standing in for a missing
      * pad.
@@ -213,30 +339,40 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 {
     XINPUT_VIBRATION xi_vib;
+    XINPUT_STATE state;
+    DWORD slot, result;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
 
+    result = poll_host(dwPort, &state, &slot);
+    if (result != ERROR_SUCCESS) return result;
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-    return XInputSetState(dwPort, &xi_vib);
+    return XInputSetState(slot, &xi_vib);
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
+    XINPUT_STATE state;
+    DWORD slot;
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
-    return g_controller_connected[dwPort];
+    return poll_host(dwPort, &state, &slot) == ERROR_SUCCESS ||
+        (dwPort == 0 && keyboard_enabled());
 }
 
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
 {
     XINPUT_CAPABILITIES xi_caps;
-    DWORD result;
+    XINPUT_STATE state;
+    DWORD result, slot;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
+    result = poll_host(dwPort, &state, &slot);
+    if (result != ERROR_SUCCESS) return result;
+    result = XInputGetCapabilities(slot, dwFlags, &xi_caps);
     if (result != ERROR_SUCCESS) return result;
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));

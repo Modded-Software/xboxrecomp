@@ -6,7 +6,80 @@ Hardware emulation of the Xbox's MCPX APU (Audio Processing Unit), extracted fro
 - **GP (Global Processor)** — DSP for global effects (reverb, chorus). Currently **stubbed** — effects bypass.
 - **EP (Encode Processor)** — DSP for AC3/DTS encoding. Currently **stubbed** — passthrough.
 
-Audio output uses Windows `waveOut` at 48kHz stereo 16-bit.
+Audio output uses Windows XAudio2, with `waveOut` as a fallback, at 48kHz
+stereo 16-bit.
+
+## Output and DMA Integration
+
+For integrations with separate memory banks, use
+`mcpx_apu_init_standalone_mapped` with the contiguous-bank base and
+`xbox_DmaPhysicalPointer`. Voice/descriptor allocations normally occupy that
+bank, but payloads can occupy ordinary low RAM. `MmGetPhysicalAddress` records
+page provenance so the resolver selects the correct, separate storage for
+physical reads/writes, streaming ADPCM copies and diagnostic acknowledgements.
+Invalid or mixed-bank extents are reported instead of reading unrelated data.
+This provenance model does not implement general physical aliasing when both
+banks reuse the same numeric offset.
+
+The legacy `mcpx_apu_init_standalone` constructor retains flat-RAM behavior
+for hosts with a single linear physical bank. Other integrations must supply
+their actual physical backing or a mapper, not an unrelated virtual mapping.
+
+The VP produces 32 samples per tick. Eight DSP slices assemble one 256-frame
+stereo packet, submitted once every 5.33ms. The monitor preserves that packet
+and mixes software voices into it; it must not clear hardware output or
+generate 1024/2048 replacement frames each tick. Muting clears the packet,
+and the inactive-hardware path clears stale VP data before software mixing.
+
+XAudio2 queue saturation applies backpressure while releasing the APU lock.
+The waveOut fallback also waits before reusing an in-flight buffer. Submission
+failures and two-second queue stalls are reported and stop host output,
+rather than silently dropping packets or overwriting a playing buffer.
+Windows requests 1ms timer resolution for this audio cadence and balances
+the request on monitor shutdown.
+
+The Windows producer uses MMCSS Audio scheduling. Packet deadlines retain
+up to eight packet intervals of catch-up rather than discarding time after
+each delayed tick. Longer stalls rebase the deadline, and queue backpressure
+still bounds submission.
+
+`NV_PAPU_XGSCNT` counts processed 48kHz samples (32 per VP slice), not
+100ns clock ticks. The counter wraps as an unsigned 32-bit sample count.
+
+Set `RECOMP_APU_DIAG=1` to log accepted output blocks, stereo frames, nonzero
+scalar samples, nonzero hardware samples, peak amplitude, test-tone and mute
+state. It also logs voice starts and interval source/routed-contribution
+peaks, retaining short-lived effects until the next report. Routed peaks are
+per-source contributions, not the final combined DSP output.
+`RECOMP_APU_TRACE=1` traces MMIO. Nonzero samples alone do not establish
+correct DMA mapping, effects fidelity or a complete soundtrack.
+GP/EP remain passthrough stubs; AC97-ready and DSP-ack diagnostic overrides are
+not DSP56300 emulation.
+
+### Diagnostic DSP Command Completion
+
+`RECOMP_APU_DSP_ACK` accepts comma-separated aligned physical addresses,
+`gp:<byte offset>` or `ep:<byte offset>`. The processor-relative forms resolve
+through the programmed scratch scatter/gather table (`GPSADDR`/`EPSADDR`),
+with its SGE limit checked before accessing the selected page. These registers
+point to tables, not directly to the command buffer.
+
+Command offsets depend on the guest's DSP protocol and are not universal
+runtime defaults. Fixed mailbox addresses can become stale when allocation
+order changes; processor-relative addressing follows the programmed scratch
+allocation. An explicitly empty setting disables acknowledgement.
+
+Diagnostic command acknowledgement runs in the regular APU frame loop after
+throttling, independently of voice-front-end execution. Gating acknowledgement
+on voice processing can leave a guest audio worker polling the mailbox while
+holding a lock after voices stop. Emulator pause still suspends frame servicing.
+Acknowledgement scheduling does not add DSP instruction execution.
+
+This mode explicitly logs **diagnostic passthrough** and clears command words
+without executing their DSP programs. It does not implement effects or prove
+correct command results. Guest audio state transitions, sustained playback,
+spatial/effects fidelity and soundtrack coverage require separate validation.
+Audible source output alone does not establish complete audio compatibility.
 
 ## Files
 
@@ -86,8 +159,8 @@ mcpx_apu_shutdown(apu);
                │ mixed samples
                ▼
    ┌──────────────────────────────┐
-   │    waveOut (48kHz stereo)    │
-   │  4 × 2048-sample buffers    │
+   │ XAudio2 / waveOut, 48kHz     │
+   │ 256-frame stereo packets    │
    └──────────────────────────────┘
 ```
 
@@ -171,3 +244,4 @@ Full register definitions in `apu_regs.h`.
 - `qemu_shim.h` (from `../nv2a/`) — QEMU type abstraction layer
 - `kernel32.lib` — Win32 threading
 - `winmm.lib` — waveOut audio output
+- `xaudio2_8.lib`, `ole32.lib` — primary Windows audio output

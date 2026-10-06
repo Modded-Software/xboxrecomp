@@ -1,5 +1,12 @@
 # NV2A Shader Translation
 
+The translators and source paths below describe the D3D8/PGRAPH implementation.
+The kernel pushbuffer backend is a separate path; see
+[Native NV2A to D3D11 Translation](../runtime/nv2a-d3d11-backend.md) for its
+vertex/state programs, fixed-function lighting, texture-coordinate generation,
+texture stages, combiners and resource caches. Cache sizes and limitations in
+this guide apply only to the D3D8/PGRAPH path.
+
 Xbox games do not ship HLSL. They configure the NV2A's fixed-function combiner
 pipeline, or upload raw vertex-shader microcode. Both have to become something
 D3D11 or OpenGL will accept, and both are translated at runtime and cached.

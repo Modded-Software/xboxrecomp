@@ -23,6 +23,40 @@ NV2AState *nv2a_get_state(void) {
     return g_nv2a;
 }
 
+int nv2a_get_pvideo_overlay(uint32_t *offset, uint32_t *pitch,
+                            uint32_t *width, uint32_t *height,
+                            uint32_t *out_x, uint32_t *out_y,
+                            uint32_t *out_width, uint32_t *out_height)
+{
+    uint32_t format, size_in, point_in, size_out, point_out;
+
+    if (!g_nv2a)
+        return 0;
+    if (!(g_nv2a->pvideo.regs[NV_PVIDEO_BUFFER]
+            & NV_PVIDEO_BUFFER_0_USE))
+        return 0;
+
+    format = g_nv2a->pvideo.regs[NV_PVIDEO_FORMAT];
+    if (((format & NV_PVIDEO_FORMAT_COLOR) >> 16) !=
+            NV_PVIDEO_FORMAT_COLOR_LE_CR8YB8CB8YA8)
+        return 0;
+
+    size_in = g_nv2a->pvideo.regs[NV_PVIDEO_SIZE_IN];
+    point_in = g_nv2a->pvideo.regs[NV_PVIDEO_POINT_IN];
+    size_out = g_nv2a->pvideo.regs[NV_PVIDEO_SIZE_OUT];
+    point_out = g_nv2a->pvideo.regs[NV_PVIDEO_POINT_OUT];
+    *pitch = format & NV_PVIDEO_FORMAT_PITCH;
+    *offset = g_nv2a->pvideo.regs[NV_PVIDEO_OFFSET]
+            | ((point_in >> 3) & 0x3Fu);
+    *width = (size_in & NV_PVIDEO_SIZE_IN_WIDTH) - ((point_in >> 3) >> 1);
+    *height = (size_in >> 16) & 0x7FFu;
+    *out_x = point_out & NV_PVIDEO_POINT_OUT_X;
+    *out_y = (point_out >> 16) & 0xFFFu;
+    *out_width = size_out & NV_PVIDEO_SIZE_OUT_WIDTH;
+    *out_height = (size_out >> 16) & 0xFFFu;
+    return *pitch && *width && *height && *out_width && *out_height;
+}
+
 /* ============================================================
  * IRQ aggregation (from xemu nv2a.c)
  * ============================================================ */

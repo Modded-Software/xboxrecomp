@@ -22,7 +22,7 @@ if(WIN32)
 endif()
 
 if(MSVC)
-    target_compile_options(xbox_dsound PRIVATE /W4 /O2)
+    target_compile_options(xbox_dsound PRIVATE /W4)
 else()
     target_compile_options(xbox_dsound PRIVATE -Wall -Wextra -O2)
 endif()
