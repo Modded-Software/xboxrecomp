@@ -27,6 +27,7 @@ static struct {
     double draw_setup, draw_textures, draw_streams, draw_shaders, draw_submit, draw_bookkeeping;
     double vertex_compile, pixel_compile;
     uint64_t vertex_shader_hits, vertex_shader_misses, pixel_shader_hits, pixel_shader_misses, shader_evictions;
+    uint64_t vertex_shader_failures, pixel_shader_failures;
     uint64_t hash_bytes;
     uint64_t blend_created, depth_created, sampler_created;
     uint64_t color_created, depth_surface_created, color_refreshed, depth_refreshed;
@@ -40,6 +41,7 @@ static struct {
     uint64_t color_clear_publications, depth_clear_publications, clear_readback_bytes_avoided;
     uint64_t texture_created, texture_updated, texture_update_bytes;
     uint64_t texture_evicted, texture_cache_entries, texture_cache_bytes;
+    uint64_t texture_decode_failures, texture_create_failures;
     uint64_t fixed_draws, lit_draws, skinned_draws, texgen_draws, texture_matrix_draws;
     uint64_t signed_texture_stages, packed_texture_stages;
     uint64_t window_clip_draws, window_scissor_draws, window_shader_draws, window_exclusive_draws;
@@ -78,9 +80,11 @@ extern "C" void nv2a_gpu_report(void)
     std::fprintf(stderr, "[GPU-D3D11] states created: %llu blend, %llu depth, %llu sampler\n",
                  (unsigned long long)gpu_timing.blend_created, (unsigned long long)gpu_timing.depth_created,
                  (unsigned long long)gpu_timing.sampler_created);
-    std::fprintf(stderr, "[GPU-D3D11] texture uploads: %llu created, %llu updated; %.3f GiB updated\n",
+    std::fprintf(stderr, "[GPU-D3D11] texture uploads: %llu created, %llu updated; %.3f GiB updated; %llu decode failures, %llu create failures\n",
                  (unsigned long long)gpu_timing.texture_created, (unsigned long long)gpu_timing.texture_updated,
-                 (double)gpu_timing.texture_update_bytes / 1073741824.0);
+                 (double)gpu_timing.texture_update_bytes / 1073741824.0,
+                 (unsigned long long)gpu_timing.texture_decode_failures,
+                 (unsigned long long)gpu_timing.texture_create_failures);
     std::fprintf(stderr, "[GPU-D3D11] texture cache: %llu entries, %.1f MiB, %llu evictions\n",
                  (unsigned long long)gpu_timing.texture_cache_entries,
                  (double)gpu_timing.texture_cache_bytes / 1048576.0,
@@ -120,10 +124,12 @@ extern "C" void nv2a_gpu_report(void)
     std::fprintf(stderr, "[GPU-D3D11] constants: %llu uploads, %llu unchanged reuses, %.3fs\n",
                  (unsigned long long)gpu_timing.constant_uploads,
                  (unsigned long long)gpu_timing.constant_reuses, gpu_timing.constants);
-    std::fprintf(stderr, "[GPU-D3D11] shaders: vertex %llu hits/%llu misses, %.3fs compile; pixel %llu hits/%llu misses, %.3fs compile; %llu evictions\n",
+    std::fprintf(stderr, "[GPU-D3D11] shaders: vertex %llu hits/%llu misses/%llu failures, %.3fs compile; pixel %llu hits/%llu misses/%llu failures, %.3fs compile; %llu evictions\n",
                  (unsigned long long)gpu_timing.vertex_shader_hits, (unsigned long long)gpu_timing.vertex_shader_misses,
+                 (unsigned long long)gpu_timing.vertex_shader_failures,
                  gpu_timing.vertex_compile, (unsigned long long)gpu_timing.pixel_shader_hits,
-                 (unsigned long long)gpu_timing.pixel_shader_misses, gpu_timing.pixel_compile,
+                 (unsigned long long)gpu_timing.pixel_shader_misses,
+                 (unsigned long long)gpu_timing.pixel_shader_failures, gpu_timing.pixel_compile,
                  (unsigned long long)gpu_timing.shader_evictions);
     std::fprintf(stderr, "[GPU-D3D11] fixed function: %llu draws, %llu lit, %llu skinned, %llu texgen, %llu texture-matrix\n",
                  (unsigned long long)gpu_timing.fixed_draws, (unsigned long long)gpu_timing.lit_draws,
@@ -302,6 +308,7 @@ struct CachedTexture {
     uint32_t width, height, format, cube, pitch, linear, face_stride, depth;
     uint32_t mip_levels;
     uint64_t bytes;
+    uint64_t validated_serial;   /* frame serial this entry's memcmp last matched */
     std::vector<uint8_t> source_snapshot;
     ComPtr<ID3D11ShaderResourceView> view;
 };
@@ -587,6 +594,7 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state)
     HRESULT result = D3DCompile(source.data(), source.size(), "NV2A-vertex", nullptr, nullptr, "vs_guest", "vs_5_0",
                                D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
     if (FAILED(result)) {
+        gpu_timing.vertex_shader_failures++;
         std::fprintf(stderr, "[GPU-D3D11] vertex compile: %s\n", errors ? (const char *)errors->GetBufferPointer() : "failed");
         return nullptr;
     }
@@ -723,6 +731,7 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
     HRESULT result = D3DCompile(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A-guest", definitions, nullptr,
                                "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
     if (FAILED(result)) {
+        gpu_timing.pixel_shader_failures++;
         std::fprintf(stderr, "[GPU-D3D11] guest shader compile: %s\n", errors ? (const char *)errors->GetBufferPointer() : "failed");
         return nullptr;
     }
@@ -1068,11 +1077,59 @@ static void publish_known_clear(SurfaceType &surface, uint32_t bytes)
     surface.dirty = false;
 }
 
-extern "C" void nv2a_gpu_sync(void)
+/* Texture re-validation pacing.
+ *
+ * Deciding whether a bound texture changed means memcmp'ing the whole image
+ * from guest RAM against its snapshot. The menu bound textures ~2.7x their
+ * total size per frame, so the same unchanged image was compared several times
+ * a frame; measured, that was 62 GiB and ~24% of runtime for ~1,000 real
+ * uploads. Validating each texture at most once per frame keeps the first
+ * comparison and reuses its verdict for the rest of the frame.
+ *
+ * The serial advances on every flip (nv2a_gpu_sync). Disable with
+ * RECOMP_TEX_VALIDATE_ONCE=0 if a title writes a texture mid-frame and samples
+ * it again -- on hardware that is a race anyway, but a title might rely on it.
+ */
+static uint64_t s_texture_validate_serial = 1;
+static int s_tex_validate_once = -1;
+static bool tex_validate_once(void)
+{
+    if (s_tex_validate_once < 0) {
+        const char *value = std::getenv("RECOMP_TEX_VALIDATE_ONCE");
+        s_tex_validate_once = (value && value[0] == '0') ? 0 : 1;
+    }
+    return s_tex_validate_once != 0;
+}
+
+static void gpu_sync_impl(bool publish)
 {
     GpuTimer sync_timer(gpu_timing.sync);
     if (!context) return;
     gpu_timing.sync_calls++;
+    if (!publish) {
+        /* Completion only: wait for the GPU to finish, but do not copy any
+         * surface back to guest RAM. WAIT_FOR_IDLE and the semaphore release
+         * only need ordering -- the guest is not about to read the surface --
+         * and they fire ~50x a frame, so a full readback on each was most of
+         * the sync cost. Nothing is marked clean, so the next real publish
+         * still writes the final contents. The texture serial is deliberately
+         * NOT advanced here: this is not a frame boundary. */
+        if (pending_draws) {
+            GpuTimer wait_timer(gpu_timing.sync_event_wait);
+            gpu_timing.completion_waits++;
+            if (!completion_event) {
+                D3D11_QUERY_DESC description = {D3D11_QUERY_EVENT, 0};
+                HRESULT created = device->CreateQuery(&description, &completion_event);
+                if (FAILED(created)) readback_failed("completion event", created, "create");
+            }
+            context->End(completion_event.Get());
+            context->Flush();
+            while (context->GetData(completion_event.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE)
+                SwitchToThread();
+            pending_draws = false;
+        }
+        return;
+    }
     ID3D11RenderTargetView *empty = nullptr;
     context->OMSetRenderTargets(1, &empty, nullptr);
     bool has_readback = false;
@@ -1242,6 +1299,19 @@ extern "C" void nv2a_gpu_sync(void)
         surface.dirty = false;
     }
     pending_draws = false;
+    s_texture_validate_serial++;
+}
+
+/* Full sync: publish every dirty surface to guest RAM (flips, invalidate). */
+extern "C" void nv2a_gpu_sync(void)
+{
+    gpu_sync_impl(true);
+}
+
+/* Completion-only sync for ordering events that do not read surfaces back. */
+extern "C" void nv2a_gpu_wait(void)
+{
+    gpu_sync_impl(false);
 }
 
 extern "C" void nv2a_gpu_flush(void)
@@ -1581,24 +1651,37 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     }
     if (direct) {
         direct->last_used = ++surface_use_serial;
-        refresh_surface(*direct);
+        /* A surface marked dirty holds GPU content newer than guest RAM (it has
+         * been drawn into but not published). Re-uploading the snapshot would
+         * overwrite that with the previous publish, so sample the GPU texture
+         * as-is and only refresh from guest RAM when the surface is clean.
+         * This is also what lets a sync skip publication without feeding the
+         * GPU stale data -- see RECOMP_SYNC_LIGHT. */
+        if (!direct->dirty)
+            refresh_surface(*direct);
         return direct->view.Get();
     }
     CachedTexture *refresh = nullptr;
     {
         GpuTimer hash_timer(gpu_timing.hash);
         gpu_timing.hash_bytes += binding.source_bytes;
-        for (auto &texture : textures)
-            if (texture.source == binding.source && texture.width == binding.width && texture.height == binding.height &&
-                texture.format == binding.format && texture.cube == binding.cube && texture.depth == binding.depth && texture.pitch == binding.pitch &&
-                texture.linear == binding.linear && texture.face_stride == binding.face_stride &&
-                texture.mip_levels == levels &&
-                texture.source_snapshot.size() == binding.source_bytes) {
-                if (std::memcmp(texture.source_snapshot.data(), binding.source, binding.source_bytes) == 0)
-                    return texture.view.Get();
-                refresh = &texture;
-                break;
+        for (auto &texture : textures) {
+            if (!(texture.source == binding.source && texture.width == binding.width && texture.height == binding.height &&
+                  texture.format == binding.format && texture.cube == binding.cube && texture.depth == binding.depth && texture.pitch == binding.pitch &&
+                  texture.linear == binding.linear && texture.face_stride == binding.face_stride &&
+                  texture.mip_levels == levels &&
+                  texture.source_snapshot.size() == binding.source_bytes))
+                continue;
+            /* Already compared this entry this frame: the verdict still holds. */
+            if (tex_validate_once() && texture.validated_serial == s_texture_validate_serial)
+                return texture.view.Get();
+            if (std::memcmp(texture.source_snapshot.data(), binding.source, binding.source_bytes) == 0) {
+                texture.validated_serial = s_texture_validate_serial;
+                return texture.view.Get();
             }
+            refresh = &texture;
+            break;
+        }
     }
     GpuTimer upload_timer(gpu_timing.upload);
     uint32_t faces = binding.cube ? 6 : 1;
@@ -1642,7 +1725,14 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                             binding.decode_level ? binding.decode_level(binding.decode_context, face, level, column, row, pixel) :
                             binding.cube ? binding.decode_face(binding.decode_context, face, column, row, pixel) :
                                            binding.decode(binding.decode_context, column, row, pixel);
-                        if (!decoded) return nullptr;
+                        if (!decoded) {
+                            static unsigned logged;
+                            if (logged++ < 16)
+                                std::fprintf(stderr, "[GPU-D3D11] texture decode failed: fmt 0x%X %ux%u depth %u face %u level %u linear %u\n",
+                                             binding.format, binding.width, binding.height, binding.depth, face, level, binding.linear);
+                            gpu_timing.texture_decode_failures++;
+                            return nullptr;
+                        }
                         if (binding.depth) *pixel = (*pixel & 0xFF00FF00u) | ((*pixel & 255u) << 16) | ((*pixel >> 16) & 255u);
                     }
                 data[subresource].pSysMem = image.data(); data[subresource].SysMemPitch = width * 4;
@@ -1661,6 +1751,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
             context->UpdateSubresource(resource.Get(), subresource, nullptr,
                                       data[subresource].pSysMem, data[subresource].SysMemPitch, data[subresource].SysMemSlicePitch);
         refresh->source_snapshot.assign(binding.source, binding.source + binding.source_bytes);
+        refresh->validated_serial = s_texture_validate_serial;
         gpu_timing.texture_updated++;
         gpu_timing.texture_update_bytes += resource_bytes;
         return refresh->view.Get();
@@ -1677,6 +1768,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     entry.cube = binding.cube;
     entry.depth = binding.depth;
     entry.mip_levels = levels; entry.bytes = resource_bytes;
+    entry.validated_serial = s_texture_validate_serial;
     if (binding.depth) {
         D3D11_TEXTURE3D_DESC volume_description = {};
         volume_description.Width = binding.width; volume_description.Height = binding.height;
@@ -1684,9 +1776,15 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         volume_description.Format = format; volume_description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         ComPtr<ID3D11Texture3D> volume;
         if (FAILED(device->CreateTexture3D(&volume_description, data.data(), &volume)) ||
-            FAILED(device->CreateShaderResourceView(volume.Get(), nullptr, &entry.view))) return nullptr;
+            FAILED(device->CreateShaderResourceView(volume.Get(), nullptr, &entry.view))) {
+            gpu_timing.texture_create_failures++;
+            return nullptr;
+        }
     } else if (FAILED(device->CreateTexture2D(&description, data.data(), &texture)) ||
-        FAILED(device->CreateShaderResourceView(texture.Get(), nullptr, &entry.view))) return nullptr;
+        FAILED(device->CreateShaderResourceView(texture.Get(), nullptr, &entry.view))) {
+        gpu_timing.texture_create_failures++;
+        return nullptr;
+    }
     gpu_timing.texture_created++;
     entry.source_snapshot.assign(binding.source, binding.source + binding.source_bytes);
     entry.bytes += entry.source_snapshot.size();

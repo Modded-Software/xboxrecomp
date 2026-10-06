@@ -11,6 +11,7 @@ extern "C" {
 int nv2a_gpu_available(void);
 int nv2a_gpu_compile(void);
 void nv2a_gpu_sync(void);
+void nv2a_gpu_wait(void);
 void nv2a_gpu_flush(void);
 void nv2a_gpu_invalidate(void);
 void nv2a_gpu_report(void);
