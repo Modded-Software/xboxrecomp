@@ -48,6 +48,34 @@ void nv2a_pb_exec_flush(void)
 #endif
 }
 
+/* Ordering events (WAIT_FOR_IDLE, semaphore release) only need the GPU to have
+ * finished; they do not read surfaces back. They fire tens of times per frame,
+ * so a full publication on each was most of the sync cost.
+ *
+ * Safe because the texture path no longer re-uploads a dirty surface from guest
+ * RAM: refresh_surface is skipped while the surface holds unpublishsed GPU
+ * content (nv2a_gpu_d3d11.cpp, the "direct" branch). Without that this stalled
+ * the title at the video->menu transition; with it, the menu runs ~30-35 FPS
+ * instead of ~12-18. Set RECOMP_SYNC_LIGHT=0 to restore full publication on
+ * every ordering event. */
+static int pb_sync_light(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *value = getenv("RECOMP_SYNC_LIGHT");
+        on = (value && value[0] == '0') ? 0 : 1;
+    }
+    return on;
+}
+
+static void pb_flush_ordering(void)
+{
+#ifdef _WIN32
+    if (pb_sync_light()) { nv2a_gpu_wait(); return; }
+#endif
+    nv2a_pb_exec_flush();
+}
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
@@ -286,6 +314,10 @@ static struct {
     uint32_t window_clip_horizontal[8], window_clip_vertical[8];
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
+    /* A flush is a full GPU->CPU readback, so which guest event drives it says
+     * where to make it cheaper. See nv2a_pb_exec_report. */
+    uint32_t flush_flip, flush_semaphore, flush_wait_idle, flush_fence,
+             flush_clear, flush_raster, flush_report, flush_present;
     uint32_t semaphore_context, semaphore_offset;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
@@ -414,7 +446,8 @@ static void semaphore_release(uint32_t value)
     if (!destination)
         goto failure;
     /* Retire the command's value, not a concurrently advanced CPU counter. */
-    nv2a_pb_exec_flush();
+    s_gpu.flush_semaphore++;
+    pb_flush_ordering();
     *(volatile uint32_t *)destination = value;
     return;
 
@@ -776,7 +809,7 @@ static void clear_surface(uint32_t param)
 #ifdef _WIN32
     native_clear = gpu_clear_surface(param);
 #endif
-    if (!native_clear) nv2a_pb_exec_flush();
+    if (!native_clear) { s_gpu.flush_clear++; nv2a_pb_exec_flush(); }
 
     if (!native_clear && (param & 3u) && s_gpu.depth_offset && s_gpu.depth_pitch) {
         uint32_t format = (s_gpu.format >> 4) & 15u;
@@ -1529,6 +1562,7 @@ static void raster_triangle(const float a[2], const float b[2],
     float fast_uv[3][2];
     uint8_t fast_modulate[4][256];
 
+    s_gpu.flush_raster++;
     nv2a_pb_exec_flush();
 
     if (bpp != 4 && bpp != 2)
@@ -3047,13 +3081,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     if (method == NV097_WAIT_FOR_IDLE) {
-        nv2a_pb_exec_flush();
+        s_gpu.flush_wait_idle++;
+        pb_flush_ordering();
         return;
     }
     if (method == 0x0100) {
         if (!param)
             return;
         if (xbox_Nv2aNativeFencesEnabled()) {
+            s_gpu.flush_fence++;
             nv2a_pb_exec_flush();
             if (xbox_Nv2aSoftwareMethod(param, s_gpu.depth_clear,
                                        s_gpu.clear_color))
@@ -3552,6 +3588,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_FLIP_STALL:
+        s_gpu.flush_flip++;
         nv2a_pb_exec_flush();
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now. */
@@ -3817,6 +3854,7 @@ static void peek_chain(void)
 
 void nv2a_pb_exec_report(void)
 {
+    s_gpu.flush_report++;
     nv2a_pb_exec_flush();
     fprintf(stderr, "[GPU-D3D11] batches: %u hardware, %u CPU fallback\n", s_gpu.gpu_batches, s_gpu.cpu_batches);
     fprintf(stderr, "[GPU-D3D11] index stream: %llu u16, %llu u32, %llu array-run indices; %llu above 65535; %llu native u32 batches\n",
@@ -3865,6 +3903,11 @@ void nv2a_pb_exec_report(void)
     }
     int i, j;
 
+    fprintf(stderr, "[GPU] flushes: flip %u, wait_idle %u, fence %u, "
+                    "semaphore %u, clear %u, raster %u, report %u\n",
+            s_gpu.flush_flip, s_gpu.flush_wait_idle, s_gpu.flush_fence,
+            s_gpu.flush_semaphore, s_gpu.flush_clear, s_gpu.flush_raster,
+            s_gpu.flush_report);
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                     " clears %u | %u unhandled methods (%d distinct)\n",
             s_gpu.color_offset, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
