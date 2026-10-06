@@ -45,14 +45,32 @@ bool mcpx_apu_diagnostics_enabled(void)
 
 uint8_t *mcpx_apu_ram_address(uint64_t physical, uint32_t bytes)
 {
+    uint8_t *pointer;
     if (g_apu_physical_mapper) {
-        uint8_t *pointer = g_apu_physical_mapper(physical, bytes);
-        if (pointer) return pointer;
-        fprintf(stderr, "[APU] unmapped DMA address 0x%llX + %u\n",
-                (unsigned long long)physical, bytes);
-        abort();
+        pointer = g_apu_physical_mapper(physical, bytes);
+        if (!pointer) {
+            fprintf(stderr, "[APU] unmapped DMA address 0x%llX + %u\n",
+                    (unsigned long long)physical, bytes);
+            abort();
+        }
+    } else {
+        pointer = g_apu_ram_ptr + (physical & 0x03FFFFFF);
     }
-    return g_apu_ram_ptr + (physical & 0x03FFFFFF);
+    {   /* RECOMP_APU_MAP_TRACE: what the APU resolves, and where it landed. */
+        static int trace = -1;
+        if (trace < 0) trace = getenv("RECOMP_APU_MAP_TRACE") != NULL;
+        if (trace) {
+            static int n;
+            if (n < 120) {
+                fprintf(stderr, "[APU-MAP] phys=0x%08llX +%u -> %p base=%p\n",
+                        (unsigned long long)physical, bytes,
+                        (void *)pointer, (void *)g_apu_ram_ptr);
+                n++;
+                fflush(stderr);
+            }
+        }
+    }
+    return pointer;
 }
 
 MCPXAPUState *g_state = NULL;

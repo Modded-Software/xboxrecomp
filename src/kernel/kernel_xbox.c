@@ -145,9 +145,32 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_VIDEO:
-        /* NTSC with widescreen and HDTV support enabled */
+        /* NTSC with widescreen and HDTV support enabled.
+         *
+         * Titles that size their own framebuffers read the flags as
+         * (value >> 16) & 0x5F -- StarCraft: Ghost's XGetVideoFlags does
+         * exactly this -- so the flags belong in the high half and the low
+         * half is the video standard. The legacy value below therefore reads
+         * as "no HD modes" to such a title and leaves it at 480i, which is
+         * the correct default.
+         *
+         * When the runner asked for a resolution, put the matching flags in
+         * the high half so the title's own mode table picks a native HD mode,
+         * then give a title-specific hook the chance to force an exact size. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            uint32_t value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            uint32_t w = 0, h = 0;
+
+            if (xbox_VideoDesiredResolution(&w, &h)) {
+                if (w >= 1280 || h >= 720)
+                    value = (uint32_t)XC_VIDEO_FLAGS_HDTV << 16;
+                else if (w > 640 || h > 480)
+                    value = (uint32_t)XC_VIDEO_FLAGS_WIDESCREEN << 16;
+                else
+                    value = 0;
+            }
+            xbox_VideoQueryHook(ValueIndex, &value, NULL);
+            *(PULONG)Value = value;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

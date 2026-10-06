@@ -3215,6 +3215,32 @@ uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes)
     return NULL;
 }
 
+/* APU DMA resolution, a superset of xbox_DmaPhysicalPointer.
+ *
+ * The APU's voice/SGE/notifier structures are built in MmAllocateContiguousMemory
+ * while its payloads can sit in ordinary low RAM, and the two arenas here reuse
+ * the same numeric offsets. The provenance table is per page, so whichever
+ * MmGetPhysicalAddress ran last wins -- and a later ordinary translation for a
+ * page a live contiguous block owns moves the APU 64MB away and it reads
+ * unrelated RAM as audio (full-scale square-wave screech). Resolve such a page
+ * to the live contiguous block, which is what DirectSound actually wrote.
+ *
+ * OHCI reads through xbox_DmaPhysicalPointer and keeps last-writer-wins: its
+ * buffers are ordinary RAM and must not be redirected into the contiguous
+ * window, so this must not live in the shared resolver.
+ * ponytail: first-page test only; a straddling extent is the shared resolver's
+ * problem. Per-access bank tagging if a title ever needs both banks on one page. */
+uint8_t *xbox_ApuPhysicalPointer(uint64_t physical, uint32_t bytes)
+{
+    int explicit_contiguous = physical >= XBOX_CONTIG_BASE &&
+        physical < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    if (!explicit_contiguous && g_contig_memory &&
+        physical < CONTIG_ARENA_BYTES && physical / 4096 < CONTIG_PAGE_COUNT &&
+        InterlockedCompareExchange(&g_contig_owner[physical / 4096], 0, 0) != 0)
+        return (uint8_t *)g_contig_memory + physical;
+    return xbox_DmaPhysicalPointer(physical, bytes);
+}
+
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {

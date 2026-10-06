@@ -28,6 +28,7 @@
 #include <string.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern int xbox_VideoDesiredResolution(uint32_t *width, uint32_t *height);
 int xbox_FramebufferDumpBmp(const char *path);
 
 static volatile LONG s_fb_running;
@@ -244,6 +245,11 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 fprintf(stderr, "[FBWIN] failed to capture framebuffer to %s\n", path);
             return 0;
         }
+        /* Alt+Esc releases the mouse so the window can be moved or the desktop
+         * reached; clicking the client grabs it again. Bare Esc is the game's
+         * Back, so it must not release on its own. */
+        if (w == VK_ESCAPE && s_key_down[VK_MENU] && getenv("RECOMP_KBM"))
+            xbox_FramebufferMouseCapture(0);
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
@@ -328,7 +334,21 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         return DefWindowProcA(h, m, w, l);
     }
 
-    case WM_LBUTTONDOWN: s_mouse_btn[0] = 1; return 0;
+    /* Non-client buttons (title bar, borders, menu box) must reach the default
+     * handler so the window can be dragged or resized. A click there never
+     * grabs the mouse; only a click inside the rendered client area does. */
+    case WM_NCLBUTTONDOWN:
+    case WM_NCRBUTTONDOWN:
+    case WM_NCMBUTTONDOWN:
+        return DefWindowProcA(h, m, w, l);
+
+    case WM_LBUTTONDOWN:
+        /* Clicking into the game grabs the mouse for mouse-look; Esc releases
+         * it again so the window can be dragged. */
+        if (getenv("RECOMP_KBM"))
+            xbox_FramebufferMouseCapture(1);
+        s_mouse_btn[0] = 1;
+        return 0;
     case WM_LBUTTONUP:   s_mouse_btn[0] = 0; return 0;
     case WM_RBUTTONDOWN: s_mouse_btn[1] = 1; return 0;
     case WM_RBUTTONUP:   s_mouse_btn[1] = 0; return 0;
@@ -341,8 +361,6 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
 
     case WM_SETFOCUS:
-        if (getenv("RECOMP_KBM"))
-            xbox_FramebufferMouseCapture(1);
         return 0;
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
@@ -351,6 +369,30 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         s_mouse_btn[0] = s_mouse_btn[1] = s_mouse_btn[2] = 0;
         xbox_FramebufferMouseCapture(0);
         return 0;
+
+    /* The window is never maximized. The WM force-fits a window larger than
+     * the monitor, which crops a 1:1 framebuffer to the screen and makes the
+     * window look fullscreen, so both the state and the size are pinned. */
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO *mmi = (MINMAXINFO *)l;
+        RECT r;
+        r.left = 0; r.top = 0;
+        r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, FALSE);
+        mmi->ptMaxSize.x = mmi->ptMaxTrackSize.x = r.right - r.left;
+        mmi->ptMaxSize.y = mmi->ptMaxTrackSize.y = r.bottom - r.top;
+        return 0;
+    }
+
+    case WM_SIZE:
+        if (IsZoomed(h))
+            ShowWindow(h, SW_RESTORE);
+        return 0;
+
+    case WM_SYSCOMMAND:
+        if ((w & 0xFFF0) == SC_MAXIMIZE)
+            return 0;
+        break;
     }
     return DefWindowProcA(h, m, w, l);
 }
@@ -434,8 +476,9 @@ int xbox_FramebufferDumpBmp(const char *path)
 static int fb_format_window_title(char *caption, size_t capacity, const char *game_title,
                                   double fps, LONG64 frame)
 {
-    int length = snprintf(caption, capacity, "%s | %.2f FPS | Frame %llu",
-                          game_title, fps, (unsigned long long)frame);
+    int length = snprintf(caption, capacity, "%s | %ux%u | %.2f FPS | Frame %llu",
+                          game_title, s_fb_width, s_fb_height, fps,
+                          (unsigned long long)frame);
     if (length < 0 || (size_t)length >= capacity) {
         fprintf(stderr, "[FBWIN] failed to format window-title statistics\n");
         return 0;
@@ -542,7 +585,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer",
                            title_stats ? caption : game_title,
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                           (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,
                            NULL, NULL, module, NULL);
@@ -553,6 +596,11 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         return 0;
     }
     s_fb_hwnd = hwnd;
+    /* Wine maps the window maximized when its requested size matches a monitor
+     * mode; on a rotated display that clamps the 1:1 framebuffer to the
+     * monitor and leaves the window undraggable. It is not maximizable (above),
+     * so restoring keeps it a normal, movable, resizable 1:1 window. */
+    ShowWindow(hwnd, SW_RESTORE);
     /* Take the keyboard. The exe is console-subsystem, so Wine also creates a
      * console window that otherwise holds the focus and receives every key --
      * the game window then sees none of them. Force this window forward and
@@ -571,8 +619,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE);
     SetFocus(hwnd);
-    if (getenv("RECOMP_KBM"))
-        xbox_FramebufferMouseCapture(1);
+    /* Mouse capture is opt-in per click (below), not on creation, so the
+     * window can be dragged and other windows reached until the user clicks
+     * into the game. */
     SendMessageA(hwnd, WM_SETICON, ICON_BIG, (LPARAM)icons.large_icon);
     SendMessageA(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icons.small_icon);
     hdc = GetDC(hwnd);
@@ -662,6 +711,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
 void xbox_FramebufferWindowStart(void)
 {
     HANDLE th;
+    uint32_t dw, dh;
+
+    /* A requested resolution is what the title is steered into rendering, so
+     * read the framebuffer at that size rather than the 480i default. */
+    if (xbox_VideoDesiredResolution(&dw, &dh)) {
+        s_fb_width  = dw;
+        s_fb_height = dh;
+    }
 
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;

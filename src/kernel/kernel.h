@@ -938,6 +938,24 @@ extern PVOID            xbox_IdexChannelObject;
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength);
 NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, PVOID Value, ULONG ValueLength);
 
+/* Desired output resolution, from the runner's --resolution=WxH flag.
+ *
+ * A title chooses its own render mode from the AV/EEPROM settings it reads at
+ * startup, so setting a size means steering those settings rather than a window
+ * size. xbox_VideoDesiredResolution parses RECOMP_RESOLUTION (WIDTHxHEIGHT) and
+ * returns 0 when unset. The kernel side uses it to answer XC_VIDEO with flags
+ * that steer the title to a matching native mode, and calls
+ * xbox_VideoQueryHook() so a title-specific hook can force an exact size by
+ * rewriting the title's own render-options structure at the moment it is built
+ * (register it with xbox_VideoSetQueryHook). */
+int  xbox_VideoDesiredResolution(uint32_t *width, uint32_t *height);
+void xbox_VideoSetQueryHook(void (*hook)(uint32_t value_index, uint32_t *value, int *handled));
+void xbox_VideoQueryHook(uint32_t value_index, uint32_t *value, int *handled);
+/* Lets a title pick the AV-info word its display-mode table is keyed on, so a
+ * requested resolution selects the matching mode row. Called for
+ * AvSendTVEncoderOption(QUERY_AVPACK); the hook rewrites *value. */
+void xbox_VideoSetAvPackHook(void (*hook)(uint32_t *value));
+
 /* ---- AV Pack types (returned by AvSendTVEncoderOption) ---- */
 #define AV_PACK_NONE            0x00
 #define AV_PACK_STANDARD        0x01
