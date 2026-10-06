@@ -577,6 +577,68 @@ static void note_unhandled(uint32_t subchannel, uint32_t method, uint32_t param)
     }
 }
 
+/* Non-3D engine traffic. Each pushbuffer subchannel is bound to an object
+ * class; subchannel 0 carries the NV097 3D class this executor implements, the
+ * others carry the 2D surface engines (M2MF, IMAGE_BLIT, the surface and
+ * pattern contexts). Those methods are real work for a video part or the D3D11
+ * translator, but none of them is render state and none changes what
+ * raster_batch() draws, so they are classified by class instead of being
+ * reported as gaps in the 3D decoder. */
+static const char *nv_class_name(uint32_t cls)
+{
+    switch (cls) {
+    case 0x02: return "DMA_FROM_MEMORY";
+    case 0x03: return "DMA_TO_MEMORY";
+    case 0x3d: return "DMA_IN_MEMORY";
+    case 0x39: return "M2MF";
+    case 0x44: return "CONTEXT_PATTERN";
+    case 0x62: return "CONTEXT_SURFACES_2D";
+    case 0x9f: return "IMAGE_BLIT";
+    case 0x19: return "NV019_SURFACES";
+    default:   return NULL;
+    }
+}
+
+static uint32_t s_subch_class[8];
+static struct { uint32_t class_id, count; } s_engine_class[8];
+static int s_engine_class_count;
+
+static void note_engine(uint32_t cls)
+{
+    int i;
+    for (i = 0; i < s_engine_class_count; i++)
+        if (s_engine_class[i].class_id == cls) { s_engine_class[i].count++; return; }
+    if (s_engine_class_count < 8) {
+        s_engine_class[s_engine_class_count].class_id = cls;
+        s_engine_class[s_engine_class_count].count = 1;
+        s_engine_class_count++;
+    }
+}
+
+/* NV097 methods the executor recognises but deliberately does not act on:
+ * context-DMA bindings, smoothing/dither toggles and features the geometry
+ * path ignores. Recognising them keeps the unhandled report about actual
+ * decode gaps rather than a list of state nobody is going to implement. */
+static int benign_state_method(uint32_t method)
+{
+    switch (method) {
+    case 0x0320:  /* SET_LINE_SMOOTH_ENABLE           */
+    case 0x0324:  /* SET_POLY_SMOOTH_ENABLE           */
+    case 0x0380:  /* unknown; written 8 at boot        */
+    case 0x09FC:  /* SET_PROVOKING_VERTEX             */
+    case 0x16BC:  /* SET_EDGEFLAG                     */
+    case 0x1710:  /* VTXBUF_VALIDATE                  */
+    case 0x17BC:  /* SET_COLOR_LOGIC_OP_ENABLE        */
+    case 0x17C4:  /* SET_LIGHT_MODEL_TWO_SIDE_ENABLE  */
+    case 0x1D80:  /* UNK1D80                          */
+    case 0x1E68:  /* SET_SHADOW_ZSLOPE_THRESHOLD      */
+    case 0x1E6C:  /* SET_SHADOW_DEPTH_FUNC            */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static uint32_t vertex_attribute_bytes(const VertexAttr *a)
 {
     uint32_t components = a->size < 4 ? a->size : 4;
@@ -3072,7 +3134,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
 
     if (xbox_Nv2aNativeFencesEnabled() && subch < 8) {
-        static uint32_t classes[8];
         if (method == 0) {
             uint32_t instance;
             if (!ramht_instance(param, &instance)) {
@@ -3084,10 +3145,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 fflush(stderr);
                 _Exit(EXIT_FAILURE);
             }
-            classes[subch] = *object & 0xFFFu;
+            s_subch_class[subch] = *object & 0xFFFu;
+            if (getenv("RECOMP_NV2A_CLASS")) {
+                static unsigned logged_mask;
+                if (!(logged_mask & (1u << subch))) {
+                    logged_mask |= 1u << subch;
+                    fprintf(stderr, "[NV2A] subch %u class 0x%03X handle 0x%X instance 0x%X\n",
+                            subch, s_subch_class[subch], param, instance);
+                    fflush(stderr);
+                }
+            }
             return;
         }
-        if (classes[subch] == 0x44u && method == 0x0310) {
+        if (s_subch_class[subch] == 0x44u && method == 0x0310) {
             volatile uint32_t *color = xbox_Nv2aRegisterPointer(0x400B10, 4);
             if (!color) {
                 fflush(stderr);
@@ -3099,9 +3169,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+        if (nv_class_name(s_subch_class[subch])) {
+            note_engine(s_subch_class[subch]);
+            return;
+        }
         note_unhandled(subch, method, param);
         return;
     }
+    if (benign_state_method(method))
+        return;
     if (method == NV097_WAIT_FOR_IDLE) {
         s_gpu.flush_wait_idle++;
         pb_flush_ordering();
@@ -3471,6 +3547,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (context_shown++ < 32)
             fprintf(stderr, "  [GPU] 3D context method 0x%04X handle 0x%08X\n",
                     method, param);
+        return;
     }
     switch (method) {
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
@@ -4037,6 +4114,18 @@ void nv2a_pb_exec_report(void)
                 fprintf(stderr, "  [TEX] 0x%04X = 0x%08X\n",
                         (unsigned)(NV_TEX_FIRST + k * 4), s_tex_reg[k]);
     }
+
+    for (i = 0; i < s_engine_class_count; i++)
+        fprintf(stderr, "  [GPU] non-3D engine methods, class 0x%03X %-19s x%u\n",
+                s_engine_class[i].class_id,
+                nv_class_name(s_engine_class[i].class_id),
+                s_engine_class[i].count);
+
+    /* What is left should be the ZPASS query trio (0x17C8/0x17CC/0x17D0): they
+     * carry occlusion-query results, not render state, and the executor has no
+     * occlusion counter to report. ponytail: resolve the report DMA object
+     * (SET_CONTEXT_DMA_REPORT) and write a conservative "visible" count in
+     * GET_REPORT if a title is ever seen waiting on a query result. */
 
     /* Top ten by frequency: selection sort over a small table, once every few
      * seconds, is not worth a better algorithm.

@@ -159,7 +159,42 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x1B04, "SET_TEXTURE_FORMAT" },
     { 0x1B08, "SET_TEXTURE_ADDRESS" },
     { 0x1B0C, "SET_TEXTURE_CONTROL0" },
-    { 0x1B14, "SET_TEXTURE_IMAGE_RECT" },
+    { 0x1B10, "SET_TEXTURE_CONTROL1" },
+    { 0x1B14, "SET_TEXTURE_FILTER" },
+    { 0x1B1C, "SET_TEXTURE_IMAGE_RECT" },
+    { 0x1B24, "SET_TEXTURE_BORDER_COLOR" },
+    /* Context DMA bindings. The software executor does not use the DMA objects
+     * it is handed; they matter to the D3D11 translator, not to the clear and
+     * raster paths here. */
+    { 0x0180, "SET_CONTEXT_DMA_NOTIFIES" },
+    { 0x0184, "SET_CONTEXT_DMA_A" },
+    { 0x0188, "SET_CONTEXT_DMA_B" },
+    { 0x0190, "SET_CONTEXT_DMA_STATE" },
+    { 0x0194, "SET_CONTEXT_DMA_COLOR" },
+    { 0x0198, "SET_CONTEXT_DMA_ZETA" },
+    { 0x019C, "SET_CONTEXT_DMA_VERTEX_A" },
+    { 0x01A0, "SET_CONTEXT_DMA_VERTEX_B" },
+    { 0x01A4, "SET_CONTEXT_DMA_SEMAPHORE" },
+    { 0x01A8, "SET_CONTEXT_DMA_REPORT" },
+    /* Render state the executor classifies but does not act on. */
+    { 0x0320, "SET_LINE_SMOOTH_ENABLE" },
+    { 0x0324, "SET_POLY_SMOOTH_ENABLE" },
+    { 0x09FC, "SET_PROVOKING_VERTEX" },
+    { 0x16BC, "SET_EDGEFLAG" },
+    { 0x1710, "VTXBUF_VALIDATE" },
+    { 0x17BC, "SET_COLOR_LOGIC_OP_ENABLE" },
+    { 0x17C4, "SET_LIGHT_MODEL_TWO_SIDE_ENABLE" },
+    /* The ZPASS occlusion-query trio. SET_ZPASS_PIXEL_COUNT_ENABLE starts a
+     * count, GET_REPORT asks for the result to be written to the report DMA
+     * object, CLEAR_REPORT_VALUE resets it. They carry query results, not
+     * render state: nothing here changes what a batch draws. */
+    { 0x17C8, "CLEAR_REPORT_VALUE" },
+    { 0x17CC, "SET_ZPASS_PIXEL_COUNT_ENABLE" },
+    { 0x17D0, "GET_REPORT" },
+    { 0x1D78, "SET_DEPTH_CLAMP" },
+    { 0x1D80, "UNK1D80" },
+    { 0x1E68, "SET_SHADOW_ZSLOPE_THRESHOLD" },
+    { 0x1E6C, "SET_SHADOW_DEPTH_FUNC" },
     { 0x0FD8, "SET_COMBINER_*" },
     { 0x0000, NULL },
 };
