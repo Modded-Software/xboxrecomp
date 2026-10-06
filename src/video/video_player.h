@@ -63,12 +63,17 @@ int  video_dump_frame_bmp(const char *path);
  * focus there is nothing to type into. */
 int xbox_FramebufferKeyDown(int vk);
 
+/* Mouse, for the keyboard+mouse mode (RECOMP_KBM). Delta is the movement
+ * accumulated since the last read, cleared on read; buttons are 0=L, 1=R,
+ * 2=M; wheel is in notches. Capture clips and recentres the cursor so movement
+ * is unbounded. All zero when there is no window. */
+int xbox_FramebufferMouseDelta(int *dx, int *dy);
+int xbox_FramebufferMouseButton(int which);
+int xbox_FramebufferMouseWheel(void);
+void xbox_FramebufferMouseCapture(int on);
+
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 int  xbox_FramebufferDumpBmp(const char *path);
-/* Title bar: "<XBE title> | FPS: n | draws: n". The name is the certificate's
- * UTF-16 title (40 chars max); the stats come from each flip. */
-void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
-void xbox_FramebufferWindowFrameStats(uint32_t draws);
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */

@@ -17,12 +17,18 @@
 #include <stdint.h>
 
 #if defined(_WIN32)
+/* Raw mouse input (WM_INPUT) needs the Vista+ declarations. */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
 #include <windows.h>
+#include <windowsx.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+int xbox_FramebufferDumpBmp(const char *path);
 
 static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
@@ -41,6 +47,7 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  * thread is never reading the one being filled. */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+static DECLSPEC_ALIGN(8) volatile LONG64 s_present_frame;
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -64,6 +71,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 
     if (!s_fb_running || !fb_va || !pitch)
         return;
+    InterlockedIncrement64(&s_present_frame);
     if (getenv("RECOMP_FB_VA"))
         return;                       /* pinned: leave the old path alone */
     next = (s_present_idx == 0) ? 1 : 0;
@@ -111,28 +119,6 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
  * seen a frame late is indistinguishable from one made a frame later. */
 static volatile unsigned char s_key_down[256];
 
-/* Title bar, the way ps3recomp's window shows it. Written by the flip,
- * read once a second by the window thread; a torn read shows one stale
- * number for a second, which nobody can tell apart from a real one. */
-static wchar_t       s_title[48] = L"Xbox Recomp";
-static volatile LONG s_flips;
-static volatile LONG s_frame_draws;
-
-void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
-{
-    int i;
-    for (i = 0; i < max_chars && i < 47 && name[i]; i++)
-        s_title[i] = (wchar_t)name[i];
-    if (i)
-        s_title[i] = 0;
-}
-
-void xbox_FramebufferWindowFrameStats(uint32_t draws)
-{
-    InterlockedIncrement(&s_flips);
-    InterlockedExchange(&s_frame_draws, (LONG)draws);
-}
-
 int xbox_FramebufferKeyDown(int vk)
 {
     if ((unsigned)vk > 255)
@@ -140,16 +126,124 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* Mouse state, for the keyboard+mouse mode (src/input, RECOMP_KBM).
+ *
+ * Absolute cursor position is useless for a camera stick: the pointer hits the
+ * window edge and stops. While KBM is active the window clips the cursor to its
+ * client area and recentres it after every move, so what the reader consumes
+ * is a delta, not a position. Deltas accumulate between polls and are cleared
+ * on read; the input layer polls at the title's rate, so one read is one
+ * frame's worth of motion.
+ *
+ * Same lock-free rule as the keys: written only by the window thread, read
+ * only by the input thread, one word at a time. A delta seen a frame late is
+ * indistinguishable from one made a frame later. */
+static volatile LONG s_mouse_dx, s_mouse_dy, s_mouse_wheel;
+static volatile unsigned char s_mouse_btn[3];   /* 0=L, 1=R, 2=M */
+static int s_mouse_x, s_mouse_y, s_mouse_have;
+static int s_mouse_capture, s_cursor_hidden;
+static int s_mouse_raw;      /* WM_INPUT deltas are authoritative when set */
+static HWND s_fb_hwnd;
+
+int xbox_FramebufferMouseDelta(int *dx, int *dy)
+{
+    int x = (int)InterlockedExchange(&s_mouse_dx, 0);
+    int y = (int)InterlockedExchange(&s_mouse_dy, 0);
+    if (dx) *dx = x;
+    if (dy) *dy = y;
+    return (x || y);
+}
+
+int xbox_FramebufferMouseButton(int which)
+{
+    if ((unsigned)which > 2)
+        return 0;
+    return s_mouse_btn[which] != 0;
+}
+
+int xbox_FramebufferMouseWheel(void)
+{
+    return (int)InterlockedExchange(&s_mouse_wheel, 0);
+}
+
+/* Turn relative mouse mode on/off. Called on focus changes and once at startup
+ * when RECOMP_KBM is set. */
+void xbox_FramebufferMouseCapture(int on)
+{
+    if (!s_fb_hwnd)
+        return;
+    on = on ? 1 : 0;
+    if (on == s_mouse_capture)
+        return;
+    s_mouse_capture = on;
+    if (on) {
+        RECT c, clip;
+        POINT tl = { 0, 0 }, br, centre;
+        RAWINPUTDEVICE rid;
+        /* Raw input is the only motion source that does not fight the cursor:
+         * it reports relative deltas straight from the device, so nothing has
+         * to be clipped or recentred and the view cannot stall at a screen
+         * edge. WM_MOUSEMOVE stays as the fallback for hosts where it fails. */
+        rid.usUsagePage = 0x01;      /* generic desktop */
+        rid.usUsage = 0x02;          /* mouse */
+        rid.dwFlags = 0;
+        rid.hwndTarget = s_fb_hwnd;
+        s_mouse_raw = RegisterRawInputDevices(&rid, 1, sizeof(rid)) ? 1 : 0;
+        if (s_mouse_raw)
+            fprintf(stderr, "[FBWIN] mouse: raw input active\n");
+        GetClientRect(s_fb_hwnd, &c);
+        br.x = c.right; br.y = c.bottom;
+        ClientToScreen(s_fb_hwnd, &tl);
+        ClientToScreen(s_fb_hwnd, &br);
+        clip.left = tl.x; clip.top = tl.y; clip.right = br.x; clip.bottom = br.y;
+        ClipCursor(&clip);
+        centre.x = (c.right - c.left) / 2;
+        centre.y = (c.bottom - c.top) / 2;
+        ClientToScreen(s_fb_hwnd, &centre);
+        SetCursorPos(centre.x, centre.y);
+        s_mouse_have = 1;
+        if (!s_cursor_hidden) { ShowCursor(FALSE); s_cursor_hidden = 1; }
+    } else {
+        if (s_mouse_raw) {
+            RAWINPUTDEVICE rid;
+            rid.usUsagePage = 0x01; rid.usUsage = 0x02;
+            rid.dwFlags = RIDEV_REMOVE; rid.hwndTarget = NULL;
+            RegisterRawInputDevices(&rid, 1, sizeof(rid));
+            s_mouse_raw = 0;
+        }
+        ClipCursor(NULL);
+        if (s_cursor_hidden) { ShowCursor(TRUE); s_cursor_hidden = 0; }
+    }
+}
+
+static void fb_exit_process(void)
+{
+    InterlockedExchange(&s_fb_running, 0);
+    fprintf(stderr, "[FBWIN] close requested; exiting process\n");
+    fflush(stderr);
+    ExitProcess(EXIT_SUCCESS);
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_CLOSE:
+        fb_exit_process();
+        return 0;
+
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
         return 0;
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        if (w == VK_F12) {
+            const char *path = getenv("RECOMP_FB_CAPTURE");
+            if (!path || !path[0]) path = "framebuffer.bmp";
+            if (xbox_FramebufferDumpBmp(path) != 0)
+                fprintf(stderr, "[FBWIN] failed to capture framebuffer to %s\n", path);
+            return 0;
+        }
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
@@ -176,9 +270,86 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             s_key_down[w] = 0;
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
 
+    case WM_MOUSEMOVE: {
+        int x = (int)(short)LOWORD(l), y = (int)(short)HIWORD(l);
+        if (s_mouse_capture) {
+            RECT c;
+            int cx, cy;
+            GetClientRect(h, &c);
+            cx = (c.right - c.left) / 2;
+            cy = (c.bottom - c.top) / 2;
+            if (s_mouse_raw) {
+                /* Raw input (WM_INPUT) owns the deltas. Only keep the hidden
+                 * cursor centred so clicks stay in the window. */
+                if (x != cx || y != cy) {
+                    POINT p;
+                    p.x = cx; p.y = cy;
+                    ClientToScreen(h, &p);
+                    SetCursorPos(p.x, p.y);
+                }
+            } else {
+                int dx = x - cx, dy = y - cy;
+                /* Clip/recentre lands the cursor within a pixel of centre under
+                 * Wine, and that residual would otherwise leak out as a constant
+                 * slow drift. One pixel of motion is below anything usable. */
+                if (dx > -2 && dx < 2) dx = 0;
+                if (dy > -2 && dy < 2) dy = 0;
+                if (dx || dy) {
+                    POINT p;
+                    InterlockedExchangeAdd(&s_mouse_dx, dx);
+                    InterlockedExchangeAdd(&s_mouse_dy, dy);
+                    p.x = cx; p.y = cy;
+                    ClientToScreen(h, &p);
+                    SetCursorPos(p.x, p.y);
+                }
+            }
+        } else {
+            if (s_mouse_have) {
+                InterlockedExchangeAdd(&s_mouse_dx, x - s_mouse_x);
+                InterlockedExchangeAdd(&s_mouse_dy, y - s_mouse_y);
+            }
+            s_mouse_x = x; s_mouse_y = y; s_mouse_have = 1;
+        }
+        return 0;
+    }
+
+    case WM_INPUT: {
+        if (s_mouse_capture && s_mouse_raw) {
+            RAWINPUT raw;
+            UINT size = sizeof(raw);
+            if (GetRawInputData((HRAWINPUT)l, RID_INPUT, &raw, &size,
+                                sizeof(RAWINPUTHEADER)) == sizeof(raw) &&
+                raw.header.dwType == RIM_TYPEMOUSE &&
+                !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+                InterlockedExchangeAdd(&s_mouse_dx, raw.data.mouse.lLastX);
+                InterlockedExchangeAdd(&s_mouse_dy, raw.data.mouse.lLastY);
+            }
+        }
+        return DefWindowProcA(h, m, w, l);
+    }
+
+    case WM_LBUTTONDOWN: s_mouse_btn[0] = 1; return 0;
+    case WM_LBUTTONUP:   s_mouse_btn[0] = 0; return 0;
+    case WM_RBUTTONDOWN: s_mouse_btn[1] = 1; return 0;
+    case WM_RBUTTONUP:   s_mouse_btn[1] = 0; return 0;
+    case WM_MBUTTONDOWN: s_mouse_btn[2] = 1; return 0;
+    case WM_MBUTTONUP:   s_mouse_btn[2] = 0; return 0;
+
+    case WM_MOUSEWHEEL:
+        InterlockedExchangeAdd(&s_mouse_wheel,
+                               (LONG)(GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA));
+        return 0;
+
+    case WM_SETFOCUS:
+        if (getenv("RECOMP_KBM"))
+            xbox_FramebufferMouseCapture(1);
+        return 0;
+
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
         memset((void *)s_key_down, 0, sizeof s_key_down);
+        s_mouse_btn[0] = s_mouse_btn[1] = s_mouse_btn[2] = 0;
+        xbox_FramebufferMouseCapture(0);
         return 0;
     }
     return DefWindowProcA(h, m, w, l);
@@ -237,9 +408,11 @@ int xbox_FramebufferDumpBmp(const char *path)
     memcpy(hdr + 22, &s_fb_height, 4);
     hdr[26] = 1; hdr[28] = 24;
     memcpy(hdr + 34, &img, 4);
-    fwrite(hdr, 1, sizeof(hdr), f);
-
     line = (uint8_t *)calloc(1, row);
+    if (!line) { fclose(f); return -1; }
+    if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        free(line); fclose(f); return -1;
+    }
     for (y = 0; y < s_fb_height; y++) {
         const uint32_t *src = s_rgb + (size_t)(s_fb_height - 1 - y) * s_fb_width;
         for (x = 0; x < s_fb_width; x++) {
@@ -247,13 +420,78 @@ int xbox_FramebufferDumpBmp(const char *path)
             line[x * 3 + 1] = (uint8_t)((src[x] >> 8) & 0xFF);
             line[x * 3 + 2] = (uint8_t)((src[x] >> 16) & 0xFF);
         }
-        fwrite(line, 1, row, f);
+        if (fwrite(line, 1, row, f) != row) {
+            free(line); fclose(f); return -1;
+        }
     }
     free(line);
-    fclose(f);
+    if (fclose(f) != 0) return -1;
     fprintf(stderr, "  [FBWIN] wrote %s (%ux%u from 0x%08X)\n",
             path, s_fb_width, s_fb_height, s_fb_va);
     return 0;
+}
+
+static int fb_format_window_title(char *caption, size_t capacity, const char *game_title,
+                                  double fps, LONG64 frame)
+{
+    int length = snprintf(caption, capacity, "%s | %.2f FPS | Frame %llu",
+                          game_title, fps, (unsigned long long)frame);
+    if (length < 0 || (size_t)length >= capacity) {
+        fprintf(stderr, "[FBWIN] failed to format window-title statistics\n");
+        return 0;
+    }
+    return 1;
+}
+
+static void fb_set_window_title(HWND hwnd, const char *caption)
+{
+    if (!SetWindowTextA(hwnd, caption))
+        fprintf(stderr, "[FBWIN] failed to update window title: error %lu\n", GetLastError());
+}
+
+typedef struct {
+    HICON large_icon, small_icon;
+    int found;
+} FbWindowIcons;
+
+static BOOL CALLBACK fb_load_icon_resource(HMODULE module, LPCWSTR type, LPWSTR name, LONG_PTR context)
+{
+    FbWindowIcons *icons = (FbWindowIcons *)context;
+    (void)type;
+    icons->found = 1;
+    icons->large_icon = (HICON)LoadImageW(module, name, IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
+    if (!icons->large_icon)
+        fprintf(stderr, "[FBWIN] cannot load executable large icon: error %lu\n", GetLastError());
+    icons->small_icon = (HICON)LoadImageW(module, name, IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
+    if (!icons->small_icon)
+        fprintf(stderr, "[FBWIN] cannot load executable small icon: error %lu\n", GetLastError());
+    return FALSE;
+}
+
+static void fb_load_window_icons(HMODULE module, FbWindowIcons *icons)
+{
+    if (!EnumResourceNamesW(module, (LPCWSTR)RT_GROUP_ICON, fb_load_icon_resource, (LONG_PTR)icons)
+        && !icons->found) {
+        DWORD error = GetLastError();
+        if (error == ERROR_RESOURCE_TYPE_NOT_FOUND || error == ERROR_RESOURCE_DATA_NOT_FOUND)
+            fprintf(stderr, "[FBWIN] executable has no icon resource; using Windows default\n");
+        else
+            fprintf(stderr, "[FBWIN] cannot enumerate executable icons: error %lu\n", error);
+    }
+    if (!icons->large_icon) {
+        icons->large_icon = (HICON)LoadImageW(NULL, MAKEINTRESOURCEW(32512), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
+        if (!icons->large_icon)
+            fprintf(stderr, "[FBWIN] cannot load default large icon: error %lu\n", GetLastError());
+    }
+    if (!icons->small_icon) {
+        icons->small_icon = (HICON)LoadImageW(NULL, MAKEINTRESOURCEW(32512), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
+        if (!icons->small_icon)
+            fprintf(stderr, "[FBWIN] cannot load default small icon: error %lu\n", GetLastError());
+    }
 }
 
 static DWORD WINAPI fb_thread(LPVOID unused)
@@ -262,29 +500,81 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     HDC hdc;
     BITMAPINFO bi;
     RECT r;
+    const char *window_title = getenv("RECOMP_WINDOW_TITLE");
+    const char *game_title = window_title && window_title[0] ? window_title : "Xbox Recomp - Framebuffer";
+    size_t caption_capacity = strlen(game_title) + 96;
+    char *caption = (char *)malloc(caption_capacity);
+    LARGE_INTEGER title_frequency, title_clock;
+    LONG64 title_frame = InterlockedCompareExchange64(&s_present_frame, 0, 0);
+    int title_stats = caption != NULL;
+    HMODULE module = GetModuleHandleA(NULL);
+    FbWindowIcons icons = {0};
 
     (void)unused;
+    if (!caption)
+        fprintf(stderr, "[FBWIN] cannot allocate window-title statistics buffer\n");
+    else if (!QueryPerformanceFrequency(&title_frequency) || title_frequency.QuadPart <= 0 ||
+             !QueryPerformanceCounter(&title_clock)) {
+        fprintf(stderr, "[FBWIN] window-title statistics unavailable: cannot query performance clock\n");
+        title_stats = 0;
+    } else if (!fb_format_window_title(caption, caption_capacity, game_title, 0.0, title_frame))
+        title_stats = 0;
 
     {
-        WNDCLASSA wc;
+        WNDCLASSEXA wc;
         memset(&wc, 0, sizeof(wc));
+        wc.cbSize        = sizeof(wc);
         wc.lpfnWndProc   = fb_wndproc;
-        wc.hInstance     = GetModuleHandleA(NULL);
+        wc.hInstance     = module;
         wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+        fb_load_window_icons(module, &icons);
+        wc.hIcon         = icons.large_icon;
+        wc.hIconSm       = icons.small_icon;
         wc.lpszClassName = "XboxRecompFramebuffer";
-        RegisterClassA(&wc);
+        if (!RegisterClassExA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            fprintf(stderr, "[FBWIN] framebuffer class registration failed: error %lu\n", GetLastError());
+            InterlockedExchange(&s_fb_running, 0);
+            free(caption);
+            return 0;
+        }
     }
     r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
+    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer",
+                           title_stats ? caption : game_title,
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,
-                           NULL, NULL, GetModuleHandleA(NULL), NULL);
+                           NULL, NULL, module, NULL);
     if (!hwnd) {
+        fprintf(stderr, "[FBWIN] framebuffer window creation failed: error %lu\n", GetLastError());
         InterlockedExchange(&s_fb_running, 0);
+        free(caption);
         return 0;
     }
+    s_fb_hwnd = hwnd;
+    /* Take the keyboard. The exe is console-subsystem, so Wine also creates a
+     * console window that otherwise holds the focus and receives every key --
+     * the game window then sees none of them. Force this window forward and
+     * focused so the pad-overlay keys arrive without a manual click.
+     *
+     * A plain SetForegroundWindow is not enough: Wine enforces the foreground
+     * lock, and a game launched from a terminal is not the foreground process,
+     * so the call is denied and the window stays unfocused until the user
+     * clicks it. The topmost flip is the documented workaround -- raising the
+     * window while it is topmost makes it the foreground one even when the
+     * lock would otherwise say no -- and it is left not-topmost afterwards so
+     * nothing else is occluded. */
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE);
+    SetForegroundWindow(hwnd);
+    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE);
+    SetFocus(hwnd);
+    if (getenv("RECOMP_KBM"))
+        xbox_FramebufferMouseCapture(1);
+    SendMessageA(hwnd, WM_SETICON, ICON_BIG, (LPARAM)icons.large_icon);
+    SendMessageA(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icons.small_icon);
     hdc = GetDC(hwnd);
 
     memset(&bi, 0, sizeof(bi));
@@ -300,23 +590,51 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
             s_fb_width, s_fb_height);
 
+    long last_drawn = -2;
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         MSG msg;
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT)
+                fb_exit_process();
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
+        }
+        if (!InterlockedCompareExchange(&s_fb_running, 1, 1))
+            break;
+        if (title_stats) {
+            LARGE_INTEGER now;
+            if (!QueryPerformanceCounter(&now)) {
+                fprintf(stderr, "[FBWIN] window-title statistics unavailable: cannot query performance counter\n");
+                title_stats = 0;
+                fb_set_window_title(hwnd, game_title);
+            } else if (now.QuadPart - title_clock.QuadPart >= title_frequency.QuadPart) {
+                LONG64 frame = InterlockedCompareExchange64(&s_present_frame, 0, 0);
+                double elapsed = (double)(now.QuadPart - title_clock.QuadPart) / title_frequency.QuadPart;
+                double fps = (double)(frame - title_frame) / elapsed;
+                if (fb_format_window_title(caption, caption_capacity, game_title, fps, frame))
+                    fb_set_window_title(hwnd, caption);
+                else {
+                    title_stats = 0;
+                    fb_set_window_title(hwnd, game_title);
+                }
+                title_clock = now;
+                title_frame = frame;
+            }
         }
         if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
             LONG idx = s_present_idx;
-            if (s_present[idx])
-                memcpy(s_rgb, s_present[idx],
-                       (size_t)s_fb_width * s_fb_height * 4);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            if (idx != last_drawn) {
+                if (s_present[idx])
+                    memcpy(s_rgb, s_present[idx],
+                           (size_t)s_fb_width * s_fb_height * 4);
+                StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+                              0, 0, (int)s_fb_width, (int)s_fb_height,
+                              s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+                last_drawn = idx;
+            }
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
@@ -327,49 +645,15 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
         }
-        {
-            /* One dump a few seconds in, so the title has had time to render
-             * something rather than catching the first blank frame.
-             *
-             * RECOMP_FB_WINDOW_DUMP_EVERY=<frames> dumps repeatedly instead.
-             * This window follows the address AvSetDisplayMode gave, which is
-             * what the CRTC scans and therefore what a person sees; the
-             * pushbuffer executor's own dump follows its draw surface. With
-             * double buffering those are different buffers, and measuring
-             * progress from the executor's dump reports a blank screen while
-             * the window is showing the title's logo. Ask the window. */
-            const char *dump = getenv("RECOMP_FB_DUMP");
-            const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
-            static int frames;
-            int period = every ? atoi(every) : 0;
-            frames++;
-            if (dump && period > 0) {
-                if (frames % period == 0)
-                    xbox_FramebufferDumpBmp(dump);
-            } else if (dump && frames == 600) {
-                xbox_FramebufferDumpBmp(dump);
-            }
-        }
-        {
-            static DWORD t0;
-            static LONG f0;
-            DWORD now = GetTickCount();
-            if (now - t0 >= 1000) {
-                LONG f = s_flips;
-                wchar_t tb[128];
-                _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
-                           t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
-                           (long)s_frame_draws);
-                tb[127] = 0;
-                SetWindowTextW(hwnd, tb);
-                t0 = now; f0 = f;
-            }
-        }
-        Sleep(16);
+        /* Pump often enough to sample WM_INPUT/WM_KEYDOWN smoothly, but not
+         * so tightly that the window thread monopolises a core. Rendering is
+         * gated on a new frame, above. */
+        Sleep(4);
     }
 
     ReleaseDC(hwnd, hdc);
     DestroyWindow(hwnd);
+    free(caption);
     free(s_rgb);
     s_rgb = NULL;
     return 0;
@@ -379,8 +663,6 @@ void xbox_FramebufferWindowStart(void)
 {
     HANDLE th;
 
-    if (!getenv("RECOMP_FB_WINDOW"))
-        return;
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;
     th = CreateThread(NULL, 0, fb_thread, NULL, 0, NULL);
@@ -395,6 +677,8 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (v
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
-void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
-void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
+int xbox_FramebufferMouseDelta(int *dx, int *dy) { if (dx) *dx = 0; if (dy) *dy = 0; return 0; }
+int xbox_FramebufferMouseButton(int which) { (void)which; return 0; }
+int xbox_FramebufferMouseWheel(void) { return 0; }
+void xbox_FramebufferMouseCapture(int on) { (void)on; }
 #endif
