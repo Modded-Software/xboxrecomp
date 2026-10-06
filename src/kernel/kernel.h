@@ -789,6 +789,9 @@ void    xbox_IrqlLeaveInterrupt(int saved);
  * A depth that is non-zero while this stops moving is stuck, not busy. */
 int     xbox_IrqlTransitions(void);
 void    xbox_IrqlDumpHolders(void);
+void    xbox_IrqlRecord(char op, const char *why, uint32_t caller,
+                        unsigned old_level, unsigned new_level);
+void    xbox_IrqlDumpRing(void);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
 

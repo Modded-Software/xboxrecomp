@@ -1294,18 +1294,17 @@ static void bridge_ExAllocatePoolWithTag(void)
 }
 
 /* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161) ────── */
-static KIRQL bridge_raise_irql(KIRQL new_irql)
+/* The guest TIB byte fs:[0x24] is the single source of truth for the current
+ * level (see kernel_hal.c); the setters below just record and name the caller. */
+static KIRQL bridge_raise_irql(KIRQL new_irql, const char *why)
 {
     KIRQL old_irql = xbox_KfRaiseIrql(new_irql);
-    /* fs:[0x24] is what guest code reads directly, so mirror the level the
-     * runtime actually ended at -- not new_irql, which is a no-op at or below
-     * the current level (a spinlock acquired inside a device ISR). */
-    BRIDGE_MEM8(g_fs_base + XBOX_KPCR_IRQL_OFFSET) =
-        (uint8_t)xbox_KeGetCurrentIrql();
+    xbox_IrqlRecord('R', why, g_xbox_kernel_caller, (unsigned)old_irql,
+                    (unsigned)xbox_KeGetCurrentIrql());
     return old_irql;
 }
 
-static void bridge_lower_irql(KIRQL new_irql)
+static void bridge_lower_irql(KIRQL new_irql, const char *why)
 {
     KIRQL old_irql = xbox_KeGetCurrentIrql();
     if (new_irql > old_irql) {
@@ -1313,33 +1312,36 @@ static void bridge_lower_irql(KIRQL new_irql)
          * it is actually at, so its saved/restored IRQL is wrong somewhere
          * upstream. Name the guest call site so the mismatch can be found. */
         static volatile LONG n;
-        if (InterlockedIncrement(&n) <= 20)
+        if (InterlockedIncrement(&n) <= 20) {
             fprintf(stderr, "  [IRQL] guest KfLowerIrql(%u) while at %u,"
-                    " from 0x%08X\n", (unsigned)new_irql, (unsigned)old_irql,
-                    g_xbox_kernel_caller);
+                    " from 0x%08X fs=%u\n", (unsigned)new_irql, (unsigned)old_irql,
+                    g_xbox_kernel_caller,
+                    (unsigned)BRIDGE_MEM8(g_fs_base + XBOX_KPCR_IRQL_OFFSET));
+            xbox_IrqlDumpRing();
+        }
     }
+    xbox_IrqlRecord('L', why, g_xbox_kernel_caller, (unsigned)old_irql,
+                    (unsigned)new_irql);
     xbox_KfLowerIrql(new_irql);
-    BRIDGE_MEM8(g_fs_base + XBOX_KPCR_IRQL_OFFSET) =
-        (uint8_t)xbox_KeGetCurrentIrql();
 }
 
 static void bridge_KfRaiseIrql(void)
 {
     uint32_t new_irql = g_ecx; /* fastcall: KIRQL is passed in CL */
-    g_eax = (uint32_t)bridge_raise_irql((UCHAR)new_irql);
+    g_eax = (uint32_t)bridge_raise_irql((UCHAR)new_irql, "guest");
 }
 
 static void bridge_KfLowerIrql(void)
 {
     uint32_t new_irql = g_ecx; /* fastcall: KIRQL is passed in CL */
-    bridge_lower_irql((UCHAR)new_irql);
+    bridge_lower_irql((UCHAR)new_irql, "guest");
     g_eax = 0;
 }
 
 /* ── KeRaiseIrqlToDpcLevel (ordinal 129) ─────────────────── */
 static void bridge_KeRaiseIrqlToDpcLevel(void)
 {
-    g_eax = (uint32_t)bridge_raise_irql(DISPATCH_LEVEL);
+    g_eax = (uint32_t)bridge_raise_irql(DISPATCH_LEVEL, "guest");
 }
 
 /* ── RtlInitializeCriticalSection / Enter / Leave (ordinals 291, 277, 294) ─ */
@@ -1933,12 +1935,12 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    old_irql = bridge_raise_irql(DISPATCH_LEVEL);
+    old_irql = bridge_raise_irql(DISPATCH_LEVEL, "dpc");
     previous_vector = g_callback_vector;
     g_callback_vector = vector;
     fn();
     g_callback_vector = previous_vector;
-    bridge_lower_irql(old_irql);
+    bridge_lower_irql(old_irql, "dpc");
     return 1;
 }
 
@@ -1987,9 +1989,9 @@ static void bridge_KeSynchronizeExecution(void)
     old_irql = xbox_KeGetCurrentIrql();
     if (new_irql < old_irql)
         new_irql = old_irql;
-    bridge_raise_irql(new_irql);
+    bridge_raise_irql(new_irql, "sync");
     fn();
-    bridge_lower_irql(old_irql);
+    bridge_lower_irql(old_irql, "sync");
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
@@ -2113,12 +2115,12 @@ static int kernel_raise_interrupt(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    old_irql = bridge_raise_irql((KIRQL)BRIDGE_MEM32(kint + 12));
+    old_irql = bridge_raise_irql((KIRQL)BRIDGE_MEM32(kint + 12), "intr");
     previous_vector = g_callback_vector;
     g_callback_vector = vector;
     fn();
     g_callback_vector = previous_vector;
-    bridge_lower_irql(old_irql);
+    bridge_lower_irql(old_irql, "intr");
     if (vector == 5u)
         xbox_GuestAudioGuardLeave();
     return (int)(g_eax & 1u);
@@ -2522,9 +2524,9 @@ static void kernel_nv2a_software_tick(void)
     g_ecx = g_nv2a_software.context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = g_nv2a_software.parameter;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    old_irql = bridge_raise_irql(DISPATCH_LEVEL);
+    old_irql = bridge_raise_irql(DISPATCH_LEVEL, "nvsoft");
     g_nv2a_software.routine();
-    bridge_lower_irql(old_irql);
+    bridge_lower_irql(old_irql, "nvsoft");
     if (g_esp != stack) {
         fprintf(stderr, "  [NV2A] Software method 0x%08X corrupted callback "
                         "stack: 0x%08X -> 0x%08X\n",

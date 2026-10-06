@@ -12,8 +12,10 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -61,9 +63,42 @@
 static XBOX_THREAD_LOCAL KIRQL g_thread_irql = PASSIVE_LEVEL;
 static volatile LONG g_irql_raised = 0;
 
+/* The guest's own view of IRQL lives in the TIB byte the title reads directly
+ * (fs:[0x24]); the runtime also keeps a thread-local level for host contexts.
+ * Two values kept in step by a mirror drifted whenever a guest callback ran on
+ * a host thread (the OHCI ISR thread, a DPC) whose level did not match the TIB
+ * that code read: the title saved one level and later lowered to it from a
+ * context already back at passive. Make the TIB byte the single source of truth
+ * whenever a guest TIB is mapped, so a read by the title and a raise here cannot
+ * disagree. Host contexts with no guest TIB fall back to the thread-local. */
+extern ptrdiff_t g_xbox_mem_offset;
+
+static uint8_t *irql_tib_slot(void)
+{
+    if (!g_xbox_mem_offset)
+        return NULL;
+    return (uint8_t *)((uintptr_t)(XBOX_FS_BASE + XBOX_KPCR_IRQL_OFFSET)
+                       + g_xbox_mem_offset);
+}
+
+static KIRQL irql_current(void)
+{
+    uint8_t *p = irql_tib_slot();
+    return p ? (KIRQL)*p : g_thread_irql;
+}
+
+static void irql_set(KIRQL level)
+{
+    uint8_t *p;
+    g_thread_irql = level;
+    p = irql_tib_slot();
+    if (p)
+        *p = (uint8_t)level;
+}
+
 KIRQL __stdcall xbox_KeGetCurrentIrql(void)
 {
-    return g_thread_irql;
+    return irql_current();
 }
 
 /* Non-zero while any context is at or above DISPATCH_LEVEL. Device models call
@@ -147,6 +182,53 @@ void xbox_IrqlDumpHolders(void)
     fflush(stderr);
 }
 
+/* A short per-thread history of IRQL operations, tagged with the caller.
+ *
+ * A guest lower that would raise means the level it saved is not the level it
+ * is at: the level it saved came from an earlier raise, and something lowered
+ * in between. On a real CPU the scheduler would not run another context while
+ * the guest held IRQL, so the drop must come from a runtime wrapper (an ISR,
+ * DPC or KeSynchronizeExecution) that exited early. The ring names both ends,
+ * which a single mismatch line cannot. */
+#define IRQL_RING 12
+static XBOX_THREAD_LOCAL struct {
+    const char *why;
+    uint32_t    caller;
+    uint8_t     old_level, new_level;
+    char        op; /* 'R' or 'L' */
+} s_irql_ring[IRQL_RING];
+static XBOX_THREAD_LOCAL int s_irql_ring_pos;
+
+void xbox_IrqlRecord(char op, const char *why, uint32_t caller,
+                     unsigned old_level, unsigned new_level)
+{
+    s_irql_ring[s_irql_ring_pos].op = op;
+    s_irql_ring[s_irql_ring_pos].why = why;
+    s_irql_ring[s_irql_ring_pos].caller = caller;
+    s_irql_ring[s_irql_ring_pos].old_level = (uint8_t)old_level;
+    s_irql_ring[s_irql_ring_pos].new_level = (uint8_t)new_level;
+    s_irql_ring_pos = (s_irql_ring_pos + 1) % IRQL_RING;
+}
+
+void xbox_IrqlDumpRing(void)
+{
+    int i, k;
+
+    fprintf(stderr, "  [IRQLHIST] tid %lu last IRQL ops (oldest first):\n",
+            (unsigned long)GetCurrentThreadId());
+    for (i = 0; i < IRQL_RING; i++) {
+        k = (s_irql_ring_pos + i) % IRQL_RING;
+        if (!s_irql_ring[k].op)
+            continue;
+        fprintf(stderr, "  [IRQLHIST]   %c %s %u->%u from 0x%08X\n",
+                s_irql_ring[k].op, s_irql_ring[k].why,
+                (unsigned)s_irql_ring[k].old_level,
+                (unsigned)s_irql_ring[k].new_level,
+                s_irql_ring[k].caller);
+    }
+    fflush(stderr);
+}
+
 static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 {
     int was = (old_level >= DISPATCH_LEVEL);
@@ -185,7 +267,7 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  */
 KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 {
-    KIRQL old = g_thread_irql;
+    KIRQL old = irql_current();
 
     /* Raising to at or below the current level is a no-op, as on hardware.
      * The decisive case is a spinlock taken inside a device ISR: the acquire
@@ -193,8 +275,10 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
      * level and leave it set. Dropping the level to 2 here made the matching
      * KfLowerIrql(device_level) look like a raise. */
     if (NewIrql > old) {
-        g_thread_irql = NewIrql;
+        irql_set(NewIrql);
         irql_track(old, NewIrql, IRQL_CALLER());
+    } else {
+        irql_set(old);
     }
     return old;
 }
@@ -205,7 +289,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
  */
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
-    KIRQL old = g_thread_irql;
+    KIRQL old = irql_current();
 
     if (NewIrql > old) {
         /* A lower above the current level would raise. On hardware that is
@@ -225,7 +309,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
         NewIrql = old;
     }
 
-    g_thread_irql = NewIrql;
+    irql_set(NewIrql);
     irql_track(old, NewIrql, IRQL_CALLER());
 }
 
@@ -234,11 +318,13 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
  */
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
-    KIRQL old = g_thread_irql;
+    KIRQL old = irql_current();
 
     if (DISPATCH_LEVEL > old) {
-        g_thread_irql = DISPATCH_LEVEL;
+        irql_set(DISPATCH_LEVEL);
         irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
+    } else {
+        irql_set(old);
     }
     return old;
 }
