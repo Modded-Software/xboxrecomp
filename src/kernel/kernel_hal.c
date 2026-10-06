@@ -696,6 +696,9 @@ NTSTATUS __stdcall xbox_NtSetSystemTime(PLARGE_INTEGER SystemTime, PLARGE_INTEGE
 static ULONG g_av_saved_data_address = 0;
 static ULONG g_av_display_mode = 0;
 
+/* Set by xbox_VideoSetAvPackHook; used earlier in xbox_AvSendTVEncoderOption. */
+static void (*s_video_avpack_hook)(uint32_t *);
+
 ULONG __stdcall xbox_AvGetSavedDataAddress(void)
 {
     return g_av_saved_data_address;
@@ -709,6 +712,7 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
         "AvSendTVEncoderOption: option=0x%02X param=0x%X", Option, Param);
+    fprintf(stderr, "  [AVOPT] option=0x%02X param=0x%X\n", Option, Param);
 
     if (!Result)
         return;
@@ -730,6 +734,13 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         *Result = AV_PACK_HDTV
                 | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
                 | AV_REFRESH_60Hz;
+        {
+            const char *ov = getenv("RECOMP_AVPACK");
+            if (ov && *ov)
+                *Result = (ULONG)strtoul(ov, NULL, 0);
+        }
+        if (s_video_avpack_hook)
+            s_video_avpack_hook(Result);
         break;
 
     case AV_OPTION_QUERY_MODE:
@@ -774,6 +785,7 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         *Result = 0;
         break;
     }
+    fprintf(stderr, "  [AVOPT]   -> 0x%08X\n", *Result);
 }
 
 VOID __stdcall xbox_AvSetSavedDataAddress(ULONG Address)
@@ -796,6 +808,55 @@ VOID __stdcall xbox_AvSetDisplayMode(
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "AvSetDisplayMode: step=%u mode=0x%X format=0x%X pitch=%u fb=0x%X",
         Step, Mode, Format, Pitch, FrameBuffer);
+}
+
+/* ---- Desired output resolution (see kernel.h) --------------------------- */
+
+static int s_video_width, s_video_height, s_video_parsed;
+static void (*s_video_query_hook)(uint32_t, uint32_t *, int *);
+
+int xbox_VideoDesiredResolution(uint32_t *width, uint32_t *height)
+{
+    if (!s_video_parsed) {
+        const char *spec = getenv("RECOMP_RESOLUTION");
+
+        s_video_parsed = 1;
+        if (spec && *spec) {
+            unsigned w = 0, h = 0;
+
+            if (sscanf(spec, "%ux%u", &w, &h) == 2 &&
+                w >= 16 && w <= 4096 && h >= 16 && h <= 4096) {
+                s_video_width  = (int)w;
+                s_video_height = (int)h;
+            } else {
+                fprintf(stderr, "[VIDEO] ignoring RECOMP_RESOLUTION '%s'"
+                                " (want WIDTHxHEIGHT, 16..4096)\n", spec);
+            }
+        }
+    }
+    if (!s_video_width)
+        return 0;
+    if (width)  *width  = (uint32_t)s_video_width;
+    if (height) *height = (uint32_t)s_video_height;
+    return 1;
+}
+
+void xbox_VideoSetQueryHook(void (*hook)(uint32_t, uint32_t *, int *))
+{
+    s_video_query_hook = hook;
+}
+
+void xbox_VideoSetAvPackHook(void (*hook)(uint32_t *))
+{
+    s_video_avpack_hook = hook;
+}
+
+void xbox_VideoQueryHook(uint32_t value_index, uint32_t *value, int *handled)
+{
+    if (handled)
+        *handled = 0;
+    if (s_video_query_hook)
+        s_video_query_hook(value_index, value, handled);
 }
 
 /* ============================================================================

@@ -196,6 +196,7 @@ uint32_t xbox_ContiguousBlockSize(uint32_t guest_va);
 uint32_t xbox_ContiguousAllocatedBytes(void);
 void xbox_RecordDmaTranslation(uint32_t guest_va, uint32_t physical);
 uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes);
+uint8_t *xbox_ApuPhysicalPointer(uint64_t physical, uint32_t bytes);
 volatile uint32_t *xbox_Nv2aRegisterPointer(uint32_t offset, uint32_t bytes);
 void xbox_Nv2aAcknowledgeHandshakes(void);
 int xbox_Nv2aNativeFencesEnabled(void);
