@@ -571,7 +571,11 @@ BOOLEAN __stdcall xbox_KeSynchronizeExecution(
     if (new_irql < old_irql)
         new_irql = old_irql;
     xbox_KfRaiseIrql(new_irql);
+    xbox_IrqlRecord('R', "ksync", 0, (unsigned)old_irql,
+                    (unsigned)xbox_KeGetCurrentIrql());
     result = routine(SynchronizeContext);
+    xbox_IrqlRecord('L', "ksync", 0, (unsigned)xbox_KeGetCurrentIrql(),
+                    (unsigned)old_irql);
     xbox_KfLowerIrql(old_irql);
     return result;
 }
