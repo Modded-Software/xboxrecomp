@@ -171,6 +171,17 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_TEXTURE_ADDRESS         0x1B08
 #define NV097_SET_TEXTURE_CONTROL1        0x1B10
 #define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
+/* Benign render state the executor classifies but does not act on. */
+#define NV097_SET_DITHER_ENABLE           0x0310
+#define NV097_SET_POINT_PARAMS_ENABLE     0x0318
+#define NV097_SET_POINT_SMOOTH_ENABLE     0x031C
+#define NV097_SET_SWATH_WIDTH             0x09F8
+#define NV097_SET_STIPPLE_ENABLE          0x147C
+#define NV097_SET_ANTI_ALIASING_CONTROL   0x1D7C
+#define NV097_SET_OCCLUDE_ZSTENCIL_EN     0x1D84
+#define NV097_SET_CLEAR_RECT_HORIZONTAL   0x1D98
+#define NV097_SET_CLEAR_RECT_VERTICAL     0x1D9C
+#define NV097_SET_TRANSFORM_PROGRAM_CXT_WRITE_EN 0x1E98
 /* The buffer flip. A title double-buffers by telling the GPU which buffer
  * the CRTC reads and which it draws into, advancing the write index and
  * then stalling until the flip has happened. Ignoring these means the
@@ -285,6 +296,17 @@ static struct {
     uint32_t pixel_max;   /* brightest value any pixel write carried */
     uint32_t clip_x, clip_w, clip_y, clip_h;
     uint32_t clear_color;
+    /* Clear rectangle (SET_CLEAR_RECT_*): the region CLEAR_SURFACE is meant to
+     * touch. Recorded, not applied -- the software clear uses the surface clip,
+     * which the title sets to the same region when it matters.
+     * ponytail: honour clear_rect_* here if a title is ever seen clearing a
+     * sub-region it expects the rest of the surface to survive. */
+    uint32_t clear_rect_x, clear_rect_w, clear_rect_y, clear_rect_h;
+    /* Benign render state captured so it is classified rather than counted.
+     * The software rasteriser does not act on any of it. */
+    uint32_t anti_alias_control, swath_width, stipple_enable, occlude_zstencil_en;
+    uint32_t point_params_enable, point_smooth_enable, dither_enable;
+    uint32_t transform_cxt_write_en;
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
@@ -3181,6 +3203,43 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
+
+    /* Benign render state. Captured so the unhandled counter only names things
+     * nobody has classified; the software rasteriser deliberately does not act
+     * on any of it (point/dither/stipple/AA/occlusion-culling are all
+     * optimisation or fixed-function choices D3D11 owns). */
+    case NV097_SET_TRANSFORM_PROGRAM_CXT_WRITE_EN:
+        s_gpu.transform_cxt_write_en = param;
+        break;
+    case NV097_SET_ANTI_ALIASING_CONTROL:
+        s_gpu.anti_alias_control = param;
+        break;
+    case NV097_SET_OCCLUDE_ZSTENCIL_EN:
+        s_gpu.occlude_zstencil_en = param;
+        break;
+    case NV097_SET_SWATH_WIDTH:
+        s_gpu.swath_width = param;
+        break;
+    case NV097_SET_STIPPLE_ENABLE:
+        s_gpu.stipple_enable = param;
+        break;
+    case NV097_SET_POINT_PARAMS_ENABLE:
+        s_gpu.point_params_enable = param;
+        break;
+    case NV097_SET_POINT_SMOOTH_ENABLE:
+        s_gpu.point_smooth_enable = param;
+        break;
+    case NV097_SET_DITHER_ENABLE:
+        s_gpu.dither_enable = param;
+        break;
+    case NV097_SET_CLEAR_RECT_HORIZONTAL:
+        s_gpu.clear_rect_x = param & 0xFFFF;
+        s_gpu.clear_rect_w = (param >> 16) & 0xFFFF;
+        break;
+    case NV097_SET_CLEAR_RECT_VERTICAL:
+        s_gpu.clear_rect_y = param & 0xFFFF;
+        s_gpu.clear_rect_h = (param >> 16) & 0xFFFF;
+        break;
 
     default:
         if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
