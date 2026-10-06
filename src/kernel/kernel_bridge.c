@@ -1824,19 +1824,35 @@ static void bridge_KeDelayExecutionThread(void)
  */
 static void bridge_KeBugCheck(void)
 {
-    fprintf(stderr, "  [KERNEL] *** KeBugCheck: code=0x%08X ***\n",
-            STACK_ARG(0));
-    fflush(stderr);
+    /* Called in a tight loop by some title path (Ghost: ~44k times in one
+     * menu boot). Name the guest call site -- that is the fact the flood
+     * lacked -- and throttle so the log does not become the bottleneck. */
+    static volatile LONG n;
+    LONG c = InterlockedIncrement(&n);
+    if (c <= 20 || (c % 10000) == 0) {
+        fprintf(stderr, "  [KERNEL] *** KeBugCheck: code=0x%08X from 0x%08X "
+                "(esp=0x%08X) [#%ld] ***\n",
+                STACK_ARG(0), g_xbox_kernel_caller, g_esp, (long)c);
+        fflush(stderr);
+        if (c == 20)
+            fprintf(stderr, "  [KERNEL] (further KeBugCheck lines throttled)\n");
+    }
     g_eax = 0;
 }
 
 static void bridge_KeBugCheckEx(void)
 {
-    fprintf(stderr, "  [KERNEL] *** KeBugCheckEx: code=0x%08X "
-            "(0x%08X, 0x%08X, 0x%08X, 0x%08X) ***\n",
-            STACK_ARG(0), STACK_ARG(1), STACK_ARG(2),
-            STACK_ARG(3), STACK_ARG(4));
-    fflush(stderr);
+    static volatile LONG n;
+    LONG c = InterlockedIncrement(&n);
+    if (c <= 20 || (c % 10000) == 0) {
+        fprintf(stderr, "  [KERNEL] *** KeBugCheckEx: code=0x%08X "
+                "(0x%08X, 0x%08X, 0x%08X, 0x%08X) from 0x%08X [#%ld] ***\n",
+                STACK_ARG(0), STACK_ARG(1), STACK_ARG(2),
+                STACK_ARG(3), STACK_ARG(4), g_xbox_kernel_caller, (long)c);
+        fflush(stderr);
+        if (c == 20)
+            fprintf(stderr, "  [KERNEL] (further KeBugCheckEx lines throttled)\n");
+    }
     g_eax = 0;
 }
 
