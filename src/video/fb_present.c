@@ -247,9 +247,26 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         /* Alt+Esc releases the mouse so the window can be moved or the desktop
          * reached; clicking the client grabs it again. Bare Esc is the game's
-         * Back, so it must not release on its own. */
-        if (w == VK_ESCAPE && s_key_down[VK_MENU] && getenv("RECOMP_KBM"))
-            xbox_FramebufferMouseCapture(0);
+         * Back, so it must not release on its own. Alt is the only modifier the
+         * game leaves unbound (Ctrl is crouch, Shift is BLACK), but two things
+         * ate the combination: the default handler opens the system-menu loop on
+         * Alt's WM_SYSKEYDOWN and swallows the Esc, and the desktop's
+         * cycle-windows binding (GNOME) owns Alt+Esc at the compositor. Alt is
+         * swallowed below so no menu loop forms; the compositor binding must be
+         * cleared for the chord to arrive in the first place. */
+        if (w == VK_ESCAPE && (GetKeyState(VK_MENU) & 0x8000)) {
+            if (getenv("RECOMP_KBM"))
+                xbox_FramebufferMouseCapture(0);
+            return 0;
+        }
+        /* Alt (VK_MENU) must not reach the default handler: it opens the
+         * system-menu loop, which swallowed the Esc. Other system keys (Alt+F4)
+         * still fall through. */
+        if (w == VK_MENU || w == VK_LMENU || w == VK_RMENU) {
+            if ((unsigned)w < 256)
+                s_key_down[w] = 1;
+            return 0;
+        }
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.

@@ -309,6 +309,7 @@ struct CachedTexture {
     uint32_t mip_levels;
     uint64_t bytes;
     uint64_t validated_serial;   /* frame serial this entry's memcmp last matched */
+    bool force_validate;         /* a GPU blit overwrote this image; re-check now */
     std::vector<uint8_t> source_snapshot;
     ComPtr<ID3D11ShaderResourceView> view;
 };
@@ -1101,10 +1102,18 @@ static bool tex_validate_once(void)
     return s_tex_validate_once != 0;
 }
 
-static void gpu_sync_impl(bool publish)
+static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_bytes = 0)
 {
     GpuTimer sync_timer(gpu_timing.sync);
     if (!context) return;
+    const uintptr_t only_begin = (uintptr_t)only;
+    const uintptr_t only_end = only_begin + only_bytes;
+    auto wanted = [&](const Surface &surface) {
+        if (!only) return true;
+        uintptr_t begin = (uintptr_t)surface.memory;
+        uintptr_t end = begin + (size_t)surface.pitch * surface.height;
+        return only_begin < end && only_end > begin;
+    };
     gpu_timing.sync_calls++;
     if (!publish) {
         /* Completion only: wait for the GPU to finish, but do not copy any
@@ -1138,6 +1147,7 @@ static void gpu_sync_impl(bool publish)
         GpuTimer copy_timer(gpu_timing.sync_copy);
         for (auto &surface : surfaces)
             if (surface.dirty) {
+                if (!wanted(surface)) continue;
                 if (surface.clear_value_valid) {
                     has_known_clear = true;
                     continue;
@@ -1153,6 +1163,7 @@ static void gpu_sync_impl(bool publish)
                 }
                 has_readback = true;
             }
+        if (!only)
         for (auto &surface : depth_surfaces)
             if (surface.dirty) {
                 if (surface.clear_value_valid) {
@@ -1163,6 +1174,9 @@ static void gpu_sync_impl(bool publish)
                 has_readback = true;
             }
     }
+    /* Targeted publish with nothing overlapping dirty: nothing to pull back,
+     * so don't pay a GPU-completion wait per blit. */
+    if (only && !has_readback && !has_known_clear) return;
     if (pending_draws && (!has_readback || has_known_clear)) {
         GpuTimer wait_timer(gpu_timing.sync_event_wait);
         gpu_timing.completion_waits++;
@@ -1180,6 +1194,7 @@ static void gpu_sync_impl(bool publish)
     }
     for (auto &surface : surfaces) {
         if (!surface.dirty) continue;
+        if (!wanted(surface)) continue;
         if (surface.clear_value_valid) {
             GpuTimer publish_timer(gpu_timing.sync_publish);
             GpuTimer color_timer(gpu_timing.color_publish);
@@ -1241,6 +1256,7 @@ static void gpu_sync_impl(bool publish)
         mark_target_aliases(&surface, surface.memory, (size_t)surface.pitch * surface.height);
         surface.dirty = false;
     }
+    if (!only)
     for (auto &surface : depth_surfaces) {
         if (!surface.dirty) continue;
         if (surface.clear_value_valid) {
@@ -1299,13 +1315,24 @@ static void gpu_sync_impl(bool publish)
         surface.dirty = false;
     }
     pending_draws = false;
-    s_texture_validate_serial++;
+    if (!only) s_texture_validate_serial++;
 }
 
 /* Full sync: publish every dirty surface to guest RAM (flips, invalidate). */
 extern "C" void nv2a_gpu_sync(void)
 {
     gpu_sync_impl(true);
+}
+
+/* Targeted publish: pull just the source surface a GPU-engine blit is about to
+ * read from guest RAM back into guest RAM. A 2D blit reads guest RAM while the
+ * renderer may still hold the surface in a D3D11 texture (publish normally only
+ * happens on flip), so a mid-frame CopyRects -- the loading-screen back-buffer
+ * capture -- read a stale/black image. No texture-serial bump: not a frame
+ * boundary. */
+extern "C" void nv2a_gpu_surface_publish(const void *addr, size_t bytes)
+{
+    gpu_sync_impl(true, addr, bytes);
 }
 
 /* Completion-only sync for ordering events that do not read surfaces back. */
@@ -1319,6 +1346,24 @@ extern "C" void nv2a_gpu_flush(void)
     nv2a_gpu_sync();
     for (auto &surface : surfaces) surface.needs_refresh = true;
     for (auto &surface : depth_surfaces) surface.needs_refresh = true;
+}
+
+/* A GPU-engine blit wrote guest RAM a cached surface mirrors. Refresh only the
+ * surfaces that overlap those bytes from guest RAM; never bump the global
+ * texture-validation serial, which would re-upload GPU-only textures (UI). */
+extern "C" void nv2a_gpu_surface_modified(const void *addr, size_t bytes)
+{
+    uintptr_t begin = (uintptr_t)addr, end = begin + bytes;
+    for (auto &surface : surfaces) {
+        uintptr_t surface_begin = (uintptr_t)surface.memory;
+        uintptr_t surface_end = surface_begin + (size_t)surface.pitch * surface.height;
+        if (begin < surface_end && end > surface_begin) surface.needs_refresh = true;
+    }
+    for (auto &texture : textures) {
+        uintptr_t texture_begin = (uintptr_t)texture.source;
+        uintptr_t texture_end = texture_begin + texture.source_snapshot.size();
+        if (begin < texture_end && end > texture_begin) texture.force_validate = true;
+    }
 }
 
 extern "C" void nv2a_gpu_invalidate(void)
@@ -1558,6 +1603,36 @@ static bool initialize_pipeline()
         vertex_code->GetBufferPointer(), vertex_code->GetBufferSize(), &input_layout));
 }
 
+/* A draw samples the surface it is rendering to (cloak refraction reads the
+ * back buffer). D3D11 forbids one resource being SRV and RTV at once, so the
+ * direct view samples as null. Snapshot the target's current content into a
+ * scratch texture and sample that. One scratch is enough: in practice one
+ * surface per draw feeds back, and the view is consumed immediately. */
+static ComPtr<ID3D11Texture2D> feedback_texture;
+static ComPtr<ID3D11ShaderResourceView> feedback_view;
+
+static ID3D11ShaderResourceView *get_feedback_texture(const Surface &destination)
+{
+    if (!context || !destination.texture) return nullptr;
+    D3D11_TEXTURE2D_DESC desc = {};
+    destination.texture->GetDesc(&desc);
+    D3D11_TEXTURE2D_DESC have = {};
+    if (feedback_texture) feedback_texture->GetDesc(&have);
+    if (!feedback_texture || !feedback_view ||
+            have.Width != desc.Width || have.Height != desc.Height || have.Format != desc.Format) {
+        feedback_texture.Reset();
+        feedback_view.Reset();
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &feedback_texture))) return nullptr;
+        if (FAILED(device->CreateShaderResourceView(feedback_texture.Get(), nullptr, &feedback_view))) return nullptr;
+    }
+    context->CopyResource(feedback_texture.Get(), destination.texture.Get());
+    return feedback_view.Get();
+}
+
 static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, const Surface &destination)
 {
     GpuTimer texture_timer(gpu_timing.texture);
@@ -1579,6 +1654,12 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     uintptr_t destination_begin = (uintptr_t)destination.memory;
     uintptr_t destination_end = destination_begin + (size_t)destination.pitch * destination.height;
     if (begin < destination_end && end > destination_begin) {
+        /* Same surface as the render target (back-buffer feedback). Sample a
+         * snapshot of it instead of the illegal SRV+RTV bind. Only the exact
+         * full-target case maps cleanly onto the scratch texture. */
+        if (binding.width == destination.width && binding.height == destination.height &&
+                binding.linear && (binding.format == 0x12 || binding.format == 0x1E))
+            return get_feedback_texture(destination);
         std::fprintf(stderr, "[GPU-D3D11] texture target alias: source %p bytes %llu size %ux%u pitch %u format %X linear %u; target %p size %ux%u pitch %u\n",
                      (const void *)binding.source, (unsigned long long)binding.source_bytes,
                      binding.width, binding.height, binding.pitch, binding.format, binding.linear,
@@ -1672,11 +1753,14 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                   texture.mip_levels == levels &&
                   texture.source_snapshot.size() == binding.source_bytes))
                 continue;
-            /* Already compared this entry this frame: the verdict still holds. */
-            if (tex_validate_once() && texture.validated_serial == s_texture_validate_serial)
+            /* Already compared this entry this frame: the verdict still holds -- unless a
+             * GPU blit overwrote it since, which forces a fresh compare. */
+            if (tex_validate_once() && !texture.force_validate &&
+                    texture.validated_serial == s_texture_validate_serial)
                 return texture.view.Get();
             if (std::memcmp(texture.source_snapshot.data(), binding.source, binding.source_bytes) == 0) {
                 texture.validated_serial = s_texture_validate_serial;
+                texture.force_validate = false;
                 return texture.view.Get();
             }
             refresh = &texture;

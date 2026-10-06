@@ -194,6 +194,13 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_VERTEX_DATA_ARRAY_OFFSET 0x1720   /* +i*4, 16 attributes */
 #define NV097_SET_VERTEX_DATA_ARRAY_FORMAT 0x1760   /* +i*4 */
 #define NV097_SET_BEGIN_END               0x17FC
+#define NV097_SET_CONTEXT_DMA_REPORT      0x01A8
+#define NV097_CLEAR_REPORT_VALUE          0x17C8
+#define NV097_SET_ZPASS_PIXEL_COUNT_ENABLE 0x17CC
+#define NV097_GET_REPORT                  0x17D0
+#define NV097_GET_REPORT_OFFSET           0x00FFFFFF
+#define NV097_GET_REPORT_TYPE             0xFF000000
+#define NV097_GET_REPORT_TYPE_ZPASS_PIXEL_CNT 1
 #define NV097_SET_TEXTURE_OFFSET          0x1B00   /* +i*0x40 */
 #define NV097_SET_TEXTURE_FORMAT          0x1B04
 #define NV097_SET_TEXTURE_ADDRESS         0x1B08
@@ -341,6 +348,8 @@ static struct {
     uint32_t flush_flip, flush_semaphore, flush_wait_idle, flush_fence,
              flush_clear, flush_raster, flush_report, flush_present;
     uint32_t semaphore_context, semaphore_offset;
+    uint32_t report_context;
+    uint64_t report_timestamp;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
@@ -418,7 +427,7 @@ int xbox_Nv2aNativeFencesEnabled(void)
     return enabled;
 }
 
-static int ramht_instance(uint32_t handle, uint32_t *instance)
+static int ramht_lookup(uint32_t handle, uint32_t *instance, int quiet)
 {
     volatile uint32_t *fifo = xbox_Nv2aRegisterPointer(0x2000, 0x1208);
     volatile uint32_t *ramin = xbox_Nv2aRegisterPointer(0x700000, 0x100000);
@@ -438,8 +447,14 @@ static int ramht_instance(uint32_t handle, uint32_t *instance)
         }
     }
 failure:
-    fprintf(stderr, "[GPU] RAMHT object unavailable: handle 0x%08X\n", handle);
+    if (!quiet)
+        fprintf(stderr, "[GPU] RAMHT object unavailable: handle 0x%08X\n", handle);
     return 0;
+}
+
+static int ramht_instance(uint32_t handle, uint32_t *instance)
+{
+    return ramht_lookup(handle, instance, 0);
 }
 
 static void semaphore_release(uint32_t value)
@@ -478,6 +493,60 @@ failure:
             s_gpu.semaphore_context, s_gpu.semaphore_offset, value);
     fflush(stderr);
     _Exit(EXIT_FAILURE);
+}
+
+/* ZPASS occlusion report. The title writes a 64-bit stamp into the report
+ * buffer, rings GET_REPORT, then spins until the stamp changes; the GPU is
+ * meant to overwrite it with a fresh timestamp plus the number of pixels that
+ * passed the depth test. xemu answers exactly that way
+ * (pgraph_write_zpass_pixel_cnt_report: u64 timestamp, u32 result, u32 done).
+ * There is no real occlusion counter behind the D3D11 path, so report the
+ * whole surface as visible -- never cull geometry a real query would have
+ * kept. ponytail: fixed count, feed the rasteriser's passing-pixel count here
+ * if a title ever needs true occlusion culling. */
+static void report_zpass(uint32_t offset)
+{
+    uint32_t ramin_offset = s_gpu.report_context;
+    if (!ramin_offset)
+        goto failure;
+    if (ramin_offset >= 0x100000u) {
+        uint32_t instance;
+        if (!ramht_instance(ramin_offset, &instance))
+            goto failure;
+        ramin_offset = instance;
+    }
+    volatile uint32_t *descriptor = xbox_Nv2aRegisterPointer(0x700000 + ramin_offset, 12);
+    if (!descriptor)
+        goto failure;
+    uint32_t flags = descriptor[0];
+    uint32_t limit = descriptor[1];
+    uint32_t frame = descriptor[2];
+    uint32_t dma_class = flags & 0xFFFu;
+    uint32_t target = flags & 0x30000u;
+    uint64_t address = (frame & 0xFFFFF000u) + (flags >> 20);
+    if ((dma_class != 0x03u && dma_class != 0x3Du) ||
+            (target != 0 && target != 0x20000u) || (offset & 3u) ||
+            (uint64_t)offset + 16 > (uint64_t)limit + 1)
+        goto failure;
+    uint8_t *destination = xbox_DmaPhysicalPointer(address + offset, 16);
+    if (!destination)
+        goto failure;
+    uint64_t timestamp = ++s_gpu.report_timestamp;
+    uint32_t result = s_gpu.clip_w && s_gpu.clip_h
+                    ? s_gpu.clip_w * s_gpu.clip_h : 1;
+    uint32_t done = 0;
+    memcpy(destination, &timestamp, 8);
+    memcpy(destination + 8, &result, 4);
+    memcpy(destination + 12, &done, 4);
+    return;
+
+failure:
+    {
+        static unsigned warned;
+        if (warned++ < 4)
+            fprintf(stderr, "[GPU] zpass report unresolved: handle 0x%08X offset 0x%08X\n",
+                    s_gpu.report_context, offset);
+    }
 }
 
 /* Every texture-stage register, as the title last set it.
@@ -612,6 +681,189 @@ static void note_engine(uint32_t cls)
         s_engine_class[s_engine_class_count].class_id = cls;
         s_engine_class[s_engine_class_count].count = 1;
         s_engine_class_count++;
+    }
+}
+
+/* ── 2D surface engines ──────────────────────────────────────────────────
+ * A large share of this title's GPU work is not the 3D pipeline but the NV2A
+ * 2D engines: CONTEXT_SURFACES_2D (0x62) describes a source/destination pair
+ * of surfaces, and IMAGE_BLIT (0x9F) copies a rectangle between them on
+ * NV09F_SIZE. Load screens, in-game UI and image decode all go through it, so
+ * ignoring it left those images blank. Implemented to match xemu's renderer op
+ * pgraph_vk_image_blit(). */
+typedef struct {
+    uint32_t object_instance;
+    uint32_t dma_image_source, dma_image_dest;
+    uint32_t color_format;
+    uint32_t source_pitch, dest_pitch;
+    uint32_t source_offset, dest_offset;
+} Nv2aSurfaces2D;
+
+typedef struct {
+    uint32_t object_instance;
+    uint32_t context_surfaces;
+    uint32_t operation;
+    uint32_t in_x, in_y, out_x, out_y, width, height;
+} Nv2aImageBlit;
+
+static Nv2aSurfaces2D s_surf2d;
+static Nv2aImageBlit s_blit;
+static unsigned s_blit_shown;
+
+/* Resolve a context-DMA handle (RAMHT handle or RAMIN offset) to a guest
+ * physical base and length, exactly as the semaphore/report paths do. */
+static int dma_base(uint32_t handle, uint32_t *base, uint32_t *limit)
+{
+    uint32_t offset = handle;
+    uint32_t instance;
+    if (ramht_lookup(handle, &instance, 1))
+        offset = instance;              /* RAMHT handle (this title's are small) */
+    else if (handle >= 0x100000u)
+        return 0;                       /* too large to be a RAMIN offset */
+    if (!offset)
+        return 0;
+    volatile uint32_t *descriptor = xbox_Nv2aRegisterPointer(0x700000 + offset, 12);
+    if (!descriptor)
+        return 0;
+    uint32_t flags = descriptor[0];
+    uint32_t dma_class = flags & 0xFFFu;
+    uint32_t target = flags & 0x30000u;
+    if ((dma_class != 0x02u && dma_class != 0x03u && dma_class != 0x3Du) ||
+            (target != 0 && target != 0x10000u && target != 0x20000u))
+        return 0;
+    *base = (descriptor[2] & 0xFFFFF000u) + (flags >> 20);
+    *limit = descriptor[1];
+    return 1;
+}
+
+static void surfaces2d_method(uint32_t method, uint32_t param)
+{
+    switch (method) {
+    case 0x0000: s_surf2d.object_instance = param; break;        /* SET_OBJECT */
+    case 0x0184: s_surf2d.dma_image_source = param; break;       /* DMA_SOURCE */
+    case 0x0188: s_surf2d.dma_image_dest   = param; break;       /* DMA_DESTIN */
+    case 0x0300: s_surf2d.color_format     = param; break;       /* COLOR_FORMAT */
+    case 0x0304:                                                 /* SET_PITCH */
+        s_surf2d.source_pitch = param & 0xFFFFu;
+        s_surf2d.dest_pitch   = param >> 16;
+        break;
+    case 0x0308: s_surf2d.source_offset = param & 0x07FFFFFFu; break;
+    case 0x030C: s_surf2d.dest_offset   = param & 0x07FFFFFFu; break;
+    default: break;
+    }
+}
+
+/* The copy itself, on NV09F_SIZE. */
+static void image_blit_run(void)
+{
+    uint32_t bpp;
+    switch (s_surf2d.color_format) {
+    case 0x01: bpp = 1; break;                          /* LE_Y8            */
+    case 0x04: bpp = 2; break;                          /* LE_R5G6B5        */
+    case 0x06: case 0x07: case 0x0A: case 0x0B: bpp = 4; break;
+    default:
+        if (s_blit_shown++ < 4)
+            fprintf(stderr, "[BLIT] unknown color format 0x%X\n", s_surf2d.color_format);
+        return;
+    }
+    if (!s_blit.width || !s_blit.height)
+        return;
+
+    uint32_t src_base, dst_base, src_limit, dst_limit;
+    if (!dma_base(s_surf2d.dma_image_source, &src_base, &src_limit) ||
+            !dma_base(s_surf2d.dma_image_dest, &dst_base, &dst_limit)) {
+        if (s_blit_shown++ < 4)
+            fprintf(stderr, "[BLIT] unresolved surfaces: src 0x%08X dst 0x%08X\n",
+                    s_surf2d.dma_image_source, s_surf2d.dma_image_dest);
+        return;
+    }
+
+    uint32_t src_off = s_surf2d.source_offset
+                     + s_blit.in_y * s_surf2d.source_pitch + s_blit.in_x * bpp;
+    uint32_t dst_off = s_surf2d.dest_offset
+                     + s_blit.out_y * s_surf2d.dest_pitch + s_blit.out_x * bpp;
+    uint32_t min_pitch = s_surf2d.source_pitch < s_surf2d.dest_pitch
+                       ? s_surf2d.source_pitch : s_surf2d.dest_pitch;
+    uint32_t row_pixels = min_pitch / bpp;
+    if (row_pixels > s_blit.width)
+        row_pixels = s_blit.width;
+    size_t row_bytes = (size_t)row_pixels * bpp;
+    if (!row_bytes)
+        return;
+
+    uint64_t src_span = (uint64_t)(s_blit.height - 1) * s_surf2d.source_pitch + row_bytes;
+    uint64_t dst_span = (uint64_t)(s_blit.height - 1) * s_surf2d.dest_pitch + row_bytes;
+    if ((uint64_t)src_off + src_span > (uint64_t)src_limit + 1 ||
+            (uint64_t)dst_off + dst_span > (uint64_t)dst_limit + 1) {
+        if (s_blit_shown++ < 4)
+            fprintf(stderr, "[BLIT] extent past DMA limit: src %llu/%u dst %llu/%u\n",
+                    (unsigned long long)((uint64_t)src_off + src_span), src_limit,
+                    (unsigned long long)((uint64_t)dst_off + dst_span), dst_limit);
+        return;
+    }
+    /* Resolve as a GPU surface (memory + dma_resolve), not via
+     * xbox_DmaPhysicalPointer: that helper enforces one host bank per extent
+     * and rejects a surface straddling the ordinary/contiguous boundary -- the
+     * back-buffer copy is exactly such a surface, and returning NULL left the
+     * refraction texture black. The two arenas are adjacent, so the renderer's
+     * own surfacing path is both correct and sufficient. */
+    uint8_t *memory = (uint8_t *)xbox_GetMemoryOffset();
+    uint8_t *src = memory + dma_resolve(src_base + src_off);
+    uint8_t *dst = memory + dma_resolve(dst_base + dst_off);
+    if (!src || !dst)
+        return;
+
+    /* The source is guest RAM: if the renderer still holds it in a D3D11
+     * surface (published only on flip), pull it back before reading, or a
+     * mid-frame CopyRects reads a stale/black image (loading-screen bg). */
+    nv2a_gpu_surface_publish(src, (size_t)s_blit.height * s_surf2d.source_pitch);
+
+    if (s_blit_shown++ < 8)
+        fprintf(stderr, "[BLIT] op=%u fmt=0x%X src=0x%08X+0x%X p%u dst=0x%08X+0x%X p%u"
+                        " in(%u,%u) out(%u,%u) %ux%u\n",
+                s_blit.operation, s_surf2d.color_format, src_base, src_off,
+                s_surf2d.source_pitch, dst_base, dst_off, s_surf2d.dest_pitch,
+                s_blit.in_x, s_blit.in_y, s_blit.out_x, s_blit.out_y,
+                s_blit.width, s_blit.height);
+
+    if (s_blit.operation == 3u) {                       /* SRCCOPY */
+        for (uint32_t y = 0; y < s_blit.height; y++)
+            memmove(dst + (size_t)y * s_surf2d.dest_pitch,
+                    src + (size_t)y * s_surf2d.source_pitch, row_bytes);
+    } else if (s_blit.operation == 2u) {                /* BLEND_AND */
+        for (uint32_t y = 0; y < s_blit.height; y++) {
+            uint8_t *d = dst + (size_t)y * s_surf2d.dest_pitch;
+            const uint8_t *s = src + (size_t)y * s_surf2d.source_pitch;
+            for (uint32_t x = 0; x < row_pixels; x++)
+                for (uint32_t ch = 0; ch < 3; ch++)
+                    d[x * bpp + ch] = (uint8_t)(((uint32_t)s[x * bpp + ch] +
+                                                 (uint32_t)d[x * bpp + ch]) / 2);
+        }
+        /* ponytail: no NV_BETA weighting (this title never binds class 0x12);
+         * BLEND_AND is averaged rather than beta-faded. */
+    } else {
+        if (s_blit_shown++ < 4)
+            fprintf(stderr, "[BLIT] unknown operation %u\n", s_blit.operation);
+        return;
+    }
+    /* The destination is guest RAM: refresh any cached surface it mirrors. */
+    nv2a_gpu_surface_modified(dst, (size_t)s_blit.height * s_surf2d.dest_pitch);
+}
+
+static void image_blit_method(uint32_t method, uint32_t param)
+{
+    switch (method) {
+    case 0x0000: s_blit.object_instance = param; break;            /* SET_OBJECT   */
+    case 0x019C: s_blit.context_surfaces = param; break;           /* CONTEXT_SURF */
+    case 0x02FC: s_blit.operation = param; break;                  /* SET_OPERATION*/
+    case 0x0300: s_blit.in_x = param & 0xFFFFu; s_blit.in_y = param >> 16; break;
+    case 0x0304: s_blit.out_x = param & 0xFFFFu; s_blit.out_y = param >> 16; break;
+    case 0x0308:                                                   /* SET_SIZE     */
+        s_blit.width = param & 0xFFFFu;
+        s_blit.height = param >> 16;
+        image_blit_run();
+        break;
+    default: break;
     }
 }
 
@@ -3169,8 +3421,30 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
-        if (nv_class_name(s_subch_class[subch])) {
-            note_engine(s_subch_class[subch]);
+        if (method == 0) {                 /* SET_OBJECT binds this engine */
+            uint32_t instance;
+            if (ramht_instance(param, &instance)) {
+                volatile uint32_t *object = xbox_Nv2aRegisterPointer(0x700000 + instance, 4);
+                if (object) {
+                    s_subch_class[subch] = *object & 0xFFFu;
+                    if (getenv("RECOMP_NV2A_CLASS"))
+                        fprintf(stderr, "[NV2A] subch %u class 0x%03X handle 0x%X\n",
+                                subch, s_subch_class[subch], param);
+                }
+            }
+            return;
+        }
+        uint32_t cls = s_subch_class[subch];
+        if (cls == 0x62u) {
+            surfaces2d_method(method, param);
+            return;
+        }
+        if (cls == 0x9Fu) {
+            image_blit_method(method, param);
+            return;
+        }
+        if (nv_class_name(cls)) {
+            note_engine(cls);
             return;
         }
         note_unhandled(subch, method, param);
@@ -3543,6 +3817,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     if (method >= 0x0180 && method <= 0x01A8
             && (method & 3) == 0) {
+        if (method == NV097_SET_CONTEXT_DMA_REPORT)
+            s_gpu.report_context = param;
         static unsigned context_shown;
         if (context_shown++ < 32)
             fprintf(stderr, "  [GPU] 3D context method 0x%04X handle 0x%08X\n",
@@ -3550,6 +3826,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     switch (method) {
+    case NV097_CLEAR_REPORT_VALUE:
+    case NV097_SET_ZPASS_PIXEL_COUNT_ENABLE:
+        /* Recorded only to keep the occlusion query trio out of the unhandled
+         * report; the count itself is answered in report_zpass. */
+        return;
+    case NV097_GET_REPORT:
+        if ((param & NV097_GET_REPORT_TYPE) == NV097_GET_REPORT_TYPE_ZPASS_PIXEL_CNT)
+            report_zpass(param & NV097_GET_REPORT_OFFSET);
+        return;
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;
         s_gpu.clip_w = (param >> 16) & 0xFFFF;
@@ -4121,11 +4406,11 @@ void nv2a_pb_exec_report(void)
                 nv_class_name(s_engine_class[i].class_id),
                 s_engine_class[i].count);
 
-    /* What is left should be the ZPASS query trio (0x17C8/0x17CC/0x17D0): they
-     * carry occlusion-query results, not render state, and the executor has no
-     * occlusion counter to report. ponytail: resolve the report DMA object
-     * (SET_CONTEXT_DMA_REPORT) and write a conservative "visible" count in
-     * GET_REPORT if a title is ever seen waiting on a query result. */
+    /* The ZPASS query trio (0x17C8/0x17CC/0x17D0) is handled above: GET_REPORT
+     * resolves the report DMA object (SET_CONTEXT_DMA_REPORT) and writes a
+     * fresh stamp plus a whole-surface count. ponytail: the count is fixed, not
+     * a real occlusion result; feed the rasteriser's passing-pixel count here
+     * if a title ever needs true occlusion culling. */
 
     /* Top ten by frequency: selection sort over a small table, once every few
      * seconds, is not worth a better algorithm.
