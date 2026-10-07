@@ -411,6 +411,8 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     static unsigned deadzone, invert_y, maxdelta, stick_deadzone, sens, ratio;
     static unsigned look_direct, look_trace;
     static float look_gain, look_gain_y;
+    static float dbg_last_pitch, dbg_last_yaw;
+    static int dbg_have;
     WORD b = 0;
     int dx, dy, wheel;
 
@@ -487,10 +489,12 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
         pState->Gamepad.sThumbRY = 0;
         camera = kbm_camera();
         if (camera) {
+            float startP = kbm_camf(camera, 0x114u);
+            float startY = kbm_camf(camera, 0x11Cu);
             float dY = -(float)dx * look_gain;
             float dP = (invert_y ? (float)dy : -(float)dy) * look_gain_y;
-            float yaw = kbm_camf(camera, 0x11Cu) + dY;
-            float pitch = kbm_camf(camera, 0x114u) + dP;
+            float yaw = startY + dY;
+            float pitch = startP + dP;
             uint32_t look = kbm_u32(camera + 0x188u);
             while (yaw >= 360.0f) yaw -= 360.0f;
             while (yaw <    0.0f) yaw += 360.0f;
@@ -498,6 +502,11 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
             if (pitch < -89.0f) pitch = -89.0f;
             kbm_cam_setf(camera, 0x11Cu, yaw);
             kbm_cam_setf(camera, 0x114u, pitch);
+            /* While moving, tSimCamera::UpdatePitch recenters +0x114 toward
+             * (+0x124 + +0x104) = (0 + rest). Writing our pitch into the rest
+             * field makes that recenter target *our* pitch, so vertical look
+             * survives movement instead of snapping back to -10. */
+            kbm_cam_setf(camera, 0x104u, pitch);
             /* the aim/desired fields the weapon path reads (SetYaw/SetPitch) */
             kbm_cam_setf(camera, 0x20Cu, yaw);
             kbm_cam_setf(camera, 0x204u, pitch);
@@ -510,6 +519,36 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
                 if (tP < -89.0f) tP = -89.0f;
                 kbm_cam_setf(look, 0x14u, tY);
                 kbm_cam_setf(look, 0x10u, tP);
+            }
+            if (look_trace && dbg_have && (dx || dy))
+                fprintf(stderr, "[PROBE] dy=%d startP=%+.3f prevSetP=%+.3f startY=%+.3f prevSetY=%+.3f\n",
+                        dy, (double)startP, (double)dbg_last_pitch,
+                        (double)startY, (double)dbg_last_yaw);
+            dbg_last_pitch = pitch;
+            dbg_last_yaw = yaw;
+            dbg_have = 1;
+        }
+    }
+
+    /* Diagnostic: hold a signed +-45 value in a configurable camera field,
+     * alternating every 2 s, to identify which field actually drives the
+     * rendered pitch. RECOMP_KBM_SWEEP=1 enables, RECOMP_KBM_SWEEP_OFF=<hex>
+     * picks the offset (default 0x114). Logs nothing on its own. */
+    {
+        static int sweep = -1;
+        static unsigned sweep_off;
+        if (sweep < 0) {
+            const char *v = getenv("RECOMP_KBM_SWEEP");
+            const char *o = getenv("RECOMP_KBM_SWEEP_OFF");
+            sweep = (v && *v && *v != '0') ? 1 : 0;
+            sweep_off = o ? (unsigned)strtoul(o, NULL, 0) : 0x114u;
+        }
+        if (sweep) {
+            uint32_t cam = kbm_camera();
+            if (cam) {
+                unsigned long t = (unsigned long)GetTickCount();
+                float v = ((t / 2000u) & 1u) ? 45.0f : -45.0f;
+                kbm_cam_setf(cam, sweep_off, v);
             }
         }
     }
@@ -544,6 +583,48 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
                         thing ? (double)kbm_camf(thing, 0x90u) : 0.0,
                         thing ? (double)kbm_camf(thing, 0x94u) : 0.0,
                         thing ? (double)kbm_camf(thing, 0x98u) : 0.0);
+                {
+                    uint32_t holder = kbm_u32(0x439DE8u);
+                    uint32_t player = (kbm_valid(holder)) ? kbm_u32(holder) : 0;
+                    uint32_t wa = 0, wb = 0, walkCam = 0;
+                    if (kbm_valid(player)) {
+                        wa = kbm_u32(player + 0x180u);
+                        if (kbm_valid(wa)) {
+                            wb = kbm_u32(wa + 0x520u);
+                            if (kbm_valid(wb)) walkCam = kbm_u32(wb + 4u);
+                        }
+                    }
+                    fprintf(stderr, "  walk: holder=%08x player=%08x wa=%08x wb=%08x walkCam=%08x same=%d\n",
+                            holder, player, wa, wb, walkCam,
+                            walkCam && walkCam == camera);
+                }
+                for (o = 0x00u; o <= 0x40u; o += 4u)
+                    fprintf(stderr, "  m%02x %+12.5f\n", o,
+                            (double)kbm_camf(camera, o));
+                for (o = 0x1A0u; o <= 0x210u; o += 4u)
+                    fprintf(stderr, "  p%03x %+12.5f\n", o,
+                            (double)kbm_camf(camera, o));
+                fprintf(stderr, "  lookPos=%+.4f %+.4f %+.4f eye=%+.4f %+.4f %+.4f dist=%+.4f pitchoff=%+.4f\n",
+                        (double)kbm_camf(camera, 0x74u),
+                        (double)kbm_camf(camera, 0x78u),
+                        (double)kbm_camf(camera, 0x7Cu),
+                        (double)kbm_camf(camera, 0x210u),
+                        (double)kbm_camf(camera, 0x214u),
+                        (double)kbm_camf(camera, 0x218u),
+                        (double)kbm_camf(camera, 0xF8u),
+                        (double)kbm_camf(camera, 0xF4u));
+                fprintf(stderr, "  tgt170=%+.4f %+.4f %+.4f c118=%+.4f c120=%+.4f c158=%+.4f c1A4=%+.4f c1A8=%+.4f\n",
+                        (double)kbm_camf(camera, 0x170u),
+                        (double)kbm_camf(camera, 0x174u),
+                        (double)kbm_camf(camera, 0x178u),
+                        (double)kbm_camf(camera, 0x118u),
+                        (double)kbm_camf(camera, 0x120u),
+                        (double)kbm_camf(camera, 0x158u),
+                        (double)kbm_camf(camera, 0x1A4u),
+                        (double)kbm_camf(camera, 0x1A8u));
+                for (o = 0x240u; o <= 0x27Cu; o += 4u)
+                    fprintf(stderr, "  M%03x %+12.5f\n", o,
+                            (double)kbm_camf(camera, o));
             }
             next_look = t + 200;
         }
