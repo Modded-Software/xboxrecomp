@@ -804,13 +804,26 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
             qemu_mutex_unlock(&d->lock);
         }
         /* VP reads handled by caller if needed */
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        /* GP region */
+        if (is_write) {
+            qemu_mutex_lock(&d->lock);
+            mcpx_apu_gp_write(d, addr - 0x30000, val, size);
+            qemu_mutex_unlock(&d->lock);
+        }
+    } else if (addr >= 0x50000 && addr < 0x60000) {
+        /* EP region */
+        if (is_write) {
+            qemu_mutex_lock(&d->lock);
+            mcpx_apu_ep_write(d, addr - 0x50000, val, size);
+            qemu_mutex_unlock(&d->lock);
+        }
     } else if (addr < 0x20000) {
         /* Main APU registers */
         if (is_write) {
             mcpx_apu_write(d, addr, val, size);
         }
     }
-    /* GP (0x30000) and EP (0x50000) regions ignored for now */
 }
 
 /* ============================================================
@@ -828,6 +841,10 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
     }
     if (addr >= 0x20000 && addr < 0x30000) {
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        return mcpx_apu_gp_read(d, addr - 0x30000, size);
+    } else if (addr >= 0x50000 && addr < 0x60000) {
+        return mcpx_apu_ep_read(d, addr - 0x50000, size);
     } else if (addr < 0x20000) {
         return mcpx_apu_read(d, (hwaddr)addr, size);
     }
