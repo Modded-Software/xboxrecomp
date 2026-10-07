@@ -51,9 +51,10 @@ extern "C" {
 #define XBOX_MCPX_APU_MMIO_END  0xFE830000u
 #define XBOX_MCPX_APU_MMIO_SIZE (XBOX_MCPX_APU_MMIO_END - XBOX_MCPX_BASE)
 
-/* Actual mapped RAM for this run. Defaults to XBOX_TOTAL_RAM; a title with a
- * devkit build calls xbox_SetTotalRam(XBOX_DEVKIT_RAM) before init. Heap top and
- * mirror stride derive from this, not from the compile-time constant. */
+/* Actual mapped RAM for this run. Defaults to XBOX_DEVKIT_RAM (128 MB) for this
+ * project's Debug build; call xbox_SetTotalRam() before init (or set
+ * RECOMP_TOTAL_RAM_MB) to change it. Heap top and mirror stride derive from
+ * this, not from the compile-time constant. */
 extern size_t g_xbox_total_ram;
 
 /* How much guest address space to map, when that must exceed RAM.
@@ -103,6 +104,11 @@ extern uint32_t g_xbox_image_hi;
 extern uint32_t g_xbox_code_lo;
 extern uint32_t g_xbox_code_hi;
 void xbox_SetTotalRam(size_t bytes);
+
+/* Self-check for the heap's reuse-and-split path; run from the title's entry
+ * point when RECOMP_HEAP_SELFTEST is set. Prints PASS/FAIL and frees what it
+ * allocates. Requires xbox_MemoryLayoutInit to have run. */
+void xbox_HeapSelfTest(void);
 
 /* NOTE: Section addresses (.text, .rdata, .data, etc.) are NOT hardcoded.
  * They are parsed from the XBE header at runtime in xbox_MemoryLayoutInit().
@@ -212,6 +218,11 @@ void xbox_GuestAudioGuardLeave(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
+
+/* Signal the dispatcher-object KEVENT at *(device_ptr_va) + event_off once the
+ * GPU ack thread has caught up, releasing a title's GPU-completion wait (D3D's
+ * BlockOnTime). The waitable counterpart to xbox_Nv2aMirrorFence. */
+int xbox_Nv2aSignalEvent(uint32_t device_ptr_va, uint32_t event_off);
 
 void xbox_MemoryLayoutShutdown(void);
 

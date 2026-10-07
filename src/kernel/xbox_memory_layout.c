@@ -44,8 +44,10 @@ static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
 
-/* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
-size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
+/* Actual mapped RAM for this run; see the header. Defaults to the 128 MB
+ * devkit: Ghost.xbe is a Debug build that sizes for it, and at 64 MB its
+ * mission load exhausted the heap. Override with RECOMP_TOTAL_RAM_MB. */
+size_t g_xbox_total_ram = XBOX_DEVKIT_RAM;
 size_t g_xbox_map_size = 0;   /* 0 = same as RAM */
 
 void xbox_SetTotalRam(size_t bytes)
@@ -150,6 +152,38 @@ static size_t xbox_TiledApertureSize(void)
                  ? XBOX_NV2A_BASE : 0x100000000ULL;
     size_t max = (size_t)(end - XBOX_TILED_BASE);
     return g_memory_size < max ? g_memory_size : max;
+}
+
+/* Can the tiled aperture -- a file view at guest 0xF0000000 plus the RAM
+ * mapping's host base -- actually be mapped?
+ *
+ * This is what constrains where the RAM mapping may be placed. It has to be a
+ * file view, not a VirtualAlloc reserve: at a host base of +0x10000000 the
+ * tiled alias is exactly 0x100000000 (4 GB), a reserve there succeeds but the
+ * file view fails with ERROR_INVALID_ADDRESS, so a reserve would lie. The
+ * throwaway mapping below performs the same operation the real aperture does. */
+static int xbox_TiledAliasMappable(uintptr_t base, size_t tiled_size)
+{
+    uintmax_t target = (uintmax_t)XBOX_TILED_BASE +
+                       (uintmax_t)(base - XBOX_MAP_START);
+    HANDLE map;
+    LPVOID view;
+
+    /* Known-bad: Wine accepts a throwaway view at 4 GB but rejects the real
+     * one, so never place the base where the alias lands there. */
+    if (target == 0x100000000ull)
+        return 0;
+
+    map = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+                             (DWORD)tiled_size, NULL);
+    if (!map)
+        return 0;
+    view = MapViewOfFileEx(map, FILE_MAP_ALL_ACCESS, 0, 0, tiled_size,
+                           (LPVOID)(uintptr_t)target);
+    if (view)
+        UnmapViewOfFile(view);
+    CloseHandle(map);
+    return view != NULL;
 }
 
 static HANDLE g_nv2a_ack_thread = NULL;
@@ -813,6 +847,58 @@ static void fence_mirrors_tick(void)
     }
 }
 
+/*
+ * D3D's GPU-completion event, the waitable form of the acknowledgement
+ * xbox_Nv2aMirrorFence makes.
+ *
+ * After submitting work, D3D::BlockOnTime blocks on a KEVENT embedded in the
+ * device struct (device + 0x1DCC) with an infinite timeout and re-calls the
+ * wait until it returns success. On hardware the GPU interrupt signals that
+ * event; this side has no interrupt, and the guest event is not even created
+ * through the HLE KeInitializeEvent path, so the wait resolves to an invalid
+ * handle, returns WAIT_FAILED immediately, and D3D spins forever. The ack
+ * thread signals the same address once it has processed the submission and
+ * advanced GET to PUT -- exactly the condition the hardware signal reports.
+ */
+#define XBOX_MAX_EVENT_SIGNALS 4
+
+static struct {
+    uint32_t device_ptr_va;
+    uint32_t event_off;
+} g_event_signals[XBOX_MAX_EVENT_SIGNALS];
+static int g_event_signal_count = 0;
+static int g_event_signal_disabled = 0;
+
+int xbox_Nv2aSignalEvent(uint32_t device_ptr_va, uint32_t event_off)
+{
+    if (g_event_signal_count >= XBOX_MAX_EVENT_SIGNALS)
+        return -1;
+    g_event_signals[g_event_signal_count].device_ptr_va = device_ptr_va;
+    g_event_signals[g_event_signal_count].event_off = event_off;
+    g_event_signal_count++;
+    g_event_signal_disabled = getenv("RECOMP_NO_D3D_RETIRE_EVENT") != NULL;
+    fprintf(stderr, "  NV2A event signal: device at 0x%08X, event +0x%X\n",
+            device_ptr_va, event_off);
+    return 0;
+}
+
+static void event_signals_tick(void)
+{
+    if (g_event_signal_disabled)
+        return;
+    for (int i = 0; i < g_event_signal_count; i++) {
+        uint32_t dev;
+
+        if (!fence_readable(g_event_signals[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_event_signals[i].device_ptr_va
+                                     + g_memory_offset);
+        if (!fence_readable(dev + g_event_signals[i].event_off, 4))
+            continue;
+        xbox_KeObjectSignal(dev + g_event_signals[i].event_off);
+    }
+}
+
 static int s_nv2a_trace = 0;
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
@@ -1030,6 +1116,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 fflush(stderr);
             }
         }
+fence_mirrors_tick();
+        event_signals_tick();
         if (s_nv2a_trace) {
             static uint32_t last_start = 0xFFFFFFFFu;
             uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
@@ -1788,7 +1876,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * VirtualFree releases just the slice about to be used, so each view
          * replaces our own reservation rather than racing for free space.
          *
-         * POSIX only. Win32 VirtualFree cannot release part of a reservation:
+* POSIX only. Win32 VirtualFree cannot release part of a reservation:
          * MEM_RELEASE with a nonzero size is ERROR_INVALID_PARAMETER, so both
          * frees below fail, the base view never maps, and the whole span stays
          * reserved. At a 64 MB map that is 1.8 GB the OS tends to place at
@@ -1799,16 +1887,67 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * this on Windows needs placeholder reservations (VirtualAlloc2). */
 #ifndef _WIN32
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
-        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
-        if (g_span_base) {
-            VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
-            g_memory_base = MapViewOfFileEx(g_mapping_handle,
-                                            FILE_MAP_ALL_ACCESS, 0, 0,
-                                            g_memory_size, g_span_base);
-            if (!g_memory_base) {
-                VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
-                g_span_base = NULL;
-                g_span_size = 0;
+        {
+            static const uintptr_t base_hints[] = {
+                XBOX_BASE_ADDRESS,  0x00800000, 0x01000000,
+                /* 0x10000000 absent on purpose: it lands the tiled alias on
+                 * exactly 4 GB, which the real view rejects. */
+                0x18000000, 0x20000000, 0x28000000,
+                0x30000000, 0x40000000, 0,
+            };
+            size_t tiled_size = xbox_TiledApertureSize();
+            if (tiled_size > XBOX_CONTIG_SIZE)
+                tiled_size = XBOX_CONTIG_SIZE;
+
+            for (size_t hi = 0;
+                    hi < sizeof(base_hints) / sizeof(base_hints[0]) &&
+                        !g_memory_base;
+                    hi++) {
+                LPVOID hint = base_hints[hi] ? (LPVOID)base_hints[hi] : NULL;
+                LPVOID base = NULL;
+                LPVOID span = NULL;
+
+                /* Prefer reserving base + mirrors as one span. When the ~3.7 GB
+                 * span cannot be placed (it runs past the free region above the
+                 * low 256 MB), map the base alone and let the mirrors be
+                 * best-effort -- the mirror loop already tolerates failures. */
+                span = VirtualAlloc(hint, g_span_size, MEM_RESERVE,
+                                    PAGE_NOACCESS);
+                if (span) {
+                    VirtualFree(span, g_memory_size, MEM_RELEASE);
+                    base = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS,
+                                           0, 0, g_memory_size, span);
+                    if (!base) {
+                        VirtualFree((LPVOID)((uintptr_t)span + g_memory_size),
+                                    0, MEM_RELEASE);
+                        span = NULL;
+                    }
+                } else {
+                    base = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS,
+                                           0, 0, g_memory_size, hint);
+                    if (base && hint && base != hint) {
+                        UnmapViewOfFile(base);
+                        base = NULL;
+                    }
+                }
+                if (!base)
+                    continue;
+
+                if (xbox_TiledAliasMappable((uintptr_t)base, tiled_size)) {
+                    g_span_base = span;
+                    g_memory_base = base;
+                    fprintf(stderr, "  RAM base %p (mirror span %s)\n",
+                            base, span ? "reserved" : "best-effort");
+                } else {
+                    fprintf(stderr, "  RAM base candidate %p rejected: tiled "
+                            "alias at 0x%llX not mappable\n", base,
+                            (unsigned long long)((uintmax_t)XBOX_TILED_BASE +
+                             ((uintptr_t)base - XBOX_MAP_START)));
+                    UnmapViewOfFile(base);
+                    if (span)
+                        VirtualFree((LPVOID)((uintptr_t)span + g_memory_size),
+                                    0, MEM_RELEASE);
+                }
             }
         }
 #endif
@@ -3260,7 +3399,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
      * debug build allocates and releases heavily through init, exhausted all
      * 48 MB in 4,726 allocations, and its second D3D CreateDevice then failed
      * with E_OUTOFMEMORY -- which the title reports by clearing
-     * global_d3d_device, so the rasterizer asserts and startup stops. */
+* global_d3d_device, so the rasterizer asserts and startup stops. */
     if (xbox_HeapReclaimEnabled()) {
         /* Take only what the request needs; see xbox_HeapReclaimEnabled(). */
         size = (size + 15) & ~15u;
@@ -3275,7 +3414,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
             if (g_heap_blocks[i].addr & (alignment - 1)) {
                 continue;   /* wrong alignment for this request */
             }
-            g_heap_blocks[i].free = 0;
+g_heap_blocks[i].free = 0;
             result = g_heap_blocks[i].addr;
             memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
             return result;
@@ -3359,6 +3498,45 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
  * forward is asking about the block that contains it. Returns 0 for an address
  * this heap never handed out, which is what "not one of mine" has to look like.
  */
+/* Runnable check for the reuse-split path. A large block freed and then
+ * re-issued for a tiny request must not report the large size back: before the
+ * split was added it did, which is the whole mission-load OOM. Gated by
+ * RECOMP_HEAP_SELFTEST so it only runs when asked. Leaves no live blocks. */
+void xbox_HeapSelfTest(void)
+{
+    uint32_t big = xbox_HeapAlloc(1024 * 1024, 16);
+    uint32_t small;
+    uint32_t mid;
+
+    if (!big) { fprintf(stderr, "[HEAP-SELFTEST] FAIL: big alloc\n"); return; }
+    xbox_HeapFree(big);
+
+    small = xbox_HeapAlloc(64, 16);
+    if (small != big) {
+        fprintf(stderr, "[HEAP-SELFTEST] FAIL: small did not reuse freed block "
+                "(got 0x%08X want 0x%08X)\n", small, big);
+        return;
+    }
+    if (xbox_HeapBlockSize(small) != 64) {
+        fprintf(stderr, "[HEAP-SELFTEST] FAIL: small consumed whole freed block "
+                "(block size %u, want 64)\n", xbox_HeapBlockSize(small));
+        xbox_HeapFree(small);
+        return;
+    }
+
+    /* The remainder must still satisfy a mid-size request. */
+    mid = xbox_HeapAlloc(512 * 1024, 16);
+    if (!mid) {
+        fprintf(stderr, "[HEAP-SELFTEST] FAIL: split remainder unusable\n");
+        xbox_HeapFree(small);
+        return;
+    }
+
+    xbox_HeapFree(mid);
+    xbox_HeapFree(small);
+    fprintf(stderr, "[HEAP-SELFTEST] PASS\n");
+}
+
 uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
 {
     int i;
