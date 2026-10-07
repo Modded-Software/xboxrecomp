@@ -228,6 +228,16 @@ class FunctionDetector:
             if not (self.engine.probes_as_prologue(nxt)
                     or self.engine.probes_as_constant_stub(nxt)):
                 continue
+            # A lone `mov edi,edi` hot-patch pad sits in front of an out-of-line
+            # jump table just as often as in front of a function. If a measured
+            # table starts inside the candidate's prologue window the bytes are
+            # padding and the "prologue" is the alignment nop, not a function
+            # head (Ghost's 0x0007D456 is 2 bytes of `mov edi,edi` before the
+            # switch tables at 0x0007D458; registering it swallowed the
+            # GunCrouchStart entry at 0x0007D4B0).
+            if any(nxt <= tbl < nxt + 16
+                   for tbl in self.engine.jump_tables):
+                continue
             self._add_candidate(nxt, config.CONFIDENCE_CC_BOUNDARY,
                                 "gap_prologue")
             added = True
@@ -574,7 +584,15 @@ class FunctionDetector:
             # address and passed around as values, so an immediate is exactly
             # how they show up.
             if not (self.engine.probes_as_returning_body(target)
-                    or self.engine.probes_as_vcall_thunk(target)):
+                    or self.engine.probes_as_vcall_thunk(target)
+                    # A handler reached only through a table immediate may end
+                    # in `jmp <other handler>` rather than a ret, so the
+                    # ret-only rule dropped it. Accept such a body only with a
+                    # recognised prologue as corroboration, which keeps a
+                    # data word that merely decodes to a stray jmp out.
+                    # Ghost's GunCrouchStart (0x0007D4B0) is exactly this.
+                    or (self.engine.probes_as_prologue(target)
+                        and self.engine.probes_as_function_body(target))):
                 continue
             if target not in self.engine.instructions:
                 if not self.engine.decode_at(target):
