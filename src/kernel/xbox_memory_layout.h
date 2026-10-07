@@ -199,10 +199,18 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t low, uint32_t high,
                                uint32_t alignment);
 void xbox_ContiguousFree(uint32_t guest_va);
 uint32_t xbox_ContiguousBlockSize(uint32_t guest_va);
+int xbox_ContiguousOwnsHead(uint32_t offset);
+void xbox_ContigMarkApuOffset(uint32_t offset);
+int xbox_ContigApuOwned(uint32_t offset);
 uint32_t xbox_ContiguousAllocatedBytes(void);
 void xbox_RecordDmaTranslation(uint32_t guest_va, uint32_t physical);
 uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes);
 uint8_t *xbox_ApuPhysicalPointer(uint64_t physical, uint32_t bytes);
+void xbox_ApuHostWrite(uint8_t *host, uint32_t bytes);
+int xbox_ApuContigTouched(uint32_t physical);
+int xbox_PageContiguousOnly(uint32_t physical);
+int xbox_DmaBankOf(uint64_t physical);
+int xbox_ContigOwnsOffset(uint64_t physical);
 volatile uint32_t *xbox_Nv2aRegisterPointer(uint32_t offset, uint32_t bytes);
 void xbox_Nv2aAcknowledgeHandshakes(void);
 int xbox_Nv2aNativeFencesEnabled(void);

@@ -90,6 +90,13 @@ static void *g_tiled_view = NULL;
  * the same numbers for MmClaimGpuInstanceMemory. */
 static void *g_contig_memory = NULL;
 static LONG g_dma_banks[XBOX_CONTIG_SIZE / 4096];
+/* Per-page provenance: did the guest translate this physical from a window VA
+ * (contiguous) and/or an ordinary VA? A page translated *only* from the window
+ * is genuinely contiguous; a page that was also translated as ordinary is a
+ * numeric collision between the two arenas and must not be pulled into the
+ * window (that is the DSP audio buffer sharing a number with a GPU surface). */
+static uint8_t g_page_contig[XBOX_CONTIG_SIZE / 4096];
+static uint8_t g_page_ordinary[XBOX_CONTIG_SIZE / 4096];
 
 /* NV2A GPU register aperture (see MemoryLayoutInit). Backed as plain RAM so
  * that D3D8 code linked into the title can poke it without faulting. */
@@ -2634,8 +2641,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  * DSP56300 engine (RECOMP_APU_DSP) the GP (0x30000) and EP
                  * (0x50000) sub-regions must trap too, so widen the span to the
                  * whole 0x80000 APU container. */
+                /* Must match apu_dsp_engine_enabled(): the DSP56300 engine is
+                 * on by default and opt-out with RECOMP_APU_DSP=0. Trapping the
+                 * GP/EP window while the stub is selected makes the title's DSP
+                 * RAM writes vanish and wedges boot. */
+                const char *dsp_env = getenv("RECOMP_APU_DSP");
+                bool apu_dsp_on = (dsp_env && *dsp_env)
+                    ? (atoi(dsp_env) != 0) : true;
                 size_t apu_trap_size = XBOX_MCPX_APU_MMIO_SIZE;
-                if (getenv("RECOMP_APU_DSP"))
+                if (apu_dsp_on)
                     apu_trap_size = 0x80000u;
                 if (VirtualProtect((char *)g_mcpx_memory,
                                    apu_trap_size,
@@ -3227,6 +3241,17 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t low, uint32_t high,
     uint64_t rounded = ((uint64_t)size + CONTIG_PAGE_BYTES - 1)
                        & ~(uint64_t)(CONTIG_PAGE_BYTES - 1);
     uint64_t mask = (uint64_t)alignment - 1;
+    /* Diagnostic: keep the arena clear of the ordinary heap. See RECOMP_CONTIG_FLOOR. */
+    if (low == 0 && high == UINT32_MAX) {
+        static uint32_t floor;
+        static int inited;
+        if (!inited) {
+            const char *e = getenv("RECOMP_CONTIG_FLOOR");
+            floor = e ? (uint32_t)strtoul(e, NULL, 0) : 0;
+            inited = 1;
+        }
+        if (floor > low) low = floor;
+    }
     uint64_t candidate = ((uint64_t)low + mask) & ~mask;
     AcquireSRWLockExclusive(&g_contig_lock);
     while (candidate + rounded <= CONTIG_ARENA_BYTES
@@ -3271,6 +3296,44 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t low, uint32_t high,
     ReleaseSRWLockExclusive(&g_contig_lock);
     fflush(stderr);
     return 0;
+}
+
+/* Is this window offset the *head* of a live contiguous block? Used by the GPU
+ * executor to decide whether a surface offset names a contiguous allocation.
+ * Interior offsets must NOT match: an ordinary surface whose physical number
+ * falls inside an unrelated contiguous block (e.g. a DSP audio buffer) would
+ * otherwise be misread out of the window. */
+/* Contiguous blocks the APU/DSP actually dereferences. The GPU executor must
+ * not promote an ordinary surface whose physical number merely falls inside one
+ * of these blocks: that would read the DSP's audio bytes as texture (black
+ * surfaces). Genuine GPU surfaces live in their own blocks, disjoint by
+ * construction. */
+static uint8_t g_contig_apu[CONTIG_PAGE_COUNT];
+
+void xbox_ContigMarkApuOffset(uint32_t offset)
+{
+    if (offset >= CONTIG_ARENA_BYTES) return;
+    uint32_t head = offset / CONTIG_PAGE_BYTES;
+    uint32_t owner = InterlockedCompareExchange(&g_contig_owner[head], 0, 0);
+    uint32_t first = owner ? owner - 1 : head;
+    uint32_t pages = owner ? (g_contig_sizes[first] / CONTIG_PAGE_BYTES) : 1;
+    if (!pages) pages = 1;
+    for (uint32_t i = first; i < first + pages && i < CONTIG_PAGE_COUNT; i++)
+        g_contig_apu[i] = 1;
+}
+
+int xbox_ContigApuOwned(uint32_t offset)
+{
+    return offset < CONTIG_ARENA_BYTES &&
+           g_contig_apu[offset / CONTIG_PAGE_BYTES];
+}
+
+int xbox_ContiguousOwnsHead(uint32_t offset)
+{
+    if (offset >= CONTIG_ARENA_BYTES || (offset & (CONTIG_PAGE_BYTES - 1)))
+        return 0;
+    uint32_t head = offset / CONTIG_PAGE_BYTES;
+    return InterlockedCompareExchange(&g_contig_owner[head], 0, 0) == (LONG)(head + 1);
 }
 
 uint32_t xbox_ContiguousBlockSize(uint32_t va)
@@ -3332,6 +3395,77 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
     return (uint32_t)InterlockedCompareExchange(&g_contig_high_water, 0, 0);
 }
 
+/* APU-DSP / GPU clash detector (diagnostic).
+ *
+ * A contiguous VA 0x80000000+P and an ordinary VA P both report physical P
+ * (xbox_MmGetPhysicalAddress), so the APU redirect resolves the DSP's payload
+ * writes to the contiguous arena. Record the arena pages the APU actually
+ * writes, then flag any *other* DMA master (GPU pushbuffer executor, OHCI)
+ * that resolves the same page: that is real host-memory aliasing, not a
+ * number coincidence. Set RECOMP_APU_CLASH_TRACE=1. */
+static uint8_t g_apu_contig_written[CONTIG_PAGE_COUNT];
+
+void xbox_ApuHostWrite(uint8_t *host, uint32_t bytes)
+{
+    uintptr_t off;
+    if (!g_contig_memory || !bytes || host < (uint8_t *)g_contig_memory ||
+        host >= (uint8_t *)g_contig_memory + XBOX_CONTIG_SIZE)
+        return;
+    off = (uintptr_t)host - (uintptr_t)g_contig_memory;
+    for (uintptr_t p = off / 4096;
+         p <= (off + bytes - 1) / 4096 && p < CONTIG_PAGE_COUNT; ++p)
+        g_apu_contig_written[p] = 1;
+}
+
+int xbox_ApuContigTouched(uint32_t physical)
+{
+    return (physical < CONTIG_ARENA_BYTES &&
+            physical / 4096 < CONTIG_PAGE_COUNT)
+        ? g_apu_contig_written[physical / 4096] : 0;
+}
+
+void xbox_DumpArenas(uint32_t physical, uint32_t bytes)
+{
+    if (!g_contig_memory || physical + bytes > g_memory_size ||
+        physical + bytes > XBOX_CONTIG_SIZE)
+        return;
+    const uint8_t *ord = (const uint8_t *)((uintptr_t)g_memory_offset + physical);
+    const uint8_t *con = (const uint8_t *)g_contig_memory + physical;
+    fprintf(stderr, "[ARENA] phys=0x%08X ord=", physical);
+    for (uint32_t i = 0; i < bytes; i++) fprintf(stderr, "%02X", ord[i]);
+    fprintf(stderr, " con=");
+    for (uint32_t i = 0; i < bytes; i++) fprintf(stderr, "%02X", con[i]);
+    fprintf(stderr, "\n");
+}
+
+int xbox_DmaBankOf(uint64_t physical)
+{
+    return physical < XBOX_CONTIG_SIZE
+        ? (int)InterlockedCompareExchange(&g_dma_banks[physical / 4096], 0, 0)
+        : -1;
+}
+
+int xbox_ContigOwnsOffset(uint64_t physical)
+{
+    return (physical < CONTIG_ARENA_BYTES &&
+            physical / 4096 < CONTIG_PAGE_COUNT)
+        ? (InterlockedCompareExchange(&g_contig_owner[physical / 4096], 0, 0) != 0)
+        : 0;
+}
+
+static int apu_contig_clash(const uint8_t *host, uint32_t bytes)
+{
+    uintptr_t off;
+    if (!host || !g_contig_memory || host < (const uint8_t *)g_contig_memory ||
+        host >= (const uint8_t *)g_contig_memory + XBOX_CONTIG_SIZE)
+        return 0;
+    off = (uintptr_t)host - (uintptr_t)g_contig_memory;
+    for (uintptr_t p = off / 4096;
+         p <= (off + bytes - 1) / 4096 && p < CONTIG_PAGE_COUNT; ++p)
+        if (g_apu_contig_written[p]) return 1;
+    return 0;
+}
+
 /* MmGetPhysicalAddress supplies provenance for ordinary guest RAM buffers.
  * Descriptor storage defaults to the separate contiguous DMA window. */
 void xbox_RecordDmaTranslation(uint32_t guest_va, uint32_t physical)
@@ -3346,6 +3480,25 @@ void xbox_RecordDmaTranslation(uint32_t guest_va, uint32_t physical)
     else
         return;
     InterlockedExchange(&g_dma_banks[physical / 4096], bank);
+    if (bank == 2)
+        g_page_contig[physical / 4096] = 1;
+    else
+        g_page_ordinary[physical / 4096] = 1;
+    static int bank_trace = -1;
+    if (bank_trace < 0) bank_trace = getenv("RECOMP_DMA_BANK_TRACE") != NULL;
+    if (bank_trace) {
+        static unsigned long n;
+        if (n < 512)
+            fprintf(stderr, "[DMA-BANK] va=0x%08X phys=0x%08X bank=%ld\n",
+                    guest_va, physical, bank);
+        n++;
+    }
+}
+
+int xbox_PageContiguousOnly(uint32_t physical)
+{
+    if (physical >= XBOX_CONTIG_SIZE) return 0;
+    return g_page_contig[physical / 4096] && !g_page_ordinary[physical / 4096];
 }
 
 uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes)
@@ -3353,8 +3506,18 @@ uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes)
     int explicit_contiguous = physical >= XBOX_CONTIG_BASE &&
         physical < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
     if (explicit_contiguous) physical -= XBOX_CONTIG_BASE;
-    if (!bytes || physical >= XBOX_CONTIG_SIZE ||
-        physical + bytes > XBOX_CONTIG_SIZE) {
+    /* Physicals at or above the contiguous window cannot be window offsets, so
+     * they name ordinary RAM directly (a 128 MB console has RAM above 64 MB).
+     * Resolve them as ordinary instead of rejecting them: the heap lives there
+     * precisely so it never shares a number with a contiguous allocation. */
+    if (physical >= XBOX_CONTIG_SIZE) {
+        if (bytes && physical + bytes <= g_memory_size)
+            return (uint8_t *)((uintptr_t)g_memory_offset + (uintptr_t)physical);
+        fprintf(stderr, "[DMA] invalid physical extent: 0x%llX + %u\n",
+                (unsigned long long)physical, bytes);
+        return NULL;
+    }
+    if (!bytes || physical + bytes > XBOX_CONTIG_SIZE) {
         fprintf(stderr, "[DMA] invalid physical extent: 0x%llX + %u\n",
                 (unsigned long long)physical, bytes);
         return NULL;
@@ -3373,8 +3536,19 @@ uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes)
     }
     if (bank == 1 && physical + bytes <= g_memory_size)
         return (uint8_t *)((uintptr_t)g_memory_offset + (uintptr_t)physical);
-    if (bank != 1 && g_contig_memory)
+    if (bank != 1 && g_contig_memory) {
+        static int clash_trace = -1;
+        if (clash_trace < 0) clash_trace = getenv("RECOMP_APU_CLASH_TRACE") != NULL;
+        if (clash_trace &&
+            apu_contig_clash((uint8_t *)g_contig_memory + physical, bytes)) {
+            static unsigned long n;
+            if (n < 128)
+                fprintf(stderr, "[APU-GPU-CLASH] physical=0x%llX bytes=%u\n",
+                        (unsigned long long)physical, bytes);
+            n++;
+        }
         return (uint8_t *)g_contig_memory + physical;
+    }
     fprintf(stderr, "[DMA] physical storage unavailable: 0x%llX + %u\n",
             (unsigned long long)physical, bytes);
     return NULL;
@@ -3399,10 +3573,23 @@ uint8_t *xbox_ApuPhysicalPointer(uint64_t physical, uint32_t bytes)
 {
     int explicit_contiguous = physical >= XBOX_CONTIG_BASE &&
         physical < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
-    if (!explicit_contiguous && g_contig_memory &&
+    static int no_redir = -1;
+    if (no_redir < 0) no_redir = getenv("RECOMP_APU_NO_REDIR") != NULL;
+    if (!no_redir && !explicit_contiguous && g_contig_memory &&
         physical < CONTIG_ARENA_BYTES && physical / 4096 < CONTIG_PAGE_COUNT &&
-        InterlockedCompareExchange(&g_contig_owner[physical / 4096], 0, 0) != 0)
+        InterlockedCompareExchange(&g_contig_owner[physical / 4096], 0, 0) != 0) {
+        static int redir_trace = -1;
+        if (redir_trace < 0) redir_trace = getenv("RECOMP_APU_REDIR_TRACE") != NULL;
+        if (redir_trace) {
+            static unsigned long n;
+            if (n < 256)
+                fprintf(stderr, "[APU-REDIR] phys=0x%08llX +%u -> contig\n",
+                        (unsigned long long)physical, bytes);
+            n++;
+        }
+        xbox_ContigMarkApuOffset((uint32_t)physical);
         return (uint8_t *)g_contig_memory + physical;
+    }
     return xbox_DmaPhysicalPointer(physical, bytes);
 }
 
@@ -3410,6 +3597,17 @@ uint8_t *xbox_ApuPhysicalPointer(uint64_t physical, uint32_t bytes)
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
+
+    /* Diagnostic: lift the ordinary heap above the contiguous arena so the two
+     * arenas stop reusing the same physical numbers. See RECOMP_HEAP_BASE. */
+    {
+        static int inited;
+        if (!inited) {
+            const char *e = getenv("RECOMP_HEAP_BASE");
+            if (e) g_heap_next = (uint32_t)strtoul(e, NULL, 0);
+            inited = 1;
+        }
+    }
 
     if (alignment < 4) alignment = 4;
 

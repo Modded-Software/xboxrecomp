@@ -37,16 +37,15 @@
 
 /* ── Engine selection ────────────────────────────────────────────────────
  *
- * Default OFF: the DSP56300 interpreter is faithful but not yet validated
- * against the guest programs this title downloads, and turning it on makes
- * output depend on the guest actually bootstrapping the GP/EP. The stub is
- * the known-good path. */
+ * Default ON: the DSP56300 interpreter runs the guest-downloaded GP/EP
+ * programs, which is what produces the title's actual mix. The passthrough
+ * stub is the fallback and can be selected with RECOMP_APU_DSP=0. */
 static bool apu_dsp_engine_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("RECOMP_APU_DSP");
-        on = (e && *e) ? (atoi(e) != 0) : 0;
+        on = (e && *e) ? (atoi(e) != 0) : 1;
     }
     return on != 0;
 }
@@ -230,7 +229,38 @@ static void dsp_frame_stub(MCPXAPUState *d,
  * Real GP/EP DSP56300 pipeline (ported from xemu gp_ep.c)
  * ============================================================ */
 
+unsigned long mcpx_apu_dsp_gp_runs;
+unsigned long mcpx_apu_dsp_ep_runs;
+unsigned long mcpx_apu_dsp_ep_sinks;
+
 static const int16_t ep_silence[256][2] = { 0 };
+
+extern void xbox_ApuHostWrite(uint8_t *host, uint32_t bytes);
+extern int xbox_DmaBankOf(uint64_t physical);
+extern int xbox_ContigOwnsOffset(uint64_t physical);
+extern void xbox_DumpArenas(uint32_t physical, uint32_t bytes);
+
+/* Tripwire for DSP->guest-RAM DMA writes. Witnesses where the running effects
+ * program scribbles; set RECOMP_APU_DMA_TRACE=1. Rate-limited. */
+static void apu_dma_tripwire(uint32_t guest, size_t len)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_APU_DMA_TRACE") != NULL;
+    if (!on) return;
+    static unsigned long n;
+    static uint32_t seen[16];
+    static int nseen;
+    if (n < 512)
+        fprintf(stderr, "[APU-DMA] write guest=0x%08X len=%zu bank=%d contig_owns=%d\n",
+                guest, len, xbox_DmaBankOf(guest), xbox_ContigOwnsOffset(guest));
+    for (int i = 0; i < nseen; i++)
+        if (seen[i] == guest) return;
+    if (nseen < 16) {
+        seen[nseen++] = guest;
+        xbox_DumpArenas(guest, 16);
+    }
+    n++;
+}
 
 static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
                               unsigned int max_sge, uint8_t *ptr, uint32_t addr,
@@ -249,12 +279,30 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
         uint8_t *guest = mcpx_apu_ram_address(prd_address + offset_in_page,
                                               TARGET_PAGE_SIZE);
 
+        /* Diagnostic: force DSP payload writes to ordinary RAM instead of the
+         * contiguous redirect, to test whether the write to the window is what
+         * corrupts GPU memory. Set RECOMP_APU_DATA_ORDINARY=1. */
+        if (dir) {
+            static int ord = -1;
+            if (ord < 0) ord = getenv("RECOMP_APU_DATA_ORDINARY") != NULL;
+            if (ord) {
+                extern ptrdiff_t xbox_GetMemoryOffset(void);
+                guest = (uint8_t *)((uintptr_t)xbox_GetMemoryOffset() +
+                                    prd_address + offset_in_page);
+            }
+        }
+
         if (bytes_to_copy > len) {
             bytes_to_copy = len;
         }
 
         if (dir) {
-            memcpy(guest, ptr, bytes_to_copy);
+            static int nowrite = -1;
+            if (nowrite < 0) nowrite = getenv("RECOMP_APU_DMA_NOWRITE") != NULL;
+            apu_dma_tripwire(prd_address + offset_in_page, bytes_to_copy);
+            xbox_ApuHostWrite(guest, bytes_to_copy);
+            if (!nowrite)
+                memcpy(guest, ptr, bytes_to_copy);
         } else {
             memcpy(ptr, guest, bytes_to_copy);
         }
@@ -364,6 +412,7 @@ static bool ep_sink_samples(MCPXAPUState *d, uint8_t *ptr, size_t len)
         (d->monitor.point == MCPX_APU_DEBUG_MON_GP_OR_EP)) {
         assert(len == sizeof(d->monitor.frame_buf));
         memcpy(d->monitor.frame_buf, ptr, len);
+        mcpx_apu_dsp_ep_sinks++;
     }
 
     return true;
@@ -608,6 +657,7 @@ static void dsp_frame_engine(MCPXAPUState *d,
             dsp_run(d->gp.dsp, 1000);
         } while (!d->gp.dsp->core.is_idle && d->gp.realtime);
         g_dbg.gp.cycles = d->gp.dsp->core.cycle_count;
+        mcpx_apu_dsp_gp_runs++;
         if (!logged_gp) {
             logged_gp = true;
             fprintf(stderr, "[APU-DSP] GP first frame: cycles=%u\n",
@@ -638,6 +688,7 @@ static void dsp_frame_engine(MCPXAPUState *d,
                 dsp_run(d->ep.dsp, 1000);
             } while (!d->ep.dsp->core.is_idle && d->ep.realtime);
             g_dbg.ep.cycles = d->ep.dsp->core.cycle_count;
+            mcpx_apu_dsp_ep_runs++;
             if (!logged_ep) {
                 logged_ep = true;
                 fprintf(stderr, "[APU-DSP] EP first frame: cycles=%u\n",
