@@ -56,6 +56,8 @@ Texture2D image0 : register(t0); Texture2D image1 : register(t1);
 Texture2D image2 : register(t2); Texture2D image3 : register(t3);
 TextureCube cube0 : register(t4); TextureCube cube1 : register(t5);
 TextureCube cube2 : register(t6); TextureCube cube3 : register(t7);
+Texture3D volume0 : register(t8); Texture3D volume1 : register(t9);
+Texture3D volume2 : register(t10); Texture3D volume3 : register(t11);
 SamplerState sampler0 : register(s0); SamplerState sampler1 : register(s1);
 SamplerState sampler2 : register(s2); SamplerState sampler3 : register(s3);
 struct Vertex {
@@ -466,13 +468,26 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
   default:value=cube3.Sample(sampler3,direction);break;
    }
   }
+  if(mode==2) {
+   float3 uvw=coordinate.xyz/coordinate.w;
+   float3 gradientX=ddx(uvw),gradientY=ddy(uvw);
+   if(textureFlags&4)uvw.x=saturate(uvw.x);
+   if(textureFlags&8)uvw.y=saturate(uvw.y);
+   if(textureFlags&32)uvw.z=saturate(uvw.z);
+   switch(stage) {
+   case 0:value=volume0.SampleGrad(sampler0,uvw,gradientX,gradientY);break;
+   case 1:value=volume1.SampleGrad(sampler1,uvw,gradientX,gradientY);break;
+   case 2:value=volume2.SampleGrad(sampler2,uvw,gradientX,gradientY);break;
+   default:value=volume3.SampleGrad(sampler3,uvw,gradientX,gradientY);break;
+   }
+  }
     if(textureFlags&1)value.a=1;
     value=texture_color_sign(value,TEXTURE_SIGN(stage));
     if(mode==7) {
      uint sourceStage=stage==1?0:(textureControl.x>>(stage*4+8))&15;
      value*=registers[8+sourceStage].r*bumpLuminance[stage].x+bumpLuminance[stage].y;
     }
-    if(mode==1 || mode==3 || mode==6 || mode==7 || mode==9 || mode==11 || mode==12 || mode==14 || mode==15 || mode==16 || mode==18) {
+    if(mode==1 || mode==2 || mode==3 || mode==6 || mode==7 || mode==9 || mode==11 || mode==12 || mode==14 || mode==15 || mode==16 || mode==18) {
      if((textureFlags&16) && value.a==0)discard;
       uint keyMode=textureKey[stage].z;
       if(keyMode!=0) {

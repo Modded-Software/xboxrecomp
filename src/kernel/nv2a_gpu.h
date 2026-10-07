@@ -33,6 +33,7 @@ typedef struct Nv2aGpuTexture {
 	const uint8_t *source;
 	uint32_t source_bytes, width, height, pitch, format, linear, address_u, address_v;
 	uint32_t cube, face_stride;
+	uint32_t depth;
 	uint32_t address_w, filter, control0, control0_valid, border_color;
 	uint32_t color_key;
 	uint32_t mip_levels;
@@ -41,6 +42,7 @@ typedef struct Nv2aGpuTexture {
 	int (*decode)(void *, uint32_t, uint32_t, uint32_t *);
 	int (*decode_face)(void *, uint32_t, uint32_t, uint32_t, uint32_t *);
 	int (*decode_level)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *);
+	int (*decode_volume)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *);
 } Nv2aGpuTexture;
 
 static inline int nv2a_gpu_texture_enabled(const Nv2aGpuTexture *binding)
@@ -51,7 +53,7 @@ static inline int nv2a_gpu_texture_enabled(const Nv2aGpuTexture *binding)
 static inline int nv2a_gpu_texture_mode_samples(uint32_t mode)
 {
 	switch (mode) {
-	case 1: case 3: case 6: case 7: case 9: case 11: case 12: case 14: case 15: case 16: case 18:
+	case 1: case 2: case 3: case 6: case 7: case 9: case 11: case 12: case 14: case 15: case 16: case 18:
 		return 1;
 	default:
 		return 0;

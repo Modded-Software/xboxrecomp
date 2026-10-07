@@ -130,6 +130,20 @@ static inline uint32_t swizzle_offset(uint32_t x, uint32_t y,
     return swizzle_deposit(x, mask_x) | swizzle_deposit(y, mask_y);
 }
 
+static inline uint32_t swizzle_volume_offset(uint32_t x, uint32_t y, uint32_t z,
+                                              uint32_t width, uint32_t height, uint32_t depth)
+{
+    uint32_t mask_x = 0, mask_y = 0, mask_z = 0;
+    uint32_t bit = 1, mask_bit = 1;
+    while (bit < width || bit < height || bit < depth) {
+        if (bit < width) { mask_x |= mask_bit; mask_bit <<= 1; }
+        if (bit < height) { mask_y |= mask_bit; mask_bit <<= 1; }
+        if (bit < depth) { mask_z |= mask_bit; mask_bit <<= 1; }
+        bit <<= 1;
+    }
+    return swizzle_deposit(x, mask_x) | swizzle_deposit(y, mask_y) | swizzle_deposit(z, mask_z);
+}
+
 
 /**
  * Unswizzle a texture from Xbox swizzled (Z-order/Morton) layout
