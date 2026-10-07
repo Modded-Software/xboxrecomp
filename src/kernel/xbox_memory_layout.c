@@ -1496,6 +1496,15 @@ void xbox_WatchInit(void)
     watch_arm(g_watch_root + g_watch_off);
 }
 
+/* Diagnostic: arm the RECOMP_WATCH write trap on a guest dword whose address
+ * is only known at runtime (heap object reached via the recompiled code).
+ * No-op if already armed. */
+void xbox_WatchArmVa(uint32_t va)
+{
+    if (!g_watch_page)
+        watch_arm(va);
+}
+
 static int watch_arm(uint32_t va)
 {
     DWORD old;
