@@ -141,11 +141,31 @@ static uint32_t dma_resolve(uint32_t offset)
      * black straight through the guest heap -- which faulted the title three
      * frames later on a pointer that had been overwritten, while the real
      * framebuffer at 0x80A6C000 stayed untouched and the screen stayed black. */
-    if (offset < XBOX_CONTIG_SIZE
-            && xbox_ContiguousBlockSize(XBOX_CONTIG_BASE + offset))
+    static int promote = -1;
+    if (promote < 0) promote = getenv("RECOMP_GPU_NO_CONTIG_PROMOTE") == NULL;
+    static int skip_apu = -1;
+    if (skip_apu < 0) skip_apu = getenv("RECOMP_GPU_SKIP_APU_BLOCKS") != NULL;
+    static int clash = -1;
+    if (clash < 0) clash = getenv("RECOMP_APU_CLASH_TRACE") != NULL;
+    int apu_touched = clash && xbox_ApuContigTouched(offset);
+    if (promote && !(skip_apu && xbox_ContigApuOwned(offset)) &&
+            offset < XBOX_CONTIG_SIZE &&
+            xbox_ContiguousBlockSize(XBOX_CONTIG_BASE + offset)) {
+        if (apu_touched)
+            fprintf(stderr, "[GPU-CLASH] offset=0x%08X -> promoted window "
+                    "0x%08X (APU wrote this page) head=%d blk=%u bank=%d\n", offset,
+                    XBOX_CONTIG_BASE + offset,
+                    xbox_ContiguousOwnsHead(offset),
+                    xbox_ContiguousBlockSize(XBOX_CONTIG_BASE + offset),
+                    xbox_DmaBankOf(offset));
         return XBOX_CONTIG_BASE + offset;
-    if (!surface_hits_image(offset, 1))
+    }
+    if (!surface_hits_image(offset, 1)) {
+        if (apu_touched)
+            fprintf(stderr, "[GPU-CLASH] offset=0x%08X -> ordinary "
+                    "(APU wrote this page)\n", offset);
         return offset;
+    }
     if ((uint64_t)offset < XBOX_CONTIG_SIZE)
         return XBOX_CONTIG_BASE + offset;
     return offset;                         /* nothing better to offer */

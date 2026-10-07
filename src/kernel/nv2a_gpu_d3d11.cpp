@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <chrono>
 #include <algorithm>
+#include <set>
 #if defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <emmintrin.h>
 #endif
@@ -2383,6 +2384,34 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vert
         std::memcpy(constants.light_infinite_direction, state->light_infinite_direction, sizeof constants.light_infinite_direction);
         std::memcpy(constants.light_infinite_half_vector, state->light_infinite_half_vector, sizeof constants.light_infinite_half_vector);
         std::memcpy(constants.light_spot_direction, state->light_spot_direction, sizeof constants.light_spot_direction);
+    }
+    if (state->fixed_transform && state->vertex_constants &&
+            ((state->stage_program & 31u) == 1u)) {
+        static int shadow_diag = -1;
+        if (shadow_diag < 0) shadow_diag = getenv("RECOMP_SHADOW_DIAG") != NULL;
+        if (shadow_diag) {
+            static std::set<uint64_t> seen;
+            uint64_t key = ((uint64_t)state->stage_program << 24)
+                         | ((uint64_t)(state->textures[0].format & 0xFFu) << 16)
+                         | ((uint64_t)(state->texgen[0][0] & 0xFFFFu) << 0);
+            if (seen.size() < 32 && seen.insert(key).second) {
+                const float (*vc)[4] = state->vertex_constants;
+                fprintf(stderr, "[SHADOW] stages=%X ctl0=%X blend=%u/%X/%X depth=%u/%X tm0=%u tgen=%X,%X,%X,%X "
+                        "tex0=%X addr=%X/%X/%X filt=%X ctl=%X/%u %ux%u w=%u h=%u "
+                        "pl64=%.4f,%.4f,%.4f,%.4f pl68=%.4f,%.4f,%.4f,%.4f\n",
+                        state->stage_program, state->control0, state->blend_enable,
+                        state->blend_source, state->blend_destination, state->depth_enable,
+                        state->depth_function, state->texture_matrix_enable[0],
+                        state->texgen[0][0], state->texgen[0][1], state->texgen[0][2], state->texgen[0][3],
+                        state->textures[0].format, state->textures[0].address_u,
+                        state->textures[0].address_v, state->textures[0].address_w,
+                        state->textures[0].filter, state->textures[0].control0,
+                        state->textures[0].control0_valid, state->textures[0].width, state->textures[0].height,
+                        state->width, state->height,
+                        vc[64][0], vc[64][1], vc[64][2], vc[64][3],
+                        vc[68][0], vc[68][1], vc[68][2], vc[68][3]);
+            }
+        }
     }
     constants.viewport[0] = (float)state->width; constants.viewport[1] = (float)state->height;
     constants.viewport[2] = state->depth_format == 1 ? 65535.0f : 16777215.0f;

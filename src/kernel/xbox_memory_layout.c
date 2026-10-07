@@ -86,6 +86,14 @@ static void *g_tiled_view = NULL;
  * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
  * the same numbers for MmClaimGpuInstanceMemory. */
 static void *g_contig_memory = NULL;
+static LONG g_dma_banks[XBOX_CONTIG_SIZE / 4096];
+/* Per-page provenance: did the guest translate this physical from a window VA
+ * (contiguous) and/or an ordinary VA? A page translated *only* from the window
+ * is genuinely contiguous; a page that was also translated as ordinary is a
+ * numeric collision between the two arenas and must not be pulled into the
+ * window (that is the DSP audio buffer sharing a number with a GPU surface). */
+static uint8_t g_page_contig[XBOX_CONTIG_SIZE / 4096];
+static uint8_t g_page_ordinary[XBOX_CONTIG_SIZE / 4096];
 
 /* NV2A GPU register aperture (see MemoryLayoutInit). Backed as plain RAM so
  * that D3D8 code linked into the title can poke it without faulting. */
@@ -2579,8 +2587,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  * DSP56300 engine (RECOMP_APU_DSP) the GP (0x30000) and EP
                  * (0x50000) sub-regions must trap too, so widen the span to the
                  * whole 0x80000 APU container. */
+                /* Must match apu_dsp_engine_enabled(): the DSP56300 engine is
+                 * on by default and opt-out with RECOMP_APU_DSP=0. Trapping the
+                 * GP/EP window while the stub is selected makes the title's DSP
+                 * RAM writes vanish and wedges boot. */
+                const char *dsp_env = getenv("RECOMP_APU_DSP");
+                bool apu_dsp_on = (dsp_env && *dsp_env)
+                    ? (atoi(dsp_env) != 0) : true;
                 size_t apu_trap_size = APU_TRAP_BYTES;
-                if (getenv("RECOMP_APU_DSP"))
+                if (apu_dsp_on)
                     apu_trap_size = 0x80000u;
                 if (VirtualProtect((char *)g_mcpx_memory,
                                    apu_trap_size,
