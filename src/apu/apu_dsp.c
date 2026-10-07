@@ -1,17 +1,16 @@
 /*
- * MCPX APU DSP (GP/EP) - Stub implementation
+ * MCPX APU DSP (GP/EP)
  *
- * The DSP Global Processor (GP) and Encode Processor (EP) handle effects
- * processing (reverb, chorus, etc.) and final output encoding. The full
- * DSP is ~3000 lines of DSP56300 emulation code.
+ * Two implementations live here:
  *
- * For initial audio, we bypass the DSP entirely:
- * - VP mixbins are passed directly to the EP output
- * - GP effects processing is skipped
- * - The EP just copies mixbin 0/1 (front L/R) to the monitor buffer
+ *  - The real GP/EP DSP56300 pipeline, ported verbatim from xemu under
+ *    dsp/. VP mixbins are written into the GP mix buffer, the GP and EP
+ *    programs run, and the EP output fifo is sunk into the monitor frame
+ *    buffer. Selected with RECOMP_APU_DSP=1.
  *
- * This gives us basic voice playback without effects. The DSP can be
- * connected later for reverb, EQ, and other processing.
+ *  - A passthrough stub (default). VP mixbins are mixed straight down to
+ *    the monitor buffer. DirectSound command doorbells are acknowledged by
+ *    RECOMP_APU_DSP_ACK rather than by a running DSP program.
  *
  * Copyright (c) 2012 espes
  * Copyright (c) 2019-2025 Matt Borgerson
@@ -23,19 +22,42 @@
  */
 
 #include "apu_state.h"
+#include "apu.h"
 #include "fpconv.h"
+
+#include "dsp/dsp.h"
+#include "dsp/dsp_dma.h"
+#include "dsp/dsp_state.h"
+#include "dsp/debug.h"
 
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <inttypes.h>
+
+/* ── Engine selection ────────────────────────────────────────────────────
+ *
+ * Default OFF: the DSP56300 interpreter is faithful but not yet validated
+ * against the guest programs this title downloads, and turning it on makes
+ * output depend on the guest actually bootstrapping the GP/EP. The stub is
+ * the known-good path. */
+static bool apu_dsp_engine_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_DSP");
+        on = (e && *e) ? (atoi(e) != 0) : 0;
+    }
+    return on != 0;
+}
 
 /* ── DSP command doorbell acknowledgement ────────────────────────────────
  *
  * DirectSound does not stop at creating the device. It hands the audio DSP a
  * command block in guest RAM, writes a command word, and spins until the DSP
  * writes zero back. On real hardware the GP runs a DSP56300 program that does
- * that. Here the DSP is a passthrough stub, so the word never changes and the
- * title hangs inside DirectSound initialisation -- which on Wreckless gates the
- * entire engine, not just audio.
+ * that. With the passthrough stub the word never changes and the title hangs
+ * inside DirectSound initialisation.
  *
  * RECOMP_APU_DSP_ACK=<addr>[,<addr>...] clears those guest dwords once per APU
  * frame, which is what "the command completed" looks like to the title.
@@ -45,16 +67,20 @@
  * the title reads back will still be wrong. The real fix is DSP56300 emulation
  * in the GP/EP; this exists so audio init stops blocking everything behind it.
  *
- * The address is not derivable from the APU registers: GPSADDR/GPFADDR/
- * EPSADDR/EPFADDR point at the DSP's own scratch and frame memory, while the
- * command block is a DirectSound heap allocation. On Wreckless the registers
- * read 0x01504000 / 0x014EC000 / 0x0151C000 / 0x014F0000 and the doorbell is at
- * 0x014F8810 -- inside none of them. So it has to be observed: run with
- * RECOMP_WATCHDOG_SECS and the spin shows up as ebx plus the poll offset.
+ * gp:<byte offset> and ep:<byte offset> resolve through the programmed scratch
+ * scatter/gather tables. Those registers contain table addresses, not the
+ * payload base; a fixed guest heap address becomes stale when allocation
+ * order changes. This remains an explicitly enabled diagnostic bypass.
  */
 #define APU_DSP_ACK_MAX 8
-static uint32_t s_dsp_ack[APU_DSP_ACK_MAX];
+static struct { uint32_t offset, processor; } s_dsp_ack[APU_DSP_ACK_MAX];
 static int s_dsp_ack_count = -1;
+
+static void dsp_ack_config_error(const char *spec)
+{
+    fprintf(stderr, "[APU] invalid RECOMP_APU_DSP_ACK '%s'; expected aligned addresses or gp:/ep: offsets\n", spec);
+    exit(EXIT_FAILURE);
+}
 
 static void dsp_ack_init(void)
 {
@@ -64,19 +90,65 @@ static void dsp_ack_init(void)
     s_dsp_ack_count = 0;
     if (!spec || !*spec)
         return;
-    strncpy(buf, spec, sizeof buf - 1);
-    buf[sizeof buf - 1] = 0;
-    for (p = buf; *p && s_dsp_ack_count < APU_DSP_ACK_MAX; ) {
-        unsigned long v = strtoul(p, &end, 0);
-        if (end == p)
-            break;
-        if (v)
-            s_dsp_ack[s_dsp_ack_count++] = (uint32_t)v;
-        p = (*end == ',') ? end + 1 : end;
+    if (strlen(spec) >= sizeof buf) dsp_ack_config_error(spec);
+    memcpy(buf, spec, strlen(spec) + 1);
+    for (p = buf; *p; ) {
+        uint32_t processor = 0;
+        if (!strncmp(p, "gp:", 3)) { processor = 1; p += 3; }
+        else if (!strncmp(p, "ep:", 3)) { processor = 2; p += 3; }
+        errno = 0;
+        unsigned long long v = strtoull(p, &end, 0);
+        if (*p < '0' || *p > '9' || end == p || errno ||
+            v > UINT32_MAX || (v & 3) || (*end && *end != ','))
+            dsp_ack_config_error(spec);
+        if (v || processor) {
+            if (s_dsp_ack_count == APU_DSP_ACK_MAX) dsp_ack_config_error(spec);
+            s_dsp_ack[s_dsp_ack_count].offset = (uint32_t)v;
+            s_dsp_ack[s_dsp_ack_count++].processor = processor;
+        }
+        if (!*end) break;
+        p = end + 1;
+        if (!*p) dsp_ack_config_error(spec);
     }
     if (s_dsp_ack_count)
-        fprintf(stderr, "[APU] DSP doorbell ack: %d address(es), first 0x%08X\n",
-                s_dsp_ack_count, s_dsp_ack[0]);
+        fprintf(stderr, "[APU] diagnostic DSP passthrough ack: %d mailbox(es); DSP commands are NOT emulated\n",
+                s_dsp_ack_count);
+}
+
+void mcpx_apu_dsp_ack_frame(MCPXAPUState *d)
+{
+    int i;
+
+    if (s_dsp_ack_count < 0)
+        dsp_ack_init();
+    if (!d->ram_ptr)
+        return;
+    for (i = 0; i < s_dsp_ack_count; i++) {
+        uint64_t physical = s_dsp_ack[i].offset;
+        uint32_t processor = s_dsp_ack[i].processor;
+        if (processor) {
+            uint32_t table = qatomic_read(&d->regs[processor == 1 ? NV_PAPU_GPSADDR : NV_PAPU_EPSADDR]);
+            if (!table) continue;
+            uint32_t page = s_dsp_ack[i].offset >> 12;
+            uint32_t last = qatomic_read(&d->regs[processor == 1 ? NV_PAPU_GPSMAXSGE : NV_PAPU_EPSMAXSGE]);
+            if (page > last) {
+                fprintf(stderr, "[APU] DSP ack offset 0x%08X exceeds scratch SGE limit %u\n",
+                        s_dsp_ack[i].offset, last);
+                exit(EXIT_FAILURE);
+            }
+            uint32_t base = ldl_le_phys(address_space_memory, (uint64_t)table + page * NV_PSGE_SIZE) & 0xFFFFF000u;
+            if (!base) continue;
+            physical = (uint64_t)base + (s_dsp_ack[i].offset & 0xFFFu);
+        }
+        volatile uint32_t *slot = (volatile uint32_t *)mcpx_apu_ram_address(physical, 4);
+        if (*slot) {
+            static int shown[APU_DSP_ACK_MAX];
+            if (shown[i]++ < 3)
+                fprintf(stderr, "[APU] diagnostic DSP doorbell physical 0x%08llX: command 0x%08X"
+                                " bypassed (passthrough)\n", (unsigned long long)physical, *slot);
+            *slot = 0;
+        }
+    }
 }
 
 /* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
@@ -94,99 +166,31 @@ static int mcpx_apu_mixdown_all(void)
     return on;
 }
 
-void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
+/* ============================================================
+ * Passthrough stub frame
+ * ============================================================ */
+
+static void dsp_frame_stub(MCPXAPUState *d,
+                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
-    int i;
-
-    if (s_dsp_ack_count < 0)
-        dsp_ack_init();
-    if (!d->ram_ptr)
-        return;
-    for (i = 0; i < s_dsp_ack_count; i++) {
-        uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
-        if (*slot) {
-            static int shown[APU_DSP_ACK_MAX];
-            if (shown[i]++ < 3)
-                fprintf(stderr, "[APU] DSP doorbell 0x%08X: command 0x%08X"
-                                " acknowledged\n", s_dsp_ack[i], *slot);
-            *slot = 0;
-        }
-    }
-}
-
-void mcpx_apu_dsp_init(MCPXAPUState *d)
-{
-    /* Allocate minimal DSP state for GP and EP.
-     * We need these to exist so reset doesn't crash,
-     * but they won't actually run DSP programs. */
-    d->gp.dsp = (DSPState *)calloc(1, sizeof(DSPState));
-    d->ep.dsp = (DSPState *)calloc(1, sizeof(DSPState));
-
-    if (d->gp.dsp) d->gp.dsp->is_gp = true;
-    if (d->ep.dsp) d->ep.dsp->is_gp = false;
-
-    d->gp.realtime = false;
-    d->ep.realtime = false;
-
-    fprintf(stderr, "[APU] DSP GP/EP initialized (STUBBED - passthrough mode)\n");
-}
-
-void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
-{
-    /* In the real xemu, this reads settings to decide whether
-     * GP/EP should run in realtime or cached mode. We ignore it. */
-    (void)d;
-}
-
-void mcpx_apu_dsp_frame(MCPXAPUState *d,
-                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
-{
-    /* Bypass DSP: take mixbin 0 (front-left) and mixbin 1 (front-right)
-     * and write them directly to the monitor frame buffer as the final
-     * EP output.
-     *
-     * The Xbox DirectSound typically routes:
+    /* The Xbox DirectSound typically routes:
      *   Mixbin 0 = Front Left
      *   Mixbin 1 = Front Right
      *   Mixbin 2 = Center (often unused in stereo)
      *   Mixbin 3 = LFE
      *   Mixbin 4-5 = Rear L/R
      *
-     * For stereo output, bins 0 and 1 are what we want.
-     */
-
+     * Bins 2..31 used to be computed and then dropped on the floor. On
+     * hardware the GP and EP mix the submixes down; here they are stubs, so
+     * thirty of thirty-two bins were discarded every frame. Even bins left,
+     * odd bins right, which preserves the stereo pairing the guest set up.
+     * This is not what a real EP does; it is the cheapest mixdown that stops
+     * discarding audio. */
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
     bool diagnostic = mcpx_apu_diagnostics_enabled();
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            /* Bins 2..31 used to be computed and then dropped on the floor.
-             * On hardware the GP and EP mix the submixes down; here they are
-             * stubs, so thirty of thirty-two bins were discarded every frame
-             * with no counter anywhere to say so.
-             *
-             * Measured on Jet Set Radio Future, one 200 s gameplay run, with
-             * a positive control moving beside it:
-             *
-             *     [APU-BIN] 2D heard=557466 lost=0
-             *               3D heard=0      lost=377768
-             *               lost by bin: 6,7,8,9,10
-             *
-             * 557,466 music voice-frames heard and none lost; 377,768 effect
-             * voice-frames produced correctly and thrown away. The title's 3D
-             * positional voices -- its sound effects -- are routed to bins 6
-             * to 10 by the guest's own V0BIN..V3BIN, and music on 2D voices
-             * lands in bins 0 and 1, which is why the music was always
-             * audible and no effect ever was. Every instrument upstream of
-             * this line read healthy.
-             *
-             * Gating the HRTF submix override was tried first and did not fix
-             * it, so the defect is the width of this mixdown and nothing else.
-             *
-             * Even bins left, odd bins right, which preserves the stereo
-             * pairing the guest set up -- bins 6/7 and 8/9 arrive with matched
-             * counts. This is not what a real EP does; it is the cheapest
-             * mixdown that stops discarding audio. */
             float left, right;
             if (mcpx_apu_mixdown_all()) {
                 left = 0.0f;
@@ -199,7 +203,6 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 left = mixbins[0][i];
                 right = mixbins[1][i];
             }
-            /* Clamp to [-1, 1] range */
             if (diagnostic) {
                 g_dbg.ep.mix_peak_since_report = fmaxf(
                     g_dbg.ep.mix_peak_since_report,
@@ -214,8 +217,6 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             if (right > 1.0f) right = 1.0f;
             if (right < -1.0f) right = -1.0f;
 
-            /* Convert to 16-bit and write (not accumulate) into frame buffer.
-             * Each of the 8 sub-frames writes its own 32-sample slice. */
             d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
             d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
         }
@@ -223,4 +224,517 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     g_dbg.gp.cycles = 0;
     g_dbg.ep.cycles = 0;
+}
+
+/* ============================================================
+ * Real GP/EP DSP56300 pipeline (ported from xemu gp_ep.c)
+ * ============================================================ */
+
+static const int16_t ep_silence[256][2] = { 0 };
+
+static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
+                              unsigned int max_sge, uint8_t *ptr, uint32_t addr,
+                              size_t len, bool dir)
+{
+    unsigned int page_entry = addr / TARGET_PAGE_SIZE;
+    unsigned int offset_in_page = addr % TARGET_PAGE_SIZE;
+    unsigned int bytes_to_copy = TARGET_PAGE_SIZE - offset_in_page;
+
+    (void)d;
+    (void)max_sge;
+
+    while (len > 0) {
+        uint32_t prd_address = ldl_le_phys(address_space_memory,
+                                           sge_base + page_entry * 8 + 0);
+        uint8_t *guest = mcpx_apu_ram_address(prd_address + offset_in_page,
+                                              TARGET_PAGE_SIZE);
+
+        if (bytes_to_copy > len) {
+            bytes_to_copy = len;
+        }
+
+        if (dir) {
+            memcpy(guest, ptr, bytes_to_copy);
+        } else {
+            memcpy(ptr, guest, bytes_to_copy);
+        }
+
+        ptr += bytes_to_copy;
+        len -= bytes_to_copy;
+
+        /* After the first iteration, we are page aligned */
+        page_entry += 1;
+        bytes_to_copy = TARGET_PAGE_SIZE;
+        offset_in_page = 0;
+    }
+}
+
+static void gp_scratch_rw(void *opaque, uint8_t *ptr, uint32_t addr, size_t len,
+                          bool dir)
+{
+    MCPXAPUState *d = opaque;
+    scatter_gather_rw(d, d->regs[NV_PAPU_GPSADDR], d->regs[NV_PAPU_GPSMAXSGE],
+                      ptr, addr, len, dir);
+}
+
+static void ep_scratch_rw(void *opaque, uint8_t *ptr, uint32_t addr, size_t len,
+                          bool dir)
+{
+    MCPXAPUState *d = opaque;
+    scatter_gather_rw(d, d->regs[NV_PAPU_EPSADDR], d->regs[NV_PAPU_EPSMAXSGE],
+                      ptr, addr, len, dir);
+}
+
+static uint32_t circular_scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
+                                           unsigned int max_sge, uint8_t *ptr,
+                                           uint32_t base, uint32_t end,
+                                           uint32_t cur, size_t len, bool dir)
+{
+    while (len > 0) {
+        unsigned int bytes_to_copy = end - cur;
+
+        if (bytes_to_copy > len) {
+            bytes_to_copy = len;
+        }
+
+        DPRINTF("circular scatter gather %s in range 0x%x - 0x%x at 0x%x of "
+                "length 0x%x / 0x%lx bytes\n",
+                dir ? "write" : "read", base, end, cur, bytes_to_copy, len);
+
+        assert((cur >= base) && ((cur + bytes_to_copy) <= end));
+        scatter_gather_rw(d, sge_base, max_sge, ptr, cur, bytes_to_copy, dir);
+
+        ptr += bytes_to_copy;
+        len -= bytes_to_copy;
+
+        /* After the first iteration we might have to wrap */
+        cur += bytes_to_copy;
+        if (cur >= end) {
+            assert(cur == end);
+            cur = base;
+        }
+    }
+
+    return cur;
+}
+
+static void gp_fifo_rw(void *opaque, uint8_t *ptr, unsigned int index,
+                       size_t len, bool dir)
+{
+    MCPXAPUState *d = opaque;
+    uint32_t base;
+    uint32_t end;
+    hwaddr cur_reg;
+    if (dir) {
+        assert(index < GP_OUTPUT_FIFO_COUNT);
+        base = GET_MASK(d->regs[NV_PAPU_GPOFBASE0 + 0x10 * index],
+                        NV_PAPU_GPOFBASE0_VALUE);
+        end = GET_MASK(d->regs[NV_PAPU_GPOFEND0 + 0x10 * index],
+                       NV_PAPU_GPOFEND0_VALUE);
+        cur_reg = NV_PAPU_GPOFCUR0 + 0x10 * index;
+    } else {
+        assert(index < GP_INPUT_FIFO_COUNT);
+        base = GET_MASK(d->regs[NV_PAPU_GPIFBASE0 + 0x10 * index],
+                        NV_PAPU_GPOFBASE0_VALUE);
+        end = GET_MASK(d->regs[NV_PAPU_GPIFEND0 + 0x10 * index],
+                       NV_PAPU_GPOFEND0_VALUE);
+        cur_reg = NV_PAPU_GPIFCUR0 + 0x10 * index;
+    }
+
+    uint32_t cur = GET_MASK(d->regs[cur_reg], NV_PAPU_GPOFCUR0_VALUE);
+
+    /* DSP hangs if current >= end; but forces current >= base */
+    assert(cur < end);
+    if (cur < base) {
+        cur = base;
+    }
+
+    cur = circular_scatter_gather_rw(d,
+        d->regs[NV_PAPU_GPFADDR], d->regs[NV_PAPU_GPFMAXSGE],
+        ptr, base, end, cur, len, dir);
+
+    SET_MASK(d->regs[cur_reg], NV_PAPU_GPOFCUR0_VALUE, cur);
+}
+
+static bool ep_sink_samples(MCPXAPUState *d, uint8_t *ptr, size_t len)
+{
+    if (d->monitor.point == MCPX_APU_DEBUG_MON_AC97) {
+        return false;
+    } else if ((d->monitor.point == MCPX_APU_DEBUG_MON_EP) ||
+        (d->monitor.point == MCPX_APU_DEBUG_MON_GP_OR_EP)) {
+        assert(len == sizeof(d->monitor.frame_buf));
+        memcpy(d->monitor.frame_buf, ptr, len);
+    }
+
+    return true;
+}
+
+static void ep_fifo_rw(void *opaque, uint8_t *ptr, unsigned int index,
+                       size_t len, bool dir)
+{
+    MCPXAPUState *d = opaque;
+    uint32_t base;
+    uint32_t end;
+    hwaddr cur_reg;
+    if (dir) {
+        assert(index < EP_OUTPUT_FIFO_COUNT);
+        base = GET_MASK(d->regs[NV_PAPU_EPOFBASE0 + 0x10 * index],
+                        NV_PAPU_GPOFBASE0_VALUE);
+        end = GET_MASK(d->regs[NV_PAPU_EPOFEND0 + 0x10 * index],
+                       NV_PAPU_GPOFEND0_VALUE);
+        cur_reg = NV_PAPU_EPOFCUR0 + 0x10 * index;
+    } else {
+        assert(index < EP_INPUT_FIFO_COUNT);
+        base = GET_MASK(d->regs[NV_PAPU_EPIFBASE0 + 0x10 * index],
+                        NV_PAPU_GPOFBASE0_VALUE);
+        end = GET_MASK(d->regs[NV_PAPU_EPIFEND0 + 0x10 * index],
+                       NV_PAPU_GPOFEND0_VALUE);
+        cur_reg = NV_PAPU_EPIFCUR0 + 0x10 * index;
+    }
+
+    uint32_t cur = GET_MASK(d->regs[cur_reg], NV_PAPU_GPOFCUR0_VALUE);
+
+    if (dir && index == 0) {
+        bool did_sink = ep_sink_samples(d, ptr, len);
+        if (did_sink) {
+            /* Since we are sinking, push silence out */
+            assert(len <= sizeof(ep_silence));
+            ptr = (uint8_t*)ep_silence;
+        }
+    }
+
+    /* DSP hangs if current >= end; but forces current >= base */
+    if (cur >= end) {
+        cur = cur % (end - base);
+    }
+    if (cur < base) {
+        cur = base;
+    }
+
+    cur = circular_scatter_gather_rw(d,
+        d->regs[NV_PAPU_EPFADDR], d->regs[NV_PAPU_EPFMAXSGE],
+        ptr, base, end, cur, len, dir);
+
+    SET_MASK(d->regs[cur_reg], NV_PAPU_GPOFCUR0_VALUE, cur);
+}
+
+static void proc_rst_write(DSPState *dsp, uint32_t oldval, uint32_t val)
+{
+    if (mcpx_apu_diagnostics_enabled() && (val != oldval))
+        fprintf(stderr, "[APU-DSP] %s RST 0x%X -> 0x%X\n",
+                dsp->is_gp ? "GP" : "EP", oldval, val);
+    if (!(val & NV_PAPU_GPRST_GPRST) || !(val & NV_PAPU_GPRST_GPDSPRST)) {
+        dsp_reset(dsp);
+    } else if (
+        (!(oldval & NV_PAPU_GPRST_GPRST) || !(oldval & NV_PAPU_GPRST_GPDSPRST))
+        && ((val & NV_PAPU_GPRST_GPRST) && (val & NV_PAPU_GPRST_GPDSPRST))) {
+        dsp_bootstrap(dsp);
+    }
+}
+
+/* Global Processor - programmable DSP */
+uint64_t mcpx_apu_gp_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    MCPXAPUState *d = opaque;
+
+    assert(size == 4);
+    assert(addr % 4 == 0);
+
+    uint64_t r = 0;
+    switch (addr) {
+    case NV_PAPU_GPXMEM ... NV_PAPU_GPXMEM + 0x1000 * 4 - 1: {
+        uint32_t xaddr = (addr - NV_PAPU_GPXMEM) / 4;
+        r = dsp_read_memory(d->gp.dsp, 'X', xaddr);
+        break;
+    }
+    case NV_PAPU_GPMIXBUF ... NV_PAPU_GPMIXBUF + 0x400 * 4 - 1: {
+        uint32_t xaddr = (addr - NV_PAPU_GPMIXBUF) / 4;
+        r = dsp_read_memory(d->gp.dsp, 'X', GP_DSP_MIXBUF_BASE + xaddr);
+        break;
+    }
+    case NV_PAPU_GPYMEM ... NV_PAPU_GPYMEM + 0x800 * 4 - 1: {
+        uint32_t yaddr = (addr - NV_PAPU_GPYMEM) / 4;
+        r = dsp_read_memory(d->gp.dsp, 'Y', yaddr);
+        break;
+    }
+    case NV_PAPU_GPPMEM ... NV_PAPU_GPPMEM + 0x1000 * 4 - 1: {
+        uint32_t paddr = (addr - NV_PAPU_GPPMEM) / 4;
+        r = dsp_read_memory(d->gp.dsp, 'P', paddr);
+        break;
+    }
+    default:
+        r = d->gp.regs[addr];
+        break;
+    }
+    DPRINTF("mcpx apu GP: read [0x%" HWADDR_PRIx "] -> 0x%lx\n", addr, r);
+
+    return r;
+}
+
+void mcpx_apu_gp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
+{
+    MCPXAPUState *d = opaque;
+
+    assert(size == 4);
+    assert(addr % 4 == 0);
+
+    DPRINTF("mcpx apu GP: [0x%" HWADDR_PRIx "] = 0x%lx\n", addr, val);
+
+    switch (addr) {
+    case NV_PAPU_GPXMEM ... NV_PAPU_GPXMEM + 0x1000 * 4 - 1: {
+        uint32_t xaddr = (addr - NV_PAPU_GPXMEM) / 4;
+        dsp_write_memory(d->gp.dsp, 'X', xaddr, val);
+        break;
+    }
+    case NV_PAPU_GPMIXBUF ... NV_PAPU_GPMIXBUF + 0x400 * 4 - 1: {
+        uint32_t xaddr = (addr - NV_PAPU_GPMIXBUF) / 4;
+        dsp_write_memory(d->gp.dsp, 'X', GP_DSP_MIXBUF_BASE + xaddr, val);
+        break;
+    }
+    case NV_PAPU_GPYMEM ... NV_PAPU_GPYMEM + 0x800 * 4 - 1: {
+        uint32_t yaddr = (addr - NV_PAPU_GPYMEM) / 4;
+        dsp_write_memory(d->gp.dsp, 'Y', yaddr, val);
+        break;
+    }
+    case NV_PAPU_GPPMEM ... NV_PAPU_GPPMEM + 0x1000 * 4 - 1: {
+        uint32_t paddr = (addr - NV_PAPU_GPPMEM) / 4;
+        dsp_write_memory(d->gp.dsp, 'P', paddr, val);
+        break;
+    }
+    case NV_PAPU_GPRST:
+        proc_rst_write(d->gp.dsp, d->gp.regs[NV_PAPU_GPRST], val);
+        d->gp.regs[NV_PAPU_GPRST] = val;
+        break;
+    default:
+        d->gp.regs[addr] = val;
+        break;
+    }
+}
+
+/* Encode Processor - encoding DSP */
+uint64_t mcpx_apu_ep_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    MCPXAPUState *d = opaque;
+
+    assert(size == 4);
+    assert(addr % 4 == 0);
+
+    uint64_t r = 0;
+    switch (addr) {
+    case NV_PAPU_EPXMEM ... NV_PAPU_EPXMEM + 0xC00 * 4 - 1: {
+        uint32_t xaddr = (addr - NV_PAPU_EPXMEM) / 4;
+        r = dsp_read_memory(d->ep.dsp, 'X', xaddr);
+        break;
+    }
+    case NV_PAPU_EPYMEM ... NV_PAPU_EPYMEM + 0x100 * 4 - 1: {
+        uint32_t yaddr = (addr - NV_PAPU_EPYMEM) / 4;
+        r = dsp_read_memory(d->ep.dsp, 'Y', yaddr);
+        break;
+    }
+    case NV_PAPU_EPPMEM ... NV_PAPU_EPPMEM + 0x1000 * 4 - 1: {
+        uint32_t paddr = (addr - NV_PAPU_EPPMEM) / 4;
+        r = dsp_read_memory(d->ep.dsp, 'P', paddr);
+        break;
+    }
+    default:
+        r = d->ep.regs[addr];
+        break;
+    }
+    DPRINTF("mcpx apu EP: read [0x%" HWADDR_PRIx "] -> 0x%lx\n", addr, r);
+
+    return r;
+}
+
+void mcpx_apu_ep_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
+{
+    MCPXAPUState *d = opaque;
+
+    assert(size == 4);
+    assert(addr % 4 == 0);
+
+    DPRINTF("mcpx apu EP: [0x%" HWADDR_PRIx "] = 0x%lx\n", addr, val);
+
+    switch (addr) {
+    case NV_PAPU_EPXMEM ... NV_PAPU_EPXMEM + 0xC00 * 4 - 1: {
+        uint32_t xaddr = (addr - NV_PAPU_EPXMEM) / 4;
+        dsp_write_memory(d->ep.dsp, 'X', xaddr, val);
+        break;
+    }
+    case NV_PAPU_EPYMEM ... NV_PAPU_EPYMEM + 0x100 * 4 - 1: {
+        uint32_t yaddr = (addr - NV_PAPU_EPYMEM) / 4;
+        dsp_write_memory(d->ep.dsp, 'Y', yaddr, val);
+        break;
+    }
+    case NV_PAPU_EPPMEM ... NV_PAPU_EPPMEM + 0x1000 * 4 - 1: {
+        uint32_t paddr = (addr - NV_PAPU_EPPMEM) / 4;
+        dsp_write_memory(d->ep.dsp, 'P', paddr, val);
+        break;
+    }
+    case NV_PAPU_EPRST:
+        proc_rst_write(d->ep.dsp, d->ep.regs[NV_PAPU_EPRST], val);
+        d->ep.regs[NV_PAPU_EPRST] = val;
+        d->ep_frame_div = 0; /* FIXME: Still unsure about frame sync */
+        break;
+    default:
+        d->ep.regs[addr] = val;
+        break;
+    }
+}
+
+static void dsp_frame_engine(MCPXAPUState *d,
+                             float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    static bool logged_gp, logged_ep;
+
+    /* Write VP results to the GP DSP MIXBUF */
+    for (int mixbin = 0; mixbin < NUM_MIXBINS; mixbin++) {
+        uint32_t base = GP_DSP_MIXBUF_BASE + mixbin * NUM_SAMPLES_PER_FRAME;
+        for (int sample = 0; sample < NUM_SAMPLES_PER_FRAME; sample++) {
+            dsp_write_memory(d->gp.dsp, 'X', base + sample,
+                             float_to_24b(mixbins[mixbin][sample]));
+        }
+    }
+
+    bool ep_enabled = (d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPRST) &&
+                      (d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPDSPRST);
+
+    /* Run GP */
+    if ((d->gp.regs[NV_PAPU_GPRST] & NV_PAPU_GPRST_GPRST) &&
+        (d->gp.regs[NV_PAPU_GPRST] & NV_PAPU_GPRST_GPDSPRST)) {
+        dsp_start_frame(d->gp.dsp);
+        d->gp.dsp->core.is_idle = false;
+        d->gp.dsp->core.cycle_count = 0;
+        do {
+            dsp_run(d->gp.dsp, 1000);
+        } while (!d->gp.dsp->core.is_idle && d->gp.realtime);
+        g_dbg.gp.cycles = d->gp.dsp->core.cycle_count;
+        if (!logged_gp) {
+            logged_gp = true;
+            fprintf(stderr, "[APU-DSP] GP first frame: cycles=%u\n",
+                    d->gp.dsp->core.cycle_count);
+        }
+
+        if ((d->monitor.point == MCPX_APU_DEBUG_MON_GP) ||
+            (d->monitor.point == MCPX_APU_DEBUG_MON_GP_OR_EP && !ep_enabled)) {
+            int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                uint32_t l = dsp_read_memory(d->gp.dsp, 'X', 0x1400 + i);
+                d->monitor.frame_buf[off + i][0] = l >> 8;
+                uint32_t r =
+                    dsp_read_memory(d->gp.dsp, 'X', 0x1400 + 1 * 0x20 + i);
+                d->monitor.frame_buf[off + i][1] = r >> 8;
+            }
+        }
+    }
+
+    /* Run EP */
+    if ((d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPRST) &&
+        (d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPDSPRST)) {
+        if (d->ep_frame_div % 8 == 0) {
+            dsp_start_frame(d->ep.dsp);
+            d->ep.dsp->core.is_idle = false;
+            d->ep.dsp->core.cycle_count = 0;
+            do {
+                dsp_run(d->ep.dsp, 1000);
+            } while (!d->ep.dsp->core.is_idle && d->ep.realtime);
+            g_dbg.ep.cycles = d->ep.dsp->core.cycle_count;
+            if (!logged_ep) {
+                logged_ep = true;
+                fprintf(stderr, "[APU-DSP] EP first frame: cycles=%u\n",
+                        d->ep.dsp->core.cycle_count);
+            }
+        }
+    }
+}
+
+static void dsp_init_engine(MCPXAPUState *d)
+{
+    d->gp.dsp = dsp_init(d, gp_scratch_rw, gp_fifo_rw);
+    for (int i = 0; i < DSP_PRAM_SIZE; i++) {
+        d->gp.dsp->core.pram[i] = 0xCACACACA;
+    }
+    memset(d->gp.dsp->core.pram_opcache, 0,
+           sizeof(d->gp.dsp->core.pram_opcache));
+    d->gp.dsp->is_gp = true;
+    d->gp.dsp->core.is_gp = true;
+    d->gp.dsp->core.is_idle = false;
+    d->gp.dsp->core.cycle_count = 0;
+
+    d->ep.dsp = dsp_init(d, ep_scratch_rw, ep_fifo_rw);
+    for (int i = 0; i < DSP_PRAM_SIZE; i++) {
+        d->ep.dsp->core.pram[i] = 0xCACACACA;
+    }
+    memset(d->ep.dsp->core.pram_opcache, 0,
+           sizeof(d->ep.dsp->core.pram_opcache));
+    for (int i = 0; i < DSP_XRAM_SIZE; i++) {
+        d->ep.dsp->core.xram[i] = 0xCACACACA;
+    }
+    for (int i = 0; i < DSP_YRAM_SIZE; i++) {
+        d->ep.dsp->core.yram[i] = 0xCACACACA;
+    }
+    d->ep.dsp->is_gp = false;
+    d->ep.dsp->core.is_gp = false;
+    d->ep.dsp->core.is_idle = false;
+    d->ep.dsp->core.cycle_count = 0;
+
+    fprintf(stderr, "[APU] DSP GP/EP initialized (DSP56300 engine, RECOMP_APU_DSP=1)\n");
+}
+
+/* ============================================================
+ * Public API
+ * ============================================================ */
+
+void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
+{
+    static int last_known_preference = -1;
+    int preference = apu_dsp_engine_enabled() ? 1 : 0;
+
+    if (last_known_preference == preference) {
+        return;
+    }
+
+    if (preference) {
+        d->monitor.point = MCPX_APU_DEBUG_MON_GP_OR_EP;
+        d->gp.realtime = true;
+        d->ep.realtime = true;
+    } else {
+        /* Stub path: leave monitor.point alone so the passthrough mixdown
+         * keeps writing to the monitor buffer. */
+        d->gp.realtime = false;
+        d->ep.realtime = false;
+    }
+
+    last_known_preference = preference;
+}
+
+void mcpx_apu_dsp_init(MCPXAPUState *d)
+{
+    if (apu_dsp_engine_enabled()) {
+        dsp_init_engine(d);
+        mcpx_apu_update_dsp_preference(d);
+        return;
+    }
+
+    /* Allocate minimal DSP state for GP and EP. We need these to exist so
+     * reset doesn't crash, but they won't actually run DSP programs. */
+    d->gp.dsp = (DSPState *)calloc(1, sizeof(DSPState));
+    d->ep.dsp = (DSPState *)calloc(1, sizeof(DSPState));
+
+    if (d->gp.dsp) d->gp.dsp->is_gp = true;
+    if (d->ep.dsp) d->ep.dsp->is_gp = false;
+
+    d->gp.realtime = false;
+    d->ep.realtime = false;
+
+    fprintf(stderr, "[APU] DSP GP/EP initialized (STUBBED - passthrough mode)\n");
+}
+
+void mcpx_apu_dsp_frame(MCPXAPUState *d,
+                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    if (apu_dsp_engine_enabled()) {
+        dsp_frame_engine(d, mixbins);
+    } else {
+        dsp_frame_stub(d, mixbins);
+    }
 }

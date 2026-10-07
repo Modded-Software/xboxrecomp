@@ -2573,13 +2573,22 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  * memory keeps what the title writes. */
                 enum { APU_TRAP_BYTES = 0x00030000 };
                 DWORD old_protect;
-                if (VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
+/* The stub path models only main + VP registers; GP/EP scratch
+                 * memory stays plain RAM so the guest's bulk effect-image
+                 * copies land where it can read them back. With the real
+                 * DSP56300 engine (RECOMP_APU_DSP) the GP (0x30000) and EP
+                 * (0x50000) sub-regions must trap too, so widen the span to the
+                 * whole 0x80000 APU container. */
+                size_t apu_trap_size = APU_TRAP_BYTES;
+                if (getenv("RECOMP_APU_DSP"))
+                    apu_trap_size = 0x80000u;
+                if (VirtualProtect((char *)g_mcpx_memory,
+                                   apu_trap_size,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
                 if (g_apu_mmio_trapped)
-                    fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO"
-                                    " (GP/EP DSP memory left as RAM)\n",
-                            XBOX_MCPX_BASE, XBOX_MCPX_BASE + APU_TRAP_BYTES);
+                    fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",
+                            XBOX_MCPX_BASE, (unsigned)(XBOX_MCPX_BASE + apu_trap_size));
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
                     |= MCPX_AC97_CODEC_READY;
