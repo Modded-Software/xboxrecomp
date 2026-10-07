@@ -327,7 +327,7 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
 {
     static DWORD packet;
     static int configured;
-    static unsigned sens, deadzone, invert_y, maxdelta, decay_ms;
+    static unsigned sens, deadzone, invert_y, maxdelta, decay_ms, min_stick;
     static float vx, vy;      /* decaying right-stick velocity, stick units */
     static unsigned long last_ms;
     WORD b = 0;
@@ -336,23 +336,25 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     if (!configured) {
         /* sens is stick units per pixel of mouse travel; decay_ms is how long
          * that deflection is held, so the camera integrates over the motion
-         * rather than seeing a one-poll blip.
+         * rather than seeing a one-poll blip. min_stick lifts small, precise
+         * moves above the title's own stick deadzone.
          *
          * The hold has to be measured in time, not in polls. The title polls
          * this ~400 times a second, so a per-call decay halved the deflection
          * every call and it was gone inside 25 ms -- which reads as small,
          * stuttering camera steps no matter how large sens is. Decaying by
          * elapsed milliseconds makes the feel independent of the poll rate. */
-        sens     = kbm_number("RECOMP_KBM_SENS", 65536, 140);
-        decay_ms = kbm_number("RECOMP_KBM_DECAY_MS", 1000, 120);
-        deadzone = kbm_number("RECOMP_KBM_DEADZONE", 64, 2);
-        invert_y = kbm_number("RECOMP_KBM_INVERT_Y", 1, 0);
-        maxdelta = kbm_number("RECOMP_KBM_MAXDELTA", 8192, 512);
+        sens      = kbm_number("RECOMP_KBM_SENS", 65536, 880);
+        decay_ms  = kbm_number("RECOMP_KBM_DECAY_MS", 1000, 55);
+        deadzone  = kbm_number("RECOMP_KBM_DEADZONE", 64, 1);
+        min_stick = kbm_number("RECOMP_KBM_MIN_STICK", 32767, 2500);
+        invert_y  = kbm_number("RECOMP_KBM_INVERT_Y", 1, 0);
+        maxdelta  = kbm_number("RECOMP_KBM_MAXDELTA", 8192, 512);
         kbm_load_map();
         configured = 1;
-        fprintf(stderr, "[KBM] profile: sens=%u decay_ms=%u deadzone=%u invert_y=%u maxdelta=%u "
+        fprintf(stderr, "[KBM] profile: sens=%u decay_ms=%u deadzone=%u min_stick=%u invert_y=%u maxdelta=%u "
                 "A=%d B=%d X=%d Y=%d BLACK=%d WHITE=%d LT=%d START=%d BACK=%d\n",
-                sens, decay_ms, deadzone, invert_y, maxdelta,
+                sens, decay_ms, deadzone, min_stick, invert_y, maxdelta,
                 k_a, k_b, k_x, k_y, k_black, k_white, k_lt, k_start, k_back);
     }
 
@@ -380,9 +382,26 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
         float alpha;
         last_ms = now;
         if (dt > 0.25f) dt = 0.25f;      /* do not let a focus pause clear it */
-        alpha = (dt > 0.0f) ? expf(-dt / tau) : 1.0f;
+        /* Linear release, not exponential: the old expf(-dt/tau) held the
+         * deflection with a long tail, so a quick flick kept the stick pinned
+         * and over-rotated the camera after the mouse stopped, while the
+         * exponential buildup of many small deltas saturated it outright. A
+         * straight fade to zero over decay_ms tracks the mouse far more
+         * directly. */
+        alpha = (tau <= 0.0f || dt >= tau) ? 0.0f : 1.0f - dt / tau;
         vx = vx * alpha + (float)dx * (float)sens;
         vy = vy * alpha + (float)dy * (float)sens;
+        /* Lift a small, precise move above the title's own stick deadzone so
+         * fine aiming is not swallowed; only while the mouse is actually
+         * moving, or the floor would freeze the camera on at rest. */
+        if (min_stick && (dx || dy)) {
+            float magnitude = sqrtf(vx * vx + vy * vy);
+            if (magnitude > 0.0f && magnitude < (float)min_stick) {
+                float lift = (float)min_stick / magnitude;
+                vx *= lift;
+                vy *= lift;
+            }
+        }
     }
     pState->Gamepad.sThumbRX = kbm_clamp((long)vx);
     pState->Gamepad.sThumbRY = kbm_clamp((long)(invert_y ? vy : -vy));
