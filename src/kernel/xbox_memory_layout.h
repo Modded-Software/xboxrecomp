@@ -364,6 +364,7 @@ typedef union RecompXmm {
 #define XBOX_TIB_MAIN       0x00004000
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
+#define XBOX_KPCR_IRQL_OFFSET 0x24u
 
 #define XBOX_STACK_BASE     0x00780000
 

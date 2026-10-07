@@ -52,6 +52,11 @@ struct McpxApuDebugVoice
     unsigned int samples_per_block;
     uint32_t ebo, cbo, lbo, ba;
     float rate;
+    float amplitude_envelope;
+    float source_peak;
+    float source_peak_since_report;
+    float mixed_peak_since_report;
+    uint64_t starved_reads;
 };
 
 struct McpxApuDebugVp
@@ -94,6 +99,8 @@ struct McpxApuDebug
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+bool mcpx_apu_diagnostics_enabled(void);
 
 static inline bool mcpx_apu_debug_is_muted(uint16_t v) { (void)v; return false; }
 

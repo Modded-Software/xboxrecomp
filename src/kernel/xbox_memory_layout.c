@@ -2978,6 +2978,7 @@ uint32_t xbox_AllocThreadTib(void)
     memset(TIB_VA(thread_data), 0, g_tls_thread_size);
 
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
+    *(uint8_t *)TIB_VA(tib + XBOX_KPCR_IRQL_OFFSET) = 0;
     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
 

@@ -120,7 +120,8 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
     if (opcode[0] == 0xC7) {
         int modrm_len = decode_modrm_len(opcode + 1, rex_b);
         uint32_t imm = *(uint32_t *)(opcode + 1 + modrm_len);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, imm, access_size);
+        uint64_t value = access_size == 8 ? (uint64_t)(int64_t)(int32_t)imm : imm;
+        mcpx_apu_mmio_write(g_apu_state, mmio_offset, value, access_size);
         ctx->Rip += prefix_len + 1 + modrm_len + 4;
         g_apu_mmio_write_count++;
         return true;
