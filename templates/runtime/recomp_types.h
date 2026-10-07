@@ -265,7 +265,7 @@ extern RECOMP_TLS uint16_t g_fp_cc;
  * relies on that: Burnout 3's sorted draw list re-inserts a node by walking
  * while `v > next` / `v < prev`, and with v left at double precision it sits
  * between its own stored copy and a neighbour and walks back and forth
- * forever, which froze every race at the start line.
+* forever, which froze every race at the start line.
  *
  * PC narrows the significand only; the exponent keeps the register's range.
  * So a plain (float) cast is right only inside float's range -- outside it,
