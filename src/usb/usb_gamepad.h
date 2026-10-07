@@ -4,7 +4,7 @@
  * A host controller moves bytes; it does not know what they mean. This is the
  * thing that answers them: an Xbox controller, as the console's own USB stack
  * expects to find it -- standard descriptors over endpoint 0, and a 20-byte
- * report over interrupt endpoint 2.
+ * report over interrupt endpoint 1.
  *
  * Kept apart from ohci.c because it is a different concern. The controller
  * walks descriptor lists and raises interrupts and would do the same for a
@@ -31,17 +31,18 @@ typedef struct {
  * stall rather than as a short transfer, because those mean different things
  * to a driver.
  */
-int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max);
+int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max);
 
-/* Fill in the 20-byte input report. Returns the byte count written. */
-int usb_gamepad_report(uint8_t *out, int max);
+/* Fill in pad `pad`'s 20-byte input report. Returns the byte count written. */
+int usb_gamepad_report(int pad, uint8_t *out, int max);
 
-/* Take an output report from the host (rumble/force feedback) and forward it to
- * the host pad. The OHCI layer moves the bytes; this is where they mean
- * something. */
-void usb_gamepad_output(const uint8_t *report, int len);
+/* The address the host assigned pad `pad` with SET_ADDRESS, 0 until it does,
+ * and whether it has been configured. */
+uint8_t usb_gamepad_address(int pad);
+int usb_gamepad_configured(int pad);
 
-/* The address the host assigned with SET_ADDRESS, 0 until it does. */
-uint8_t usb_gamepad_address(void);
+/* Up to four pads, one per Xbox controller port. Pad n is driven by host
+ * XInput pad n and by pad-script steps prefixed "p<n+1>-". */
+#define USB_GAMEPAD_MAX 4
 
 #endif /* XBOX_USB_GAMEPAD_H */

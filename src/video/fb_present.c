@@ -554,6 +554,29 @@ static void fb_load_window_icons(HMODULE module, FbWindowIcons *icons)
     }
 }
 
+/* The certificate's UTF-16 title name, for the title bar. Set once while the
+ * XBE loads, read once when the window is created. */
+static char s_cert_title[64];
+
+void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
+{
+    int i;
+
+    for (i = 0; i < max_chars && i < (int)sizeof(s_cert_title) - 1 && name[i]; i++)
+        s_cert_title[i] = (char)name[i];
+    s_cert_title[i] = 0;
+}
+
+/* Flip/draw counters the pushbuffer executor reports each frame. */
+static volatile LONG s_frame_flips;
+static volatile LONG s_frame_draws;
+
+void xbox_FramebufferWindowFrameStats(uint32_t draws)
+{
+    InterlockedIncrement(&s_frame_flips);
+    InterlockedExchange(&s_frame_draws, (LONG)draws);
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
@@ -561,7 +584,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     BITMAPINFO bi;
     RECT r;
     const char *window_title = getenv("RECOMP_WINDOW_TITLE");
-    const char *game_title = window_title && window_title[0] ? window_title : "Xbox Recomp - Framebuffer";
+    const char *game_title = window_title && window_title[0] ? window_title :
+        s_cert_title[0] ? s_cert_title : "Xbox Recomp - Framebuffer";
     size_t caption_capacity = strlen(game_title) + 96;
     char *caption = (char *)malloc(caption_capacity);
     LARGE_INTEGER title_frequency, title_clock;

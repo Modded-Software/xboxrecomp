@@ -197,7 +197,7 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t low, uint32_t high,
                                uint32_t alignment);
-void xbox_ContiguousFree(uint32_t guest_va);
+int xbox_ContiguousFree(uint32_t guest_va);
 uint32_t xbox_ContiguousBlockSize(uint32_t guest_va);
 int xbox_ContiguousOwnsHead(uint32_t offset);
 void xbox_ContigMarkApuOffset(uint32_t offset);

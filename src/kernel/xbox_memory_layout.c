@@ -3274,11 +3274,14 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
     int i;
 
     if (alignment < 4096) alignment = 4096;
-    if (reclaim) {
-        AcquireSRWLockExclusive(&g_contig_lock);
-        size = (size + 4095u) & ~4095u;
-        if (size == 0) size = 4096;
+    /* Track every live block whether or not free reuse is enabled: the APU/GPU
+     * provenance queries need to tell a genuine contiguous allocation from an
+     * ordinary-RAM numeric collision at all times. */
+    AcquireSRWLockExclusive(&g_contig_lock);
+    size = (size + 4095u) & ~4095u;
+    if (size == 0) size = 4096;
 
+    if (reclaim) {
         /* A freed block first: carve the aligned piece, keep what is left free. */
         for (i = 0; i < g_contig_block_count; i++) {
             uint32_t a, end, front, back;
@@ -3311,20 +3314,16 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
                     size, g_contig_next - XBOX_CONTIG_BASE,
                     (unsigned)XBOX_CONTIG_SIZE);
             fflush(stderr);
-            if (reclaim)
-                ReleaseSRWLockExclusive(&g_contig_lock);
+            ReleaseSRWLockExclusive(&g_contig_lock);
             return 0;
         }
-        if (reclaim) {
-            if (result > g_contig_next)    /* the alignment gap stays usable */
-                contig_insert(g_contig_block_count, g_contig_next,
-                              result - g_contig_next, 1);
-            contig_insert(g_contig_block_count, result, size, 0);
-        }
+        if (result > g_contig_next)    /* the alignment gap stays usable */
+            contig_insert(g_contig_block_count, g_contig_next,
+                          result - g_contig_next, 1);
+        contig_insert(g_contig_block_count, result, size, 0);
         g_contig_next = result + size;
     }
-    if (reclaim)
-        ReleaseSRWLockExclusive(&g_contig_lock);
+    ReleaseSRWLockExclusive(&g_contig_lock);
 
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
@@ -3370,8 +3369,6 @@ uint32_t xbox_ContiguousBlockSize(uint32_t addr)
     uint32_t r = 0;
     int i;
 
-    if (!xbox_HeapReclaimEnabled())
-        return 0;
     AcquireSRWLockShared(&g_contig_lock);
     for (i = 0; i < g_contig_block_count; i++)
         if (g_contig_blocks[i].addr == addr && !g_contig_blocks[i].free) {
@@ -3390,6 +3387,291 @@ uint32_t xbox_ContiguousBlockSize(uint32_t addr)
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
     return g_contig_next - XBOX_CONTIG_BASE;
+}
+
+/* ── Contiguous / DMA provenance ──────────────────────────────────────────
+ *
+ * A guest physical P and the window VA XBOX_CONTIG_BASE + P are different
+ * bytes here, yet MmGetPhysicalAddress maps *both* the contiguous window and
+ * ordinary heap to the same numeric P. The DSP's voice/SGE structures are
+ * built in MmAllocateContiguousMemory while its payloads can sit in ordinary
+ * low RAM; if a page is read back through the wrong arena the DSP reads
+ * unrelated RAM as audio (full-scale square-wave screech) and the GPU can
+ * read an audio buffer as a texture. These helpers answer "is this offset a
+ * live contiguous allocation?" and "which DMA master last described it?",
+ * resolved against the live block table so it stays correct with free reuse
+ * on or off. */
+#define CONTIG_PAGE_BYTES 4096u
+#define CONTIG_ARENA_BYTES (XBOX_CONTIG_SIZE - XBOX_GPU_INSTANCE_DEFAULT)
+#define CONTIG_PAGE_COUNT (CONTIG_ARENA_BYTES / CONTIG_PAGE_BYTES)
+
+static uint8_t g_contig_apu[CONTIG_PAGE_COUNT];        /* APU-owned pages */
+
+/* Live block whose range contains window offset `off`, if any. */
+static int contig_block_at(uint32_t off, uint32_t *start_off, uint32_t *size)
+{
+    int i, found = 0;
+
+    AcquireSRWLockShared(&g_contig_lock);
+    for (i = 0; i < g_contig_block_count; i++) {
+        uint32_t s;
+        if (g_contig_blocks[i].free)
+            continue;
+        s = g_contig_blocks[i].addr - XBOX_CONTIG_BASE;
+        if (off >= s && off < s + g_contig_blocks[i].size) {
+            if (start_off) *start_off = s;
+            if (size)      *size = g_contig_blocks[i].size;
+            found = 1;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_contig_lock);
+    return found;
+}
+
+void xbox_ContigMarkApuOffset(uint32_t offset)
+{
+    uint32_t start, size, p, end;
+
+    if (offset >= CONTIG_ARENA_BYTES)
+        return;
+    if (!contig_block_at(offset, &start, &size))
+        return;
+    end = (start + size + CONTIG_PAGE_BYTES - 1) / CONTIG_PAGE_BYTES;
+    for (p = start / CONTIG_PAGE_BYTES; p < end && p < CONTIG_PAGE_COUNT; p++)
+        g_contig_apu[p] = 1;
+}
+
+int xbox_ContigApuOwned(uint32_t offset)
+{
+    return (offset < CONTIG_ARENA_BYTES)
+        ? g_contig_apu[offset / CONTIG_PAGE_BYTES] : 0;
+}
+
+/* Does a live contiguous block begin exactly at window offset `offset`? */
+int xbox_ContiguousOwnsHead(uint32_t offset)
+{
+    int i, found = 0;
+
+    if (offset >= CONTIG_ARENA_BYTES || (offset & (CONTIG_PAGE_BYTES - 1)))
+        return 0;
+    AcquireSRWLockShared(&g_contig_lock);
+    for (i = 0; i < g_contig_block_count; i++) {
+        if (!g_contig_blocks[i].free &&
+            g_contig_blocks[i].addr == XBOX_CONTIG_BASE + offset) {
+            found = 1;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_contig_lock);
+    return found;
+}
+
+int xbox_ContigOwnsOffset(uint64_t physical)
+{
+    return (physical < CONTIG_ARENA_BYTES)
+        ? contig_block_at((uint32_t)physical, NULL, NULL) : 0;
+}
+
+/* Pages the APU actually wrote through the redirect (clash diagnostic). */
+static uint8_t g_apu_contig_written[CONTIG_PAGE_COUNT];
+
+void xbox_ApuHostWrite(uint8_t *host, uint32_t bytes)
+{
+    uintptr_t off;
+
+    if (!g_contig_memory || !bytes || host < (uint8_t *)g_contig_memory ||
+        host >= (uint8_t *)g_contig_memory + XBOX_CONTIG_SIZE)
+        return;
+    off = (uintptr_t)host - (uintptr_t)g_contig_memory;
+    for (uintptr_t p = off / CONTIG_PAGE_BYTES;
+         p <= (off + bytes - 1) / CONTIG_PAGE_BYTES && p < CONTIG_PAGE_COUNT;
+         ++p)
+        g_apu_contig_written[p] = 1;
+}
+
+int xbox_ApuContigTouched(uint32_t physical)
+{
+    return (physical < CONTIG_ARENA_BYTES &&
+            physical / CONTIG_PAGE_BYTES < CONTIG_PAGE_COUNT)
+        ? g_apu_contig_written[physical / CONTIG_PAGE_BYTES] : 0;
+}
+
+int xbox_DmaBankOf(uint64_t physical)
+{
+    return physical < XBOX_CONTIG_SIZE
+        ? (int)InterlockedCompareExchange(&g_dma_banks[physical / 4096], 0, 0)
+        : -1;
+}
+
+void xbox_DumpArenas(uint32_t physical, uint32_t bytes)
+{
+    const uint8_t *ord;
+    const uint8_t *con;
+
+    if (!g_contig_memory || physical + bytes > g_memory_size ||
+        physical + bytes > XBOX_CONTIG_SIZE)
+        return;
+    ord = (const uint8_t *)((uintptr_t)g_memory_offset + physical);
+    con = (const uint8_t *)g_contig_memory + physical;
+    fprintf(stderr, "[ARENA] phys=0x%08X ord=", physical);
+    for (uint32_t i = 0; i < bytes; i++)
+        fprintf(stderr, "%02X", ord[i]);
+    fprintf(stderr, " con=");
+    for (uint32_t i = 0; i < bytes; i++)
+        fprintf(stderr, "%02X", con[i]);
+    fprintf(stderr, "\n");
+}
+
+static int apu_contig_clash(const uint8_t *host, uint32_t bytes)
+{
+    uintptr_t off;
+
+    if (!host || !g_contig_memory || host < (const uint8_t *)g_contig_memory ||
+        host >= (const uint8_t *)g_contig_memory + XBOX_CONTIG_SIZE)
+        return 0;
+    off = (uintptr_t)host - (uintptr_t)g_contig_memory;
+    for (uintptr_t p = off / CONTIG_PAGE_BYTES;
+         p <= (off + bytes - 1) / CONTIG_PAGE_BYTES && p < CONTIG_PAGE_COUNT;
+         ++p)
+        if (g_apu_contig_written[p])
+            return 1;
+    return 0;
+}
+
+/* MmGetPhysicalAddress supplies provenance for ordinary guest RAM buffers.
+ * Descriptor storage defaults to the separate contiguous DMA window. */
+void xbox_RecordDmaTranslation(uint32_t guest_va, uint32_t physical)
+{
+    LONG bank;
+
+    if (physical >= XBOX_CONTIG_SIZE)
+        return;
+    if (guest_va >= XBOX_CONTIG_BASE &&
+        (uint64_t)guest_va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        bank = 2;
+    else if (guest_va && guest_va < g_memory_size)
+        bank = 1;
+    else
+        return;
+    InterlockedExchange(&g_dma_banks[physical / 4096], bank);
+    if (bank == 2)
+        g_page_contig[physical / 4096] = 1;
+    else
+        g_page_ordinary[physical / 4096] = 1;
+    {
+        static int bank_trace = -1;
+        if (bank_trace < 0)
+            bank_trace = getenv("RECOMP_DMA_BANK_TRACE") != NULL;
+        if (bank_trace) {
+            static unsigned long n;
+            if (n < 512)
+                fprintf(stderr, "[DMA-BANK] va=0x%08X phys=0x%08X bank=%ld\n",
+                        guest_va, physical, bank);
+            n++;
+        }
+    }
+}
+
+int xbox_PageContiguousOnly(uint32_t physical)
+{
+    if (physical >= XBOX_CONTIG_SIZE)
+        return 0;
+    return g_page_contig[physical / 4096] && !g_page_ordinary[physical / 4096];
+}
+
+uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes)
+{
+    int explicit_contiguous = physical >= XBOX_CONTIG_BASE &&
+        physical < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    LONG bank;
+
+    if (explicit_contiguous)
+        physical -= XBOX_CONTIG_BASE;
+    /* Physicals at or above the window cannot be window offsets, so they name
+     * ordinary RAM directly (a 128 MB console has RAM above 64 MB): the heap
+     * lives there precisely so it never shares a number with a contiguous
+     * allocation. */
+    if (physical >= XBOX_CONTIG_SIZE) {
+        if (bytes && physical + bytes <= g_memory_size)
+            return (uint8_t *)((uintptr_t)g_memory_offset + (uintptr_t)physical);
+        fprintf(stderr, "[DMA] invalid physical extent: 0x%llX + %u\n",
+                (unsigned long long)physical, bytes);
+        return NULL;
+    }
+    if (!bytes || physical + bytes > XBOX_CONTIG_SIZE) {
+        fprintf(stderr, "[DMA] invalid physical extent: 0x%llX + %u\n",
+                (unsigned long long)physical, bytes);
+        return NULL;
+    }
+    bank = explicit_contiguous ? 2 :
+        InterlockedCompareExchange(&g_dma_banks[physical / 4096], 0, 0);
+    for (uint64_t page = physical / 4096 + 1;
+         page <= (physical + bytes - 1) / 4096; page++) {
+        LONG next = explicit_contiguous ? 2 :
+            InterlockedCompareExchange(&g_dma_banks[page], 0, 0);
+        if ((next == 1) != (bank == 1)) {
+            fprintf(stderr, "[DMA] extent crosses RAM banks: 0x%llX + %u\n",
+                    (unsigned long long)physical, bytes);
+            return NULL;
+        }
+    }
+    if (bank == 1 && physical + bytes <= g_memory_size)
+        return (uint8_t *)((uintptr_t)g_memory_offset + (uintptr_t)physical);
+    if (bank != 1 && g_contig_memory) {
+        static int clash_trace = -1;
+        if (clash_trace < 0)
+            clash_trace = getenv("RECOMP_APU_CLASH_TRACE") != NULL;
+        if (clash_trace &&
+            apu_contig_clash((uint8_t *)g_contig_memory + physical, bytes)) {
+            static unsigned long n;
+            if (n < 128)
+                fprintf(stderr, "[APU-GPU-CLASH] physical=0x%llX bytes=%u\n",
+                        (unsigned long long)physical, bytes);
+            n++;
+        }
+        return (uint8_t *)g_contig_memory + physical;
+    }
+    fprintf(stderr, "[DMA] physical storage unavailable: 0x%llX + %u\n",
+            (unsigned long long)physical, bytes);
+    return NULL;
+}
+
+/* APU DMA resolution, a superset of xbox_DmaPhysicalPointer.
+ *
+ * A later ordinary translation for a page a live contiguous block owns would
+ * otherwise move the APU 64 MB away and make it read unrelated RAM as audio.
+ * Resolve such a page to the live contiguous block, which is what the title's
+ * DirectSound actually wrote. OHCI reads through xbox_DmaPhysicalPointer and
+ * keeps last-writer-wins: its buffers are ordinary RAM and must not be
+ * redirected into the window, so this must not live in the shared resolver.
+ * ponytail: first-page test only; a straddling extent is the shared resolver's
+ * problem. Per-access bank tagging if a title ever needs both banks on a page. */
+uint8_t *xbox_ApuPhysicalPointer(uint64_t physical, uint32_t bytes)
+{
+    int explicit_contiguous = physical >= XBOX_CONTIG_BASE &&
+        physical < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    static int no_redir = -1;
+
+    if (no_redir < 0)
+        no_redir = getenv("RECOMP_APU_NO_REDIR") != NULL;
+    if (!no_redir && !explicit_contiguous && g_contig_memory &&
+        physical < CONTIG_ARENA_BYTES &&
+        contig_block_at((uint32_t)physical, NULL, NULL)) {
+        static int redir_trace = -1;
+        if (redir_trace < 0)
+            redir_trace = getenv("RECOMP_APU_REDIR_TRACE") != NULL;
+        if (redir_trace) {
+            static unsigned long n;
+            if (n < 256)
+                fprintf(stderr, "[APU-REDIR] phys=0x%08llX +%u -> contig\n",
+                        (unsigned long long)physical, bytes);
+            n++;
+        }
+        xbox_ContigMarkApuOffset((uint32_t)physical);
+        return (uint8_t *)g_contig_memory + physical;
+    }
+    return xbox_DmaPhysicalPointer(physical, bytes);
 }
 
 

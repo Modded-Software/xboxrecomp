@@ -547,7 +547,7 @@ BOOLEAN __stdcall xbox_KeRemoveQueueDpc(PXBOX_KDPC Dpc)
  * KeSynchronizeExecution
  *
  * On Xbox, this raises IRQL to the interrupt's level and executes a routine.
- * The interrupt object's spinlock is not yet modeled.
+ * Since we don't have real IRQLs, we just call the routine directly.
  * ============================================================================ */
 
 BOOLEAN __stdcall xbox_KeSynchronizeExecution(
@@ -557,27 +557,13 @@ BOOLEAN __stdcall xbox_KeSynchronizeExecution(
 {
     typedef BOOLEAN (__stdcall *PKSYNCHRONIZE_ROUTINE)(PVOID);
     PKSYNCHRONIZE_ROUTINE routine = (PKSYNCHRONIZE_ROUTINE)SynchronizeRoutine;
-    KIRQL old_irql, new_irql;
-    BOOLEAN result;
 
-    if (!Interrupt || !routine) {
-        xbox_log(XBOX_LOG_ERROR, XBOX_LOG_SYNC,
-            "KeSynchronizeExecution: invalid interrupt or routine");
+    (void)Interrupt;
+
+    if (!routine)
         return FALSE;
-    }
 
-    old_irql = xbox_KeGetCurrentIrql();
-    new_irql = (KIRQL)Interrupt->Irql;
-    if (new_irql < old_irql)
-        new_irql = old_irql;
-    xbox_KfRaiseIrql(new_irql);
-    xbox_IrqlRecord('R', "ksync", 0, (unsigned)old_irql,
-                    (unsigned)xbox_KeGetCurrentIrql());
-    result = routine(SynchronizeContext);
-    xbox_IrqlRecord('L', "ksync", 0, (unsigned)xbox_KeGetCurrentIrql(),
-                    (unsigned)old_irql);
-    xbox_KfLowerIrql(old_irql);
-    return result;
+    return routine(SynchronizeContext);
 }
 
 /* ============================================================================

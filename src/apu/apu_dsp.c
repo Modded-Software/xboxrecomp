@@ -35,6 +35,8 @@
 #include <errno.h>
 #include <inttypes.h>
 
+extern uint8_t *xbox_ApuPhysicalPointer(uint64_t physical, uint32_t bytes);
+
 /* ── Engine selection ────────────────────────────────────────────────────
  *
  * Default ON: the DSP56300 interpreter runs the guest-downloaded GP/EP
@@ -139,7 +141,7 @@ void mcpx_apu_dsp_ack_frame(MCPXAPUState *d)
             if (!base) continue;
             physical = (uint64_t)base + (s_dsp_ack[i].offset & 0xFFFu);
         }
-        volatile uint32_t *slot = (volatile uint32_t *)mcpx_apu_ram_address(physical, 4);
+        volatile uint32_t *slot = (volatile uint32_t *)xbox_ApuPhysicalPointer(physical, 4);
         if (*slot) {
             static int shown[APU_DSP_ACK_MAX];
             if (shown[i]++ < 3)
@@ -148,6 +150,22 @@ void mcpx_apu_dsp_ack_frame(MCPXAPUState *d)
             *slot = 0;
         }
     }
+}
+
+/* Upstream apu_core calls this name; the DSP56300 engine conditions the
+ * doorbell acknowledgement on the GP/EP scratch-SGE table, which the stub did
+ * not. Keep one implementation and let the core call it by either name. */
+void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
+{
+    mcpx_apu_dsp_ack_frame(d);
+}
+
+bool mcpx_apu_diagnostics_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("RECOMP_APU_DIAG") != NULL;
+    return enabled != 0;
 }
 
 /* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
@@ -276,8 +294,8 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
     while (len > 0) {
         uint32_t prd_address = ldl_le_phys(address_space_memory,
                                            sge_base + page_entry * 8 + 0);
-        uint8_t *guest = mcpx_apu_ram_address(prd_address + offset_in_page,
-                                              TARGET_PAGE_SIZE);
+        uint8_t *guest = xbox_ApuPhysicalPointer(prd_address + offset_in_page,
+                                                 TARGET_PAGE_SIZE);
 
         /* Diagnostic: force DSP payload writes to ordinary RAM instead of the
          * contiguous redirect, to test whether the write to the window is what
