@@ -715,6 +715,13 @@ class FunctionDetector:
         # nowhere else. Excluding them left those constructors with no body at
         # all, and _initterm silently skipped every one.
         targets = set()
+        # A code pointer with another code pointer immediately beside it is a
+        # table slot -- a vtable, a dispatch table -- not a lone constant that
+        # happens to land in the code range. Only those slots get the long-body
+        # probe below; a bare constant keeps the short cap, because a value like
+        # 0x00080000 decodes happily and would otherwise alias hundreds of
+        # kilobytes of unrelated code.
+        table_slots = set()
         for sec in self.image.sections:
             if sec.name in code_names:
                 continue                    # scan data, not code
@@ -723,8 +730,16 @@ class FunctionDetector:
                 continue
             for off in range(0, len(data) - 3, 4):
                 value = int.from_bytes(data[off:off + 4], "little")
-                if in_code_section(value):
-                    targets.add(value)
+                if not in_code_section(value):
+                    continue
+                targets.add(value)
+                for noff in (off - 4, off + 4):
+                    if noff < 0 or noff + 4 > len(data):
+                        continue
+                    if in_code_section(
+                            int.from_bytes(data[noff:noff + 4], "little")):
+                        table_slots.add(value)
+                        break
 
         # Alias entries, not candidates.
         #
@@ -781,13 +796,25 @@ class FunctionDetector:
                 first = self.engine.instructions[target]
                 if first.mnemonic.lower() in ("int3", "nop"):
                     continue
+                # A table slot can name a long method -- Ghost's
+                # cCloakShader::RenderSetup is 341 instructions -- which the
+                # short cap rejected. Only slots flanked by another code
+                # pointer may spend the long walk; a bare constant keeps 64.
+                cap = 8192 if target in table_slots else 64
                 if not self.engine.probes_as_function_body(target,
-                                                           max_insns=64):
+                                                           max_insns=cap):
                     continue
                 i = bisect.bisect_right(starts, target)
                 sec = self.image.get_section_at_va(target)
                 end = starts[i] if i < len(starts) else section_end.get(
                     sec.name if sec else "", target + 4)
+                # A table slot whose next detected start is thousands of
+                # instructions away is a table in a section the sweep barely
+                # covered, not a method: the alias would translate a region no
+                # boundary vouches for. Ghost's cloak shader method is 1,248
+                # bytes; the WMADEC pointer tables wanted 13,000.
+                if target in table_slots and end - target > 2048:
+                    continue
             if end <= target:
                 continue
             self._alias_entries[target] = end

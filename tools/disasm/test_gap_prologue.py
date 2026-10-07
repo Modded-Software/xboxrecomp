@@ -50,6 +50,7 @@ class _Engine:
         self.instructions = {i.address: i for i in insns}
         self._prologues = set(prologues)
         self._stub = False
+        self.jump_tables = []
 
     def probes_as_prologue(self, addr):
         return addr in self._prologues
