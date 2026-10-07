@@ -96,6 +96,27 @@ def _incoming_flag_state(sources, known, is_entry):
     return _merge_flag_states([known[p] for p in sources])
 
 
+def _incoming_narrow_state(sources, known, is_entry):
+    """Narrow-load hints a block inherits, kept only where every predecessor
+    agrees.
+
+    A hint says a register still holds a movzx/movsx of a known width. If two
+    predecessor paths disagree, the register's value at the join is not known,
+    so the hint is dropped there. An unknown predecessor drops everything, the
+    same conservative rule the flag state uses.
+    """
+    if is_entry or not sources:
+        return {}
+    if not all(p in known for p in sources):
+        return {}
+    preds = [known[p] for p in sources]
+    agreed = {}
+    for reg, value in preds[0].items():
+        if all(p.get(reg) == value for p in preds[1:]):
+            agreed[reg] = value
+    return agreed
+
+
 def write_if_changed(path, text):
     """Write text to path only when it differs from what is already there.
 
@@ -2291,6 +2312,8 @@ class FunctionTranslator:
         # itself, which is what this function did before the probe existed.
         out_state = {}
         settled_state = out_state
+        out_narrow = {}
+        settled_narrow = out_narrow
         if any(p >= bb.start for bb in blocks for p in preds[bb.start]):
             saved_unimplemented = {
                 k: list(v) for k, v in self.lifter.unimplemented.items()
@@ -2300,10 +2323,16 @@ class FunctionTranslator:
                 for bb in blocks:
                     incoming = _incoming_flag_state(
                         preds[bb.start], out_state, bb.start == start)
+                    self.lifter._narrow = _incoming_narrow_state(
+                        preds[bb.start], out_narrow, bb.start == start)
                     _, new_out = lift_basic_block(
                         self.lifter, bb, flag_state=incoming)
+                    new_narrow = dict(self.lifter._narrow)
                     if out_state.get(bb.start) != new_out:
                         out_state[bb.start] = new_out
+                        changed = True
+                    if out_narrow.get(bb.start) != new_narrow:
+                        out_narrow[bb.start] = new_narrow
                         changed = True
                 if not changed:
                     break
@@ -2311,6 +2340,8 @@ class FunctionTranslator:
             self.lifter.unimplemented.update(saved_unimplemented)
             settled_state = out_state
             out_state = {}
+            settled_narrow = out_narrow
+            out_narrow = {}
 
         for bb in blocks:
             # Emit label if this block is a branch target
@@ -2329,9 +2360,12 @@ class FunctionTranslator:
             # order.
             incoming = _incoming_flag_state(preds[bb.start], settled_state,
                                             bb.start == start)
+            self.lifter._narrow = _incoming_narrow_state(
+                preds[bb.start], settled_narrow, bb.start == start)
 
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
+            out_narrow[bb.start] = dict(self.lifter._narrow)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
             bypass = debug_slide_bypasses.get(bb.last_insn.address)

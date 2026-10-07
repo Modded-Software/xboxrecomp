@@ -280,8 +280,32 @@ def _operand_width(op):
     if op.type == "mem":
         return getattr(op, "mem_size", None) or 4
     if op.type == "reg":
+        # A register that holds a value we know is a zero/sign extension of a
+        # narrower load compares at that narrower width (see _snapshot_flags).
+        hint = getattr(op, "width_hint", None)
+        if hint in (1, 2, 4):
+            return hint
         return _REG_WIDTH.get(str(op.reg).lower(), 4)
     return None
+
+
+def _narrow_imm_fits(raw, width, signed):
+    """Whether an immediate reads the same at `width` as it does at 32 bits.
+
+    Narrowing a compare is only sound when nothing the wider form could see is
+    lost. A zero-extended register holds 0..2**width-1, so the immediate must
+    sit in that range; a sign-extended one holds the sign extension of its low
+    bits, so the immediate must be its own sign extension. When both hold, the
+    narrow and wide compares agree on every flag, which is what lets the
+    snapshot and its join use the narrow width.
+    """
+    bits = width * 8
+    mask = (1 << bits) - 1
+    if signed:
+        v = raw & mask
+        sext = v - (1 << bits) if v & (1 << (bits - 1)) else v
+        return raw == sext
+    return 0 <= raw < (1 << bits)
 
 
 def _fmt_operand_read(op):
@@ -399,6 +423,14 @@ _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
     "rdtsc",              # Special instructions
     "lock xadd",           # Lock prefix - complex flag behavior
+})
+
+# Mnemonics whose first operand, when a register, is read rather than written.
+# Used to keep narrow-load hints alive across them; anything absent here that
+# names a register destination drops that register's hint.
+_NARROW_READONLY = frozenset({
+    "cmp", "test", "push", "jmp", "call", "ret", "retn", "nop",
+    "loop", "loope", "loopne", "int3", "int", "wait",
 })
 
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
@@ -1303,6 +1335,12 @@ class Lifter:
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
+        # Within the current basic block: {reg: (width, signed)} for a register
+        # just loaded by movzx/movsx from a 1- or 2-byte source. Lets a later
+        # `cmp reg, imm` snapshot at the narrow width so it merges with a
+        # sibling `cmp word ptr [..], imm` instead of falling back to _flags.
+        # Reset at each block boundary; a register write drops its entry.
+        self._narrow = {}
         self.publishes_ebp = False  # Set per-function: has a real frame
         self.trace_exit_name = None  # Set per-function when traced
         self.force_return_value = None   # Set per-function by --force-return
@@ -1828,6 +1866,7 @@ class Lifter:
                 src = f"ZX8({src})"
             elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
                 src = f"ZX16({src})"
+        self._note_narrow_load(ops, signed=False)
         return [_fmt_operand_write(ops[0], src)]
 
     def _lift_movsx(self, insn, ops):
@@ -1844,7 +1883,26 @@ class Lifter:
                 src = f"SX8({src})"
             elif r in ("ax", "bx", "cx", "dx", "si", "di"):
                 src = f"SX16({src})"
+        self._note_narrow_load(ops, signed=True)
         return [_fmt_operand_write(ops[0], src)]
+
+    def _note_narrow_load(self, ops, signed):
+        """Remember a movzx/movsx destination as a narrow-width value.
+
+        Only a 32-bit destination register and a 1- or 2-byte source are
+        tracked; anything else leaves the register with no width hint. The
+        entry lives until the next write to that register or the next block.
+        """
+        if len(ops) < 2 or ops[0].type != "reg":
+            return
+        if ops[1].type == "mem":
+            width = ops[1].mem_size
+        elif ops[1].type == "reg":
+            width = _REG_WIDTH.get(str(ops[1].reg).lower())
+        else:
+            width = None
+        if width in (1, 2) and _REG_WIDTH.get(str(ops[0].reg).lower(), 4) == 4:
+            self._narrow[ops[0].reg] = (width, signed)
 
     def _lift_lea(self, insn, ops):
         if len(ops) < 2 or ops[1].type != "mem":
@@ -2244,7 +2302,26 @@ class Lifter:
         Snapshotting fixes both: operands are read once, at the right
         width, in both a zero- and a sign-extended form so the jcc can
         pick whichever its condition needs.
+
+        A register that only holds the zero/sign extension of a narrower load
+        (movzx/movsx) compares at that narrower width when the immediate also
+        fits it. That is what lets this snapshot merge at a join with a sibling
+        that compares the byte/word directly, rather than being written off as a
+        width mismatch and left to the _flags fallback.
         """
+        for idx, other_idx in ((0, 1), (1, 0)):
+            op = ops[idx]
+            other = ops[other_idx]
+            hint = None
+            if (op.type == "reg" and other.type == "imm"
+                    and op.reg in self._narrow):
+                width, signed = self._narrow[op.reg]
+                if _narrow_imm_fits(other.imm, width, signed):
+                    hint = width
+            # Set or clear every pass: the same instruction is lifted once per
+            # settle round and once to emit, and a hint left over from a round
+            # whose incoming state differed would silently pin a stale width.
+            op.width_hint = hint
         size = _operand_width(ops[0])
         if size is None:
             size = _operand_width(ops[1])          # e.g. cmp imm, reg
@@ -3809,6 +3886,22 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
     while i < len(insns):
         curr = insns[i]
+
+        # Drop a narrow-load hint as soon as its register is overwritten, so a
+        # stale width can never reach a later compare. Mnemonics whose first
+        # operand is read, not written, are skipped; everything else that names
+        # a register destination invalidates it. movzx/movsx re-add their own.
+        if curr.operands and curr.operands[0].type == "reg" \
+                and curr.mnemonic not in _NARROW_READONLY:
+            lifter._narrow.pop(curr.operands[0].reg, None)
+            if curr.mnemonic == "xchg" and len(curr.operands) > 1 \
+                    and curr.operands[1].type == "reg":
+                lifter._narrow.pop(curr.operands[1].reg, None)
+        # A call returns an arbitrary value in eax/ecx/edx, so any narrow-load
+        # hint on them dies at the call.
+        if getattr(curr, "is_call", False):
+            for reg in ("eax", "ecx", "edx"):
+                lifter._narrow.pop(reg, None)
 
         # Try cmp/test + jcc pattern first (2-instruction match)
         match = try_match_cmp_jcc(insns, i, lifter=lifter)
