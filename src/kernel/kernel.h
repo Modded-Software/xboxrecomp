@@ -750,6 +750,12 @@ LONG     __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait);
 NTSTATUS __stdcall xbox_KeWaitForSingleObject(PVOID Object, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], ULONG WaitType, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 
+/* Signal the guest dispatcher object (KEVENT) at guest_va, creating and
+ * registering a host event in the ke shadow if the guest never initialised one
+ * there. Returns 0 on success, -1 if no slot/handle was available. Used by the
+ * NV2A ack thread to release a title's GPU-completion wait. */
+int xbox_KeObjectSignal(uint32_t guest_va);
+
 BOOLEAN  __stdcall xbox_KeCancelTimer(PXBOX_KTIMER Timer);
 BOOLEAN  __stdcall xbox_KeSetTimer(PXBOX_KTIMER Timer, LARGE_INTEGER DueTime, PXBOX_KDPC Dpc);
 BOOLEAN  __stdcall xbox_KeSetTimerEx(PXBOX_KTIMER Timer, LARGE_INTEGER DueTime, LONG Period, PXBOX_KDPC Dpc);

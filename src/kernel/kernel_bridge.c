@@ -1449,6 +1449,35 @@ static void bridge_KeSetEvent(void)
         g_eax = 0;
 }
 
+/*
+ * Signal the guest KEVENT at guest_va. If the guest never initialised one
+ * there (nothing registered it in the shadow), create an auto-reset host event
+ * and register it for this VA, so a subsequent KeWaitForSingleObject on the
+ * same address resolves to a valid, signalled handle.
+ *
+ * A guest that embeds a dispatcher object in a driver structure and waits on
+ * it after submitting work expects the hardware interrupt to signal it; an
+ * HLE has to provide that signal explicitly. Without the object existing at
+ * all, the wait resolves to an invalid handle, returns WAIT_FAILED at once,
+ * and the caller's wait-loop spins forever instead of blocking.
+ */
+int xbox_KeObjectSignal(uint32_t guest_va)
+{
+    HANDLE h;
+
+    if (!guest_va)
+        return -1;
+
+    h = ke_shadow_lookup(guest_va);
+    if (!h) {
+        h = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!h)
+            return -1;
+        ke_shadow_insert(guest_va, h);
+    }
+    return SetEvent(h) ? 0 : -1;
+}
+
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
 static void bridge_KeWaitForSingleObject(void)
 {
