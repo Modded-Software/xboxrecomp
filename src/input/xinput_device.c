@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
+#include <stddef.h>
 
 /* ======================================================================== */
 #if defined(_WIN32)
@@ -273,6 +275,85 @@ static SHORT kbm_clamp(long v)
     return (SHORT)v;
 }
 
+/* Expand a right-stick deflection through the guest's own deadzone.
+ *
+ * XReadGamepad (0x001B99C0) does, per axis: n = (|axis| - D) * S, and zero
+ * when (|axis| - D) <= 0, with D a float at 0x3A947C (7696.0 here) and
+ * S = 1/(32767 - D). So any axis below D is silently swallowed -- which is
+ * what made precise aiming impossible: a slow move produced a stick value
+ * under 7696 and the guest saw nothing.
+ *
+ * Emitting D + (|v|/32767)*(32767-D) cancels to an effective deflection of
+ * exactly |v|/32767 after the guest's subtraction: linear, with no floor
+ * step. v == 0 must stay 0, or the decaying tail would hold the axis just
+ * above D and the camera would never stop. */
+static SHORT kbm_deadzone_expand(float v, unsigned deadzone)
+{
+    float span = 32767.0f - (float)deadzone;
+    float mag, out;
+    if (v == 0.0f || span <= 0.0f) return kbm_clamp((long)v);
+    mag = v < 0.0f ? -v : v;
+    if (mag > 32767.0f) mag = 32767.0f;
+    out = (float)deadzone + mag * (span / 32767.0f);
+    return kbm_clamp((long)(v < 0.0f ? -out : out));
+}
+
+/* ---- direct camera look (RECOMP_KBM_LOOK_DIRECT) -------------------------
+ *
+ * The right stick's turn rate is capped by the game, so once the ball pins at
+ * full deflection the camera stops speeding up however fast the mouse moves.
+ * This bypasses the stick for look: each poll it adds the mouse delta straight
+ * to the local camera's yaw/pitch fields.
+ *
+ * The camera is gameMultiplayer_GetFirstLocalCamera (0x00130C90):
+ *   holder = *0x439DE8; camera = *(holder + 4)        (0 if no local player)
+ * The live angles are tSimCamera yaw at +0x11C and pitch at +0x114, both in
+ * degrees (tSimCamera::UpdateYaw 0x00057560 / UpdatePitch 0x00055450 drive
+ * them; traced 0..360 and about -27..-4). tSimCamera::SetYaw/SetPitch
+ * (0x000715E0/0x000715C0) instead write the desired aim at +0x20C/+0x204, and
+ * the walk/aim path lerps the live angles toward a look target reached through
+ * *(camera+0x188)+0x14/+0x10 -- so that target is turned too, or the lerp
+ * pulls the camera straight back.
+ *
+ * Guest memory is a host mapping at va + xbox_GetMemoryOffset(); this runs on
+ * the guest thread inside XInputGetState, the same thread the generated code
+ * uses, so a plain volatile access matches it. */
+extern ptrdiff_t xbox_GetMemoryOffset(void);
+
+/* A plausible guest VA: below the device aperture and above the null page.
+ * Camera-relative pointers (camera+0x188) are uninitialised (0xCCCCCCCC) while
+ * the camera is being built on a load screen, so every deref is guarded. */
+static int kbm_valid(uint32_t va)
+{
+    return va >= 0x00010000u && va < 0x80000000u;
+}
+
+static uint32_t kbm_u32(uint32_t va)
+{
+    return *(volatile uint32_t *)((uintptr_t)va + (uintptr_t)xbox_GetMemoryOffset());
+}
+
+static uint32_t kbm_camera(void)
+{
+    uint32_t holder = kbm_u32(0x439DE8u);
+    uint32_t camera;
+    if (!kbm_valid(holder)) return 0;
+    camera = kbm_u32(holder + 4u);
+    return kbm_valid(camera) ? camera : 0;
+}
+
+static float kbm_camf(uint32_t camera, uint32_t offset)
+{
+    return *(volatile float *)((uintptr_t)(camera + offset)
+                               + (uintptr_t)xbox_GetMemoryOffset());
+}
+
+static void kbm_cam_setf(uint32_t camera, uint32_t offset, float v)
+{
+    *(volatile float *)((uintptr_t)(camera + offset)
+                        + (uintptr_t)xbox_GetMemoryOffset()) = v;
+}
+
 /* Face/triggers, matching what the build actually does (not what the docs
  * guess): A is jump, B is use, X is melee, LT is crouch. So jump is on Space,
  * melee on F, crouch on Control. A pad is expected to be the primary device,
@@ -327,34 +408,44 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
 {
     static DWORD packet;
     static int configured;
-    static unsigned sens, deadzone, invert_y, maxdelta, decay_ms, min_stick;
-    static float vx, vy;      /* decaying right-stick velocity, stick units */
-    static unsigned long last_ms;
+    static unsigned deadzone, invert_y, maxdelta, stick_deadzone, sens, ratio;
+    static unsigned look_direct, look_trace;
+    static float look_gain, look_gain_y;
     WORD b = 0;
     int dx, dy, wheel;
 
     if (!configured) {
-        /* sens is stick units per pixel of mouse travel; decay_ms is how long
-         * that deflection is held, so the camera integrates over the motion
-         * rather than seeing a one-poll blip. min_stick lifts small, precise
-         * moves above the title's own stick deadzone.
-         *
-         * The hold has to be measured in time, not in polls. The title polls
-         * this ~400 times a second, so a per-call decay halved the deflection
-         * every call and it was gone inside 25 ms -- which reads as small,
-         * stuttering camera steps no matter how large sens is. Decaying by
-         * elapsed milliseconds makes the feel independent of the poll rate. */
-        sens      = kbm_number("RECOMP_KBM_SENS", 65536, 880);
-        decay_ms  = kbm_number("RECOMP_KBM_DECAY_MS", 1000, 55);
+        /* The right stick is just the mouse delta scaled straight through:
+         * moving the mouse N counts deflects the stick by N/sens of full.
+         * No ball, no spring, no friction, no acceleration -- the game already
+         * turns the camera from the stick, so anything between the mouse and
+         * the stick only adds lag. sens is the mouse counts for full
+         * deflection (lower = faster); deadzone drops sub-count sensor noise.
+         * stick_deadzone is the guest's own per-axis stick deadzone
+         * (XReadGamepad subtracts it before scaling); output is expanded
+         * through it so slow aim stays linear. */
         deadzone  = kbm_number("RECOMP_KBM_DEADZONE", 64, 1);
-        min_stick = kbm_number("RECOMP_KBM_MIN_STICK", 32767, 2500);
+        stick_deadzone = kbm_number("RECOMP_KBM_STICK_DEADZONE", 32767, 7696);
         invert_y  = kbm_number("RECOMP_KBM_INVERT_Y", 1, 0);
         maxdelta  = kbm_number("RECOMP_KBM_MAXDELTA", 8192, 512);
+        sens      = kbm_number("RECOMP_KBM_SENS", 32767, 300);
+        /* per-axis output ratio (Y as a percent of X) */
+        ratio     = kbm_number("RECOMP_KBM_RATIO", 1000, 100);
+        /* Direct camera look: add the mouse delta straight to the camera's
+         * yaw/pitch, bypassing the stick's turn-rate cap. GAIN is degrees per
+         * mouse count (x1000); _Y is the pitch axis. TRACE logs the camera
+         * each 200 ms and changes nothing. */
+        look_direct = kbm_number("RECOMP_KBM_LOOK_DIRECT", 1, 1);
+        look_trace  = kbm_number("RECOMP_KBM_LOOK_TRACE", 1, 0);
+        look_gain   = (float)kbm_number("RECOMP_KBM_LOOK_GAIN",   1000000, 100) / 1000.0f;
+        look_gain_y = (float)kbm_number("RECOMP_KBM_LOOK_GAIN_Y", 1000000, 100) / 1000.0f;
         kbm_load_map();
         configured = 1;
-        fprintf(stderr, "[KBM] profile: sens=%u decay_ms=%u deadzone=%u min_stick=%u invert_y=%u maxdelta=%u "
+        fprintf(stderr, "[KBM] profile: deadzone=%u stick_deadzone=%u invert_y=%u maxdelta=%u "
+                "sens=%u ratio=%u look_direct=%u look_gain=%.4f look_gain_y=%.4f "
                 "A=%d B=%d X=%d Y=%d BLACK=%d WHITE=%d LT=%d START=%d BACK=%d\n",
-                sens, decay_ms, deadzone, min_stick, invert_y, maxdelta,
+                deadzone, stick_deadzone, invert_y, maxdelta, sens, ratio,
+                look_direct, look_gain, look_gain_y,
                 k_a, k_b, k_x, k_y, k_black, k_white, k_lt, k_start, k_back);
     }
 
@@ -364,9 +455,9 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbLX = axis_from_keys('A', 'D');
     pState->Gamepad.sThumbLY = axis_from_keys('S', 'W');
 
-    /* Right stick: mouse velocity, held for decay_ms. A single poll can carry a
-     * whole frame's worth of motion; clamp that to maxdelta so a focus change
-     * or a stuck cursor cannot slam the camera, while real flicks still scale. */
+    /* Right stick: the mouse delta scaled straight to the stick. Clamp each
+     * poll's delta so a focus change or a stuck cursor cannot slam it to full,
+     * while real flicks still scale; the inlet deadzone drops sub-count noise. */
     xbox_FramebufferMouseDelta(&dx, &dy);
     if (dx >  (int)maxdelta) dx =  (int)maxdelta;
     if (dx < -(int)maxdelta) dx = -(int)maxdelta;
@@ -376,46 +467,101 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     if (dy > -(int)deadzone && dy < (int)deadzone) dy = 0;
 
     {
-        unsigned long now = (unsigned long)GetTickCount();
-        float dt = last_ms ? (float)(now - last_ms) / 1000.0f : 0.0f;
-        float tau = (float)decay_ms / 1000.0f;
-        float alpha;
-        last_ms = now;
-        if (dt > 0.25f) dt = 0.25f;      /* do not let a focus pause clear it */
-        /* Linear release, not exponential: the old expf(-dt/tau) held the
-         * deflection with a long tail, so a quick flick kept the stick pinned
-         * and over-rotated the camera after the mouse stopped, while the
-         * exponential buildup of many small deltas saturated it outright. A
-         * straight fade to zero over decay_ms tracks the mouse far more
-         * directly. */
-        alpha = (tau <= 0.0f || dt >= tau) ? 0.0f : 1.0f - dt / tau;
-        vx = vx * alpha + (float)dx * (float)sens;
-        vy = vy * alpha + (float)dy * (float)sens;
-        /* Lift a small, precise move above the title's own stick deadzone so
-         * fine aiming is not swallowed; only while the mouse is actually
-         * moving, or the floor would freeze the camera on at rest. */
-        if (min_stick && (dx || dy)) {
-            float magnitude = sqrtf(vx * vx + vy * vy);
-            if (magnitude > 0.0f && magnitude < (float)min_stick) {
-                float lift = (float)min_stick / magnitude;
-                vx *= lift;
-                vy *= lift;
+        float scale = 32767.0f / (float)sens;
+        float sy = (float)dy * scale * (float)ratio / 100.0f;
+        if (!invert_y) sy = -sy;
+        pState->Gamepad.sThumbRX = kbm_deadzone_expand((float)dx * scale, stick_deadzone);
+        pState->Gamepad.sThumbRY = kbm_deadzone_expand(sy, stick_deadzone);
+    }
+
+    /* Direct camera look: the mouse delta IS the look input, added straight
+     * to the local camera's yaw/pitch. No stick, no ball. The right stick is
+     * zeroed so the game does not also turn. In the free-look branch the game
+     * reads +0x11C/+0x114 directly, so writing them is enough; in the walk/aim
+     * branch (UpdateYaw/UpdatePitch) it instead lerps them toward a look
+     * target at *(camera+0x188)+0x14/+0x10, so that target is turned by the
+     * same delta too and the camera ends the frame where the mouse put it. */
+    if (look_direct) {
+        uint32_t camera;
+        pState->Gamepad.sThumbRX = 0;
+        pState->Gamepad.sThumbRY = 0;
+        camera = kbm_camera();
+        if (camera) {
+            float dY = -(float)dx * look_gain;
+            float dP = (invert_y ? (float)dy : -(float)dy) * look_gain_y;
+            float yaw = kbm_camf(camera, 0x11Cu) + dY;
+            float pitch = kbm_camf(camera, 0x114u) + dP;
+            uint32_t look = kbm_u32(camera + 0x188u);
+            while (yaw >= 360.0f) yaw -= 360.0f;
+            while (yaw <    0.0f) yaw += 360.0f;
+            if (pitch >  89.0f) pitch =  89.0f;
+            if (pitch < -89.0f) pitch = -89.0f;
+            kbm_cam_setf(camera, 0x11Cu, yaw);
+            kbm_cam_setf(camera, 0x114u, pitch);
+            /* the aim/desired fields the weapon path reads (SetYaw/SetPitch) */
+            kbm_cam_setf(camera, 0x20Cu, yaw);
+            kbm_cam_setf(camera, 0x204u, pitch);
+            if (kbm_valid(look)) {
+                float tY = kbm_camf(look, 0x14u) + dY;
+                float tP = kbm_camf(look, 0x10u) + dP;
+                while (tY >= 360.0f) tY -= 360.0f;
+                while (tY <    0.0f) tY += 360.0f;
+                if (tP >  89.0f) tP =  89.0f;
+                if (tP < -89.0f) tP = -89.0f;
+                kbm_cam_setf(look, 0x14u, tY);
+                kbm_cam_setf(look, 0x10u, tP);
             }
         }
     }
-    pState->Gamepad.sThumbRX = kbm_clamp((long)vx);
-    pState->Gamepad.sThumbRY = kbm_clamp((long)(invert_y ? vy : -vy));
-    if (dx || dy) {
+
+    /* Trace the camera angles so the yaw/pitch offsets and signs can be
+     * confirmed; logs nothing and changes nothing on its own. */
+    if (look_trace) {
+        static unsigned long next_look;
+        unsigned long t = (unsigned long)GetTickCount();
+        if ((long)(t - next_look) >= 0) {
+            uint32_t camera = kbm_camera();
+            fprintf(stderr, "[LOOK] cam=%08x dx=%d dy=%d\n", camera, dx, dy);
+            if (camera) {
+                unsigned o;
+                uint32_t look = kbm_u32(camera + 0x188u);
+                uint32_t thing = kbm_u32(camera + 0x168u);
+                if (!kbm_valid(look)) look = 0;
+                if (!kbm_valid(thing)) thing = 0;
+                for (o = 0x100u; o <= 0x140u; o += 4u)
+                    fprintf(stderr, "  +%03x %+12.5f\n", o,
+                            (double)kbm_camf(camera, o));
+                fprintf(stderr, "  look=%08x rateP=%+.4f rateY=%+.4f tgtP=%+.4f tgtY=%+.4f\n",
+                        look,
+                        (double)kbm_camf(camera, 0x58u),
+                        (double)kbm_camf(camera, 0x60u),
+                        look ? (double)kbm_camf(look, 0x10u) : 0.0,
+                        look ? (double)kbm_camf(look, 0x14u) : 0.0);
+                fprintf(stderr, "  aimP=%+.4f aimY=%+.4f thing=%08x lx=%+.4f ly=%+.4f lz=%+.4f\n",
+                        (double)kbm_camf(camera, 0x204u),
+                        (double)kbm_camf(camera, 0x20Cu),
+                        thing,
+                        thing ? (double)kbm_camf(thing, 0x90u) : 0.0,
+                        thing ? (double)kbm_camf(thing, 0x94u) : 0.0,
+                        thing ? (double)kbm_camf(thing, 0x98u) : 0.0);
+            }
+            next_look = t + 200;
+        }
+    }
+    {
         static int trace = -1;
-        static unsigned long moves;
+        static unsigned long next_log;
+        unsigned long t = (unsigned long)GetTickCount();
         if (trace < 0) {
             const char *v = getenv("RECOMP_KBM_TRACE");
             trace = (v && *v && *v != '0') ? 1 : 0;
         }
-        moves++;
-        if (trace)
-            fprintf(stderr, "[KBM] mouse dx=%d dy=%d rx=%d ry=%d moves=%lu\n",
-                    dx, dy, pState->Gamepad.sThumbRX, pState->Gamepad.sThumbRY, moves);
+        if (trace && (long)(t - next_log) >= 0) {
+            fprintf(stderr, "[KBM] dx=%d dy=%d out=(%d,%d)\n",
+                    dx, dy,
+                    pState->Gamepad.sThumbRX, pState->Gamepad.sThumbRY);
+            next_log = t + 200;
+        }
     }
 
     /* Digital: d-pad on the arrows (and 1-4); Start/Back from the map. */
