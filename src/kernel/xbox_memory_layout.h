@@ -203,6 +203,11 @@ int xbox_Nv2aNativeFencesEnabled(void);
 int xbox_Nv2aSoftwareMethodHandler(uint32_t routine, uint32_t context);
 int xbox_Nv2aSoftwareMethod(uint32_t parameter, uint32_t depth_clear,
                             uint32_t color_clear);
+void xbox_Nv2aSoftwareMethodReport(void);
+/* Recursive guest audio exclusion; worker callbacks defer with TryEnter. */
+void xbox_GuestAudioGuardEnter(void);
+int xbox_GuestAudioGuardTryEnter(void);
+void xbox_GuestAudioGuardLeave(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);

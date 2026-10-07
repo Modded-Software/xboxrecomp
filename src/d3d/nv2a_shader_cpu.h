@@ -105,6 +105,30 @@ static inline void nv_cpu_unpack_normal(uint32_t packed, float result[4])
     result[3] = 1.0f;
 }
 
+static inline uint32_t nv_cpu_vp_operand_usage(uint32_t mac, uint32_t ilu)
+{
+    return (mac != 0 ? 1u : 0u) |
+           (mac == 2 || (mac >= 4 && mac <= 12) ? 2u : 0u) |
+           (mac == 3 || mac == 4 || ilu != 0 ? 4u : 0u);
+}
+
+static inline uint32_t nv_cpu_vertex_input_mask(const uint32_t program[136][4],
+                                                const uint32_t valid[136], uint32_t start)
+{
+    uint32_t mask = 0, slot;
+    for (slot = start; slot < 136; slot++) {
+        const uint32_t *words = program[slot];
+        uint32_t usage = nv_cpu_vp_operand_usage((words[1] >> 21) & 15u,
+                                                (words[1] >> 25) & 7u);
+        if (((usage & 1u) && ((words[2] >> 26) & 3u) == 2u) ||
+            ((usage & 2u) && ((words[2] >> 11) & 3u) == 2u) ||
+            ((usage & 4u) && ((words[3] >> 28) & 3u) == 2u))
+            mask |= 1u << ((words[1] >> 9) & 15u);
+        if (valid[slot] == 15 && (words[3] & 1u)) break;
+    }
+    return mask;
+}
+
 static inline int nv_cpu_vertex_execute(const uint32_t program[136][4],
                                         const uint32_t valid[136], uint32_t start,
                                         const float attributes[16][4], float constants[192][4],
@@ -130,8 +154,9 @@ static inline int nv_cpu_vertex_execute(const uint32_t program[136][4],
         float mac_result[4] = {0}, ilu_result[4] = {0};
         float scalar = 0.0f;
         int constant = (int)((words[1] >> 13) & 255u);
-        int use_a = mac != 0, use_b = mac == 2 || (mac >= 4 && mac <= 12);
-        int use_c = mac == 3 || mac == 4 || ilu != 0;
+        uint32_t usage = nv_cpu_vp_operand_usage(mac, ilu);
+        int use_a = (usage & 1u) != 0, use_b = (usage & 2u) != 0;
+        int use_c = (usage & 4u) != 0;
         vertex->failed_slot = slot;
         if (valid[slot] != 15 || mac > 13) return 0;
         if (words[3] & 2u) constant += address;

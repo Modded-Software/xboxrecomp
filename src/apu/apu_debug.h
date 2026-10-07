@@ -56,6 +56,11 @@ struct McpxApuDebugVoice
     float source_peak;
     float source_peak_since_report;
     float mixed_peak_since_report;
+    float filtered_peak_since_report;
+    float min_rate_since_report, max_rate_since_report;
+    uint32_t filter_mode, filter_coeff[2];
+    uint64_t filter_clipped_since_report;
+    uint64_t filter_nonfinite_since_report;
     uint64_t starved_reads;
 };
 
@@ -73,6 +78,9 @@ struct McpxApuDebugVp
 struct McpxApuDebugDsp
 {
     int cycles;
+    float mix_peak_since_report;
+    uint64_t clipped_since_report;
+    uint64_t nonfinite_since_report;
 };
 
 struct McpxApuDebug

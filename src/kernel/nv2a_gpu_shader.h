@@ -133,10 +133,13 @@ float4 fixed_texcoord(float4 coordinate,uint stage,float4 objectPosition,float4 
  }
  return textureMatrixEnable[stage]!=0?fixed_matrix(coordinate,68+stage*8):coordinate;
 }
+#ifndef NV_FIXED_TRANSFORM
+#define NV_FIXED_TRANSFORM misc.z
+#endif
 Pixel vs_main(Vertex input) {
  Pixel output;
  float distance=fogControl.x==6?input.fogCoordinate:saturate(input.specular.a);
- if(misc.z!=0) {
+ if(NV_FIXED_TRANSFORM!=0) {
   float4 eyeSpacePosition;
   float3 eyeSpaceNormal;
   fixed_eye_transform(input,eyeSpacePosition,eyeSpaceNormal);

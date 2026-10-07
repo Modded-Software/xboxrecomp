@@ -156,6 +156,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
      */
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+    bool diagnostic = mcpx_apu_diagnostics_enabled();
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
@@ -199,6 +200,15 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 right = mixbins[1][i];
             }
             /* Clamp to [-1, 1] range */
+            if (diagnostic) {
+                g_dbg.ep.mix_peak_since_report = fmaxf(
+                    g_dbg.ep.mix_peak_since_report,
+                    fmaxf(fabsf(left), fabsf(right)));
+                g_dbg.ep.clipped_since_report +=
+                    (fabsf(left) > 1.0f) + (fabsf(right) > 1.0f);
+                g_dbg.ep.nonfinite_since_report +=
+                    !isfinite(left) + !isfinite(right);
+            }
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;
