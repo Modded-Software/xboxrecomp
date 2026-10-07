@@ -50,6 +50,24 @@ static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
     }
 }
 
+/* The XMM register file in an x64 CONTEXT. Used for 16-byte SSE loads/stores
+ * against a trapped aperture (the guest's effect-image bulk copies into APU
+ * GP/EP scratch memory are movups). */
+static inline M128A *mmio_ctx_xmm(PCONTEXT c, int reg)
+{
+    switch (reg & 0xF) {
+    case 0:  return &c->Xmm0;   case 1:  return &c->Xmm1;
+    case 2:  return &c->Xmm2;   case 3:  return &c->Xmm3;
+    case 4:  return &c->Xmm4;   case 5:  return &c->Xmm5;
+    case 6:  return &c->Xmm6;   case 7:  return &c->Xmm7;
+    case 8:  return &c->Xmm8;   case 9:  return &c->Xmm9;
+    case 10: return &c->Xmm10;  case 11: return &c->Xmm11;
+    case 12: return &c->Xmm12;  case 13: return &c->Xmm13;
+    case 14: return &c->Xmm14;  case 15: return &c->Xmm15;
+    default: return NULL;
+    }
+}
+
 static inline int mmio_modrm_len(const uint8_t *ip, int rex_b)
 {
     uint8_t modrm = *ip;
@@ -297,6 +315,33 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
             mlen  = mmio_modrm_len(op + 2, rex_b);
             reg   = ((op[2] >> 3) & 7) | (rex_r ? 8 : 0);
             *mmio_ctx_reg(ctx, reg) = rd(dev, off, s) & ((1ULL << (s * 8)) - 1);
+            ctx->Rip += prefix + 2 + mlen;
+            return 1;
+        }
+        /* 16-byte SSE moves against a trapped aperture: movups/movaps/movdqa/
+         * movdqu load (0F 10/28/6F) and store (0F 11/29/7F). Serviced as four
+         * dword accesses because the callbacks speak at most 64 bits. */
+        if (op[1] == 0x10 || op[1] == 0x28 || op[1] == 0x6F) {
+            M128A *x = mmio_ctx_xmm(ctx, ((op[2] >> 3) & 7) | (rex_r ? 8 : 0));
+            mlen = mmio_modrm_len(op + 2, rex_b);
+            if (x) {
+                x->Low  = (uint32_t)rd(dev, off, 4)
+                        | ((uint64_t)(uint32_t)rd(dev, off + 4, 4) << 32);
+                x->High = (uint32_t)rd(dev, off + 8, 4)
+                        | ((uint64_t)(uint32_t)rd(dev, off + 12, 4) << 32);
+            }
+            ctx->Rip += prefix + 2 + mlen;
+            return 1;
+        }
+        if (op[1] == 0x11 || op[1] == 0x29 || op[1] == 0x7F) {
+            M128A *x = mmio_ctx_xmm(ctx, ((op[2] >> 3) & 7) | (rex_r ? 8 : 0));
+            mlen = mmio_modrm_len(op + 2, rex_b);
+            if (x) {
+                wr(dev, off,      (uint32_t)x->Low,                4);
+                wr(dev, off + 4,  (uint32_t)(x->Low >> 32),        4);
+                wr(dev, off + 8,  (uint32_t)x->High,               4);
+                wr(dev, off + 12, (uint32_t)(x->High >> 32),       4);
+            }
             ctx->Rip += prefix + 2 + mlen;
             return 1;
         }
