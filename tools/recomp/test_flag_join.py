@@ -101,3 +101,43 @@ def test_a_join_with_an_unknown_predecessor_is_not_guessed():
     from tools.recomp.translator import _edge_flag_plan
     assert _edge_flag_plan(None, set(), {}) is None
     assert _edge_flag_plan(None, {1, 2}, {1: ('cmp', []), 2: None}) is None
+
+
+def translate_movzx_join(source_imm=7):
+    # movzx eax, word [esi+0x30]; cmp eax, imm; jmp join; nop;
+    # cmp word [esi+0x30], 7; join: setne al; ret
+    movzx = bytes.fromhex('0fb74630')
+    if 0 <= source_imm < 0x80:
+        cmp_wide = bytes.fromhex('83f8') + bytes([source_imm])
+    else:
+        cmp_wide = bytes.fromhex('81f8') + source_imm.to_bytes(4, 'little')
+    prefix = movzx + cmp_wide
+    jmp_at = len(prefix)
+    direct = bytes.fromhex('66837e3007')  # 0x66 prefix: word, not dword
+    join_at = jmp_at + 2 + len(direct)
+    jmp = bytes([0xEB, join_at - (jmp_at + 2)])
+    body = prefix + jmp + direct + bytes.fromhex('0f95c0c3')
+    config._install([config.Section('.text', BASE, len(body), 0, len(body), True)],
+                    entry_point=BASE, kernel_thunk_addr=BASE,
+                    origin='movzx-flag-join-test')
+    db = {BASE: {'start': hex(BASE), 'end': BASE + len(body),
+                 '_addr': BASE, 'size': len(body)}}
+    return FunctionTranslator(body, db).translate_function(BASE, db[BASE])
+
+
+def test_movzx_narrow_compare_merges_with_direct_compare():
+    # cmp eax, 7 where eax = zero-extended word [esi+0x30] is the same compare
+    # as cmp word [esi+0x30], 7. Both must snapshot at 16 bits so the join
+    # keeps a real condition instead of falling back to the never-taken _flags.
+    code = translate_movzx_join()
+    assert 'CMP_NE(_fa, _fb)' in code, code
+    assert '_flags /* setne */' not in code
+
+
+def test_movzx_compare_with_wide_immediate_is_not_narrowed():
+    # 0x10007 does not fit 16 bits: comparing the zero-extended word against it
+    # differs from comparing the low word alone, so narrowing would answer the
+    # wrong way and must not happen (the join falls back to _flags instead).
+    code = translate_movzx_join(source_imm=0x10007)
+    assert 'CMP_NE(_fa, _fb)' not in code, code
+    assert '_flags /* setne */' in code, code
