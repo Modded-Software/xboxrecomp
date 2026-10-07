@@ -243,6 +243,18 @@ int main(int argc, char **argv)
                 check(read_byte_in_child(p2, &got), what,
                       "not mapped after shutdown + init");
             }
+
+            /* The APU MMIO trap ends at 0xFE830000; guest memory past that
+             * point remains mapped as GP/EP scratch instead of being blocked by
+             * the modeled main/VP register window. */
+            {
+                const uintptr_t scratch_va = 0xFE830000u;
+                unsigned char *scratch = (unsigned char *)base2 + scratch_va;
+                unsigned char got = 0;
+                check(read_byte_in_child(scratch, &got),
+                      "APU scratch beyond the MMIO trap is still mapped",
+                      "GP/EP scratch vanished behind the trap boundary");
+            }
         }
         xbox_MemoryLayoutShutdown();
     }

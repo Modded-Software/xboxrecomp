@@ -234,6 +234,7 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
 extern RECOMP_TLS uint32_t g_ebp;
+extern RECOMP_TLS uint32_t g_eflags;
 
 /* EFLAGS.DF, and the signed step the string instructions take because of it.
  *

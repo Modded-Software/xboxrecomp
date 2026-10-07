@@ -92,8 +92,59 @@ def test_arm_that_cannot_run_alone_is_left_unresolved():
     print("ok  arm_that_cannot_run_alone_is_left_unresolved")
 
 
+def test_biased_tables_dispatch_to_local_labels():
+    for bias in (0, 1, -2):
+        image = bytearray(b"\xCC" * 0x100)
+        table = BASE + 0x60
+        displacement = table - bias * 4
+        image[:7] = b"\xFF\x24\x8D" + displacement.to_bytes(4, "little")
+        image[ARM - BASE:ARM - BASE + 1] = b"\xC3"
+        image[PIECE - BASE:PIECE - BASE + 1] = b"\xC3"
+        image[table - BASE:table - BASE + 8] = (
+            ARM.to_bytes(4, "little") + PIECE.to_bytes(4, "little"))
+        config._install(
+            [config.Section(".text", BASE, len(image), 0, len(image), True)],
+            entry_point=BASE, kernel_thunk_addr=BASE,
+            origin="biased-jump-table-test")
+        translator = FunctionTranslator(bytes(image),
+                                        {BASE: _entry(BASE, BASE + 0x80)})
+        code = translator.translate_function(BASE, translator.func_db[BASE])
+        for target in (ARM, PIECE):
+            assert f"goto loc_{target:08X};" in code, (bias, code)
+            assert f"loc_{target:08X}:" in code, (bias, code)
+        instructions, _ = translator.decode_function(BASE, BASE + 0x80)
+        translator.lifter.jump_table_targets = {displacement: []}
+        assert translator.lifter._analyze_switch_table(
+            instructions[0].operands) == [], bias
+    print("ok  biased_tables_dispatch_to_local_labels")
+
+
+def test_biased_table_after_function_dispatches_locally():
+    image = bytearray(b"\xCC" * 0x100)
+    end = BASE + 0x5F
+    table = (end + 3) & ~3
+    image[:7] = b"\xFF\x24\x8D" + table.to_bytes(4, "little")
+    image[ARM - BASE:ARM - BASE + 1] = b"\xC3"
+    image[PIECE - BASE:PIECE - BASE + 1] = b"\xC3"
+    image[table - BASE:table - BASE + 12] = (
+        b"\x00" * 4 + ARM.to_bytes(4, "little")
+        + PIECE.to_bytes(4, "little"))
+    config._install(
+        [config.Section(".text", BASE, len(image), 0, len(image), True)],
+        entry_point=BASE, kernel_thunk_addr=BASE,
+        origin="post-function-jump-table-test")
+    translator = FunctionTranslator(bytes(image), {BASE: _entry(BASE, end)})
+    code = translator.translate_function(BASE, translator.func_db[BASE])
+    for target in (ARM, PIECE):
+        assert f"goto loc_{target:08X};" in code, code
+        assert f"loc_{target:08X}:" in code, code
+    print("ok  biased_table_after_function_dispatches_locally")
+
+
 if __name__ == "__main__":
     test_arm_gets_an_entry_covering_its_reachable_code()
     test_switch_inside_its_function_adds_nothing()
     test_arm_that_cannot_run_alone_is_left_unresolved()
+    test_biased_tables_dispatch_to_local_labels()
+    test_biased_table_after_function_dispatches_locally()
     print("jump_table_arm_entries: ALL PASS")

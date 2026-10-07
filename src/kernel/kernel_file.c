@@ -185,8 +185,10 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
-        if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
-            flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
+        /* Xbox callers may request no intermediate buffering, but Win32 then
+         * requires sector-aligned offsets and lengths. The title issues an
+         * unaligned video read at offset 505952, so preserve normal buffered
+         * host I/O while keeping the Xbox option visible to the emulated API. */
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
@@ -236,17 +238,27 @@ NTSTATUS __stdcall xbox_NtReadFile(
 {
     DWORD bytes_read = 0;
     BOOL result;
-    OVERLAPPED ov;
+    LARGE_INTEGER seek;
     (void)ApcRoutine; (void)ApcContext;
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
-        memset(&ov, 0, sizeof(ov));
-        ov.Offset = ByteOffset->LowPart;
-        ov.OffsetHigh = ByteOffset->HighPart;
-        result = ReadFile(FileHandle, Buffer, Length, &bytes_read, &ov);
+        /* NtCreateFile opens these handles synchronously. Passing an
+         * OVERLAPPED structure to ReadFile on such a handle fails with
+         * ERROR_INVALID_PARAMETER, which stopped Blizzard_logo.vid at its
+         * first offset read. Seek the synchronous handle explicitly instead. */
+        seek.QuadPart = ByteOffset->QuadPart;
+        if (!SetFilePointerEx(FileHandle, seek, NULL, FILE_BEGIN)) {
+            XBOX_TRACE(XBOX_LOG_FILE,
+                       "NtReadFile(handle=%p) seek to %lld failed err=%u",
+                       FileHandle, (long long)seek.QuadPart, GetLastError());
+            IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
+            IoStatusBlock->Information = 0;
+            return STATUS_UNSUCCESSFUL;
+        }
+        result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
     } else {
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
     }

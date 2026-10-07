@@ -36,7 +36,7 @@ endif()
 target_include_directories(xbox_d3d8 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(MSVC)
-    target_compile_options(xbox_d3d8 PRIVATE /W4 /O2)
+    target_compile_options(xbox_d3d8 PRIVATE /W4)
 else()
     target_compile_options(xbox_d3d8 PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()

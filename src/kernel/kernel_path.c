@@ -429,6 +429,27 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         }
     }
 
+    if (xbox_path[0] != '\\' && xbox_path[0] != '/' &&
+        !(isalpha((unsigned char)xbox_path[0]) && xbox_path[1] == ':')) {
+        WCHAR relative_wide[MAX_PATH];
+        if (!MultiByteToWideChar(CP_ACP, 0, xbox_path, -1,
+                                 relative_wide, MAX_PATH))
+            return FALSE;
+        for (WCHAR* p = relative_wide; *p; p++) {
+            if (*p == L'/') *p = L'\\';
+        }
+        if (swprintf_s(host_path_buf, buf_size, L"%s\\%s",
+                       s_game_dir, relative_wide) < 0)
+            return FALSE;
+        size_t n = wcslen(host_path_buf);
+        while (n > 1 && (host_path_buf[n - 1] == L'\\'
+                         || host_path_buf[n - 1] == L'/'))
+            host_path_buf[--n] = L'\0';
+        XBOX_TRACE(XBOX_LOG_PATH, "%s -> %S", xbox_path, host_path_buf);
+        xbox_remember_host_path(host_path_buf);
+        return TRUE;
+    }
+
     xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "Unrecognized Xbox path: %s", xbox_path);
     MultiByteToWideChar(CP_ACP, 0, xbox_path, -1, host_path_buf, buf_size);
     return TRUE;
@@ -580,6 +601,26 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
             sub_dir   = s_rules[i].sub_posix;
             goto translate;
         }
+    }
+
+    if (xbox_path[0] != '\\' && xbox_path[0] != '/' &&
+        !(isalpha((unsigned char)xbox_path[0]) && xbox_path[1] == ':')) {
+        char remainder_posix[MAX_PATH];
+        if (strlen(xbox_path) >= sizeof(remainder_posix))
+            return FALSE;
+        snprintf(remainder_posix, sizeof(remainder_posix), "%s", xbox_path);
+        for (char* p = remainder_posix; *p; p++) {
+            if (*p == '\\') *p = '/';
+        }
+        int written = snprintf(host_path_buf, buf_size, "%s/%s",
+                               s_game_dir, remainder_posix);
+        if (written < 0 || (DWORD)written >= buf_size)
+            return FALSE;
+        size_t n = strlen(host_path_buf);
+        while (n > 1 && host_path_buf[n - 1] == '/')
+            host_path_buf[--n] = '\0';
+        XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
+        return TRUE;
     }
 
     /* Unrecognized path: pass through, just normalize separators. */

@@ -51,7 +51,7 @@ if [ -z "${GHIDRA_HOME:-}" ]; then
     exit 1
 fi
 HEADLESS="$GHIDRA_HOME/support/analyzeHeadless.bat"
-XBE="${XBE:?ERROR: set XBE=/path/to/Xbox/default.xbe (the XBE to analyze)}"
+XBE="${XBE:-game_files/Ghost.xbe}"
 
 WORK="$HERE/work"
 PROJ_DIR="$WORK/ghidra_project"

@@ -132,24 +132,29 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     XAUDIO2_VOICE_STATE state;
     XAUDIO2_BUFFER xbuf;
     int idx;
-    int copy_samples;
     HRESULT hr;
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    if (!g_xa2_initialized || !g_xa2_source ||
+        !samples || num_samples <= 0 || num_samples > XA2_BUF_SAMPLES) {
+        fprintf(stderr, "[XA2] invalid submission or inactive output; audio output stopped\n");
+        return -1;
+    }
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
     if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
 
     idx = g_xa2_next_buf;
-    copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
-    memcpy(g_xa2_bufs[idx], samples, copy_samples * XA2_CHANNELS * sizeof(int16_t));
+    memcpy(g_xa2_bufs[idx], samples, num_samples * XA2_CHANNELS * sizeof(int16_t));
 
     memset(&xbuf, 0, sizeof(xbuf));
-    xbuf.AudioBytes = copy_samples * XA2_CHANNELS * sizeof(int16_t);
+    xbuf.AudioBytes = num_samples * XA2_CHANNELS * sizeof(int16_t);
     xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
 
     hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
-    if (FAILED(hr)) return 0;
+    if (FAILED(hr)) {
+        fprintf(stderr, "[XA2] SubmitSourceBuffer failed: 0x%08lX; audio output stopped\n", hr);
+        return -1;
+    }
 
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
     g_xa2_frames_written++;

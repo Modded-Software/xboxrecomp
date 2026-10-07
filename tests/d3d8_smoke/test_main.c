@@ -17,6 +17,7 @@
 #include "d3d8_internal.h"
 #include "d3d8_swizzle.h"
 #include "d3d8_fvf.h"
+#include "nv2a_shader_cpu.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -300,6 +301,80 @@ static void test_dxt_decode(void)
         CHECK("dxt1 block 0", d3d8_dxt_decode_texel(img, 0x0C, 0, 0, 8, &argb) && argb == 0xFFFF0000u);
         CHECK("dxt1 block 1", d3d8_dxt_decode_texel(img, 0x0C, 4, 0, 8, &argb) && argb == 0xFF0000FFu);
     }
+
+    {
+        d3d8_dxt_texel_cache cache = {0};
+        BYTE image[144];
+        const UINT formats[] = {0x0C, 0x0E, 0x0F};
+        UINT format_index, pass, horizontal, vertical, byte_index;
+        UINT32 expected, cached;
+        for (byte_index = 0; byte_index < sizeof image; byte_index++)
+            image[byte_index] = (BYTE)(byte_index * 73u + 19u);
+        for (format_index = 0; format_index < 3; format_index++) {
+            for (pass = 0; pass < 3; pass++) {
+                for (vertical = 0; vertical < 9; vertical++) {
+                    for (horizontal = 0; horizontal < 9; horizontal++) {
+                        CHECK("dxt reference decodes",
+                              d3d8_dxt_decode_texel(image, formats[format_index],
+                                                   horizontal, vertical, 9, &expected));
+                        CHECK("dxt cached decodes",
+                              d3d8_dxt_decode_texel_cached(&cache, image, formats[format_index],
+                                                          horizontal, vertical, 9, &cached));
+                        CHECK("dxt cache matches reference", cached == expected);
+                    }
+                }
+                if (pass == 1)
+                    for (byte_index = 0; byte_index < sizeof image; byte_index++)
+                        image[byte_index] ^= 0x5Au;
+            }
+        }
+        CHECK("dxt cache rejects unsupported format",
+              !d3d8_dxt_decode_texel_cached(&cache, image, 0x06, 0, 0, 9, &cached));
+        CHECK("dxt cache rejects zero width",
+              !d3d8_dxt_decode_texel_cached(&cache, image, 0x0F, 0, 0, 0, &cached));
+        CHECK("dxt cache reflects source update",
+              d3d8_dxt_decode_texel_cached(&cache, blk, 0x0E, 0, 0, 4, &cached)
+              && cached == 0xFFFF0000u);
+        blk[0] = 0;
+        CHECK("dxt cache invalidates changed alpha",
+              d3d8_dxt_decode_texel_cached(&cache, blk, 0x0E, 0, 0, 4, &cached)
+              && cached == 0x00FF0000u);
+    }
+    if (GetEnvironmentVariableA("D3D8_DXT_BENCH", NULL, 0)) {
+        BYTE texture[4096];
+        const UINT formats[] = {0x0C, 0x0E, 0x0F};
+        UINT format_index, byte_index, sample_index, cached_pass;
+        LARGE_INTEGER frequency, start, finish;
+        UINT32 checksums[2];
+        QueryPerformanceFrequency(&frequency);
+        for (byte_index = 0; byte_index < sizeof texture; byte_index++)
+            texture[byte_index] = (BYTE)(byte_index * 73u + 19u);
+        for (format_index = 0; format_index < 3; format_index++) {
+            for (cached_pass = 0; cached_pass < 2; cached_pass++) {
+                d3d8_dxt_texel_cache cache = {0};
+                volatile UINT32 checksum = 0;
+                QueryPerformanceCounter(&start);
+                for (sample_index = 0; sample_index < 5000000u; sample_index++) {
+                    UINT horizontal = ((sample_index % 640u) * 64u) / 640u;
+                    UINT vertical = (sample_index / 640u) % 64u;
+                    if (cached_pass)
+                        d3d8_dxt_decode_texel_cached(&cache, texture, formats[format_index],
+                                                    horizontal, vertical, 64, &argb);
+                    else
+                        d3d8_dxt_decode_texel(texture, formats[format_index],
+                                             horizontal, vertical, 64, &argb);
+                    checksum += argb;
+                }
+                QueryPerformanceCounter(&finish);
+                checksums[cached_pass] = checksum;
+                printf("DXT benchmark format 0x%02X %s: %.3f ms checksum %08X\n",
+                       formats[format_index], cached_pass ? "cached" : "reference",
+                       1000.0 * (double)(finish.QuadPart - start.QuadPart) /
+                           (double)frequency.QuadPart, (unsigned)checksum);
+            }
+            CHECK("dxt benchmark preserves checksum", checksums[0] == checksums[1]);
+        }
+    }
 }
 
 /* Forward the D3D8 conversion helper through a tiny local wrapper so we
@@ -382,6 +457,163 @@ static void test_fvf_position(void)
     CHECK_INT("weighted normal offset", d3d8_fvf_position_bytes(0x118u), 20);
 }
 
+static void test_vertex_program(void)
+{
+    uint32_t program[136][4] = {{0}}, valid[136] = {0};
+    float attributes[16][4] = {{0}}, constants[192][4] = {{0}};
+    Nv2aCpuVertex vertex;
+    printf("test_vertex_program\n");
+    attributes[0][0] = 120.0f; attributes[0][1] = 80.0f; attributes[0][3] = 1.0f;
+    attributes[3][0] = 0.8f; attributes[3][1] = 0.6f; attributes[3][3] = 1.0f;
+    constants[2][0] = 0.5f; constants[2][1] = 0.25f; constants[2][3] = 1.0f;
+    program[0][1] = (1u << 21) | 0x1Bu;
+    program[0][2] = 2u << 26;
+    program[0][3] = (15u << 12) | 0x800u;
+    program[1][1] = (2u << 21) | (2u << 13) | (3u << 9) | 0x1Bu;
+    program[1][2] = (2u << 26) | (3u << 11) | (0x1Bu << 17);
+    program[1][3] = (15u << 12) | 0x800u | (3u << 3) | 1u;
+    valid[0] = valid[1] = 15;
+    CHECK("vertex program executes", nv_cpu_vertex_execute(program, valid, 0, attributes, constants, &vertex));
+    CHECK("vertex output position", vertex.output[0][0] == 120.0f && vertex.output[0][1] == 80.0f);
+    CHECK("vertex shader computes lighting", fabsf(vertex.output[3][0] - 0.4f) < 0.00001f
+          && fabsf(vertex.output[3][1] - 0.15f) < 0.00001f);
+    valid[1] = 7;
+    CHECK("reject incomplete instruction", !nv_cpu_vertex_execute(program, valid, 0, attributes, constants, &vertex));
+    valid[1] = 15;
+    program[1][1] |= 15u << 21;
+    CHECK("reject invalid MAC opcode", !nv_cpu_vertex_execute(program, valid, 0, attributes, constants, &vertex));
+    {
+        const float expected_x[] = {0, 1, 2, 3, 4, 20, 25, 40, 1, 1, 2, 1, 0};
+        uint32_t opcode;
+        attributes[0][0] = 1; attributes[0][1] = 2; attributes[0][2] = 3; attributes[0][3] = 4;
+        constants[1][0] = 2; constants[1][1] = 3; constants[1][2] = 4; constants[1][3] = 5;
+        for (opcode = 1; opcode <= 12; opcode++) {
+            memset(program, 0, sizeof program);
+            program[0][1] = (opcode << 21) | (1u << 13) | 0x1Bu;
+            program[0][2] = (2u << 26) | (3u << 11) | (0x1Bu << 17) | (0x1Bu << 2);
+            program[0][3] = (3u << 28) | (15u << 12) | 0x800u | 1u;
+            CHECK("MAC arithmetic executes", nv_cpu_vertex_execute(program, valid, 0, attributes, constants, &vertex));
+            CHECK("MAC arithmetic value", fabsf(vertex.output[0][0] - expected_x[opcode]) < 0.00001f);
+        }
+        for (opcode = 1; opcode <= 7; opcode++) {
+            program[0][1] = (opcode << 25);
+            program[0][2] = 0x1Bu << 2;
+            program[0][3] = (2u << 28) | (15u << 12) | 0x800u | 4u | 1u;
+            CHECK("ILU arithmetic executes", nv_cpu_vertex_execute(program, valid, 0, attributes, constants, &vertex));
+            CHECK("ILU arithmetic finite", isfinite(vertex.output[0][0]) && isfinite(vertex.output[0][3]));
+        }
+        program[0][1] = (1u << 21) | 0x100u | 0xE4u;
+        program[0][2] = 2u << 26;
+        program[0][3] = (10u << 12) | 0x800u | (3u << 3) | 1u;
+        CHECK("vertex swizzle negate mask", nv_cpu_vertex_execute(program, valid, 0, attributes, constants, &vertex)
+              && vertex.output[3][0] == -4 && vertex.output[3][1] == 0
+              && vertex.output[3][2] == -2 && vertex.output[3][3] == 1);
+        memset(program, 0, sizeof program);
+        program[0][1] = (1u << 21) | 0x1Bu;
+        program[0][2] = 2u << 26;
+        program[0][3] = 15u << 24;
+        program[1][1] = (1u << 21) | (1u << 25) | (1u << 13) | 0x1Bu;
+        program[1][2] = (3u << 26) | (0x1Bu << 2);
+        program[1][3] = (1u << 28) | (15u << 24) | (15u << 16) |
+                          (15u << 12) | 0x800u | (3u << 3) | 4u | 1u;
+        CHECK("paired units read pre-write register", nv_cpu_vertex_execute(program, valid, 0, attributes, constants, &vertex)
+              && vertex.output[3][0] == 1 && vertex.output[3][1] == 2);
+        program[0][1] = (13u << 21) | 0x1Bu;
+        program[0][3] = 0;
+        program[1][1] = (1u << 21) | (1u << 13) | 0x1Bu;
+        program[1][2] = 3u << 26;
+        program[1][3] = (15u << 12) | 0x800u | 2u | 1u;
+        CHECK("relative constant address", nv_cpu_vertex_execute(program, valid, 0, attributes, constants, &vertex)
+              && vertex.output[0][0] == 0.5f);
+        program[1][1] = (1u << 21) | (191u << 13) | 0x1Bu;
+        CHECK("reject out of range relative constant",
+              !nv_cpu_vertex_execute(program, valid, 0, attributes, constants, &vertex));
+    }
+}
+
+static void test_register_combiners(void)
+{
+    {
+        const float coordinates[] = {-2147480000.0f, -128.75f, -1.0f, -0.25f, -0.0f, 0.25f, 128.75f, 2147480000.0f};
+        float registers[16][4] = {{0}};
+        uint32_t index;
+        for (index = 0; index < sizeof coordinates / sizeof coordinates[0]; index++)
+            CHECK("coordinate floor matches reference", nv_cpu_floor_coordinate(coordinates[index]) == (int32_t)floorf(coordinates[index]));
+        CHECK("finite normal", nv_cpu_finite(1.0f));
+        CHECK("finite zero", nv_cpu_finite(-0.0f));
+        CHECK("reject infinity", !nv_cpu_finite(INFINITY));
+        CHECK("reject NaN", !nv_cpu_finite(NAN));
+        CHECK("clamp NaN to lower bound", nv_cpu_clamp(NAN, 0.0f, 1.0f) == 0.0f);
+        CHECK("clamp infinity to upper bound", nv_cpu_clamp(INFINITY, 0.0f, 1.0f) == 1.0f);
+        registers[4][0] = NAN;
+        CHECK("unsigned combiner NaN maps to zero", nv_cpu_combiner_input(registers, 4, 0, 0) == 0.0f);
+    }
+    Nv2aCpuCombiners state = {0};
+    const float diffuse[4] = {0.5f, 0.25f, 0.75f, 0.5f}, specular[4] = {0};
+    const float textures[4][4] = {{0.8f, 0.4f, 0.2f, 0.6f}, {0.25f, 0.5f, 1.0f, 0.5f}};
+    float result[4];
+    printf("test_register_combiners\n");
+    state.control = 1;
+    state.rgb_input[0] = 0x04080000u;
+    state.alpha_input[0] = 0x14180000u;
+    state.rgb_output[0] = state.alpha_output[0] = 0xC0u;
+    state.final_input[0] = 0x0000000Cu;
+    state.final_input[1] = 0x00001C00u;
+    CHECK_INT("recognize exact modulation shader", nv_cpu_combiner_fast_mode(&state), 2);
+    CHECK("combiner diffuse modulation", nv_cpu_combiners_execute(&state, diffuse, specular, textures, 1, result)
+        && fabsf(result[0] - 0.4f) < 0.00001f && fabsf(result[3] - 0.3f) < 0.00001f);
+    state.rgb_input[0] = 0x08200000u;
+    state.alpha_input[0] = 0x18200000u;
+    CHECK_INT("recognize exact replacement shader", nv_cpu_combiner_fast_mode(&state), 1);
+    CHECK("combiner texture replacement", nv_cpu_combiners_execute(&state, diffuse, specular, textures, 1, result)
+        && fabsf(result[0] - 0.8f) < 0.00001f && fabsf(result[3] - 0.6f) < 0.00001f);
+    state.rgb_output[0] = state.alpha_output[0] = 0xC00u;
+    state.alpha_input[0] = 0x14200000u;
+    state.final_input[1] = 0x00001C80u;
+    CHECK_INT("recognize real movie shader", nv_cpu_combiner_fast_mode(&state), 3);
+    CHECK("movie shader uses diffuse alpha", nv_cpu_combiners_execute(&state, diffuse, specular, textures, 1, result)
+          && fabsf(result[0] - 0.8f) < 0.00001f && fabsf(result[3] - 0.5f) < 0.00001f);
+        state.rgb_input[0] = 0x08040000u;
+        state.alpha_input[0] = 0x00002014u;
+        CHECK_INT("recognize real menu shader", nv_cpu_combiner_fast_mode(&state), 4);
+        CHECK("menu shader modulates RGB only", nv_cpu_combiners_execute(&state, diffuse, specular, textures, 1, result)
+            && fabsf(result[0] - 0.4f) < 0.00001f && fabsf(result[3] - 0.5f) < 0.00001f);
+    state.rgb_input[0] = 0x08090000u;
+    state.alpha_input[0] = 0x18190000u;
+    CHECK_INT("two texture shader requires general execution", nv_cpu_combiner_fast_mode(&state), 0);
+    CHECK("combiner two texture product", nv_cpu_combiners_execute(&state, diffuse, specular, textures, 1, result)
+        && fabsf(result[0] - 0.2f) < 0.00001f && fabsf(result[3] - 0.3f) < 0.00001f);
+    state.rgb_input[0] = 0x04200000u;
+    state.rgb_output[0] = 0x300C0u;
+    CHECK("combiner shift-right output encoding", nv_cpu_combiners_execute(&state, diffuse, specular, textures, 1, result)
+        && fabsf(result[0] - 0.25f) < 0.00001f);
+    state.control = 9;
+    CHECK("reject excessive combiner stages", !nv_cpu_combiners_execute(&state, diffuse, specular, textures, 1, result));
+    CHECK("depth less", nv_cpu_compare(0x0201, 100, 200) && !nv_cpu_compare(0x0201, 200, 100));
+    CHECK("depth equal", nv_cpu_compare(0x0202, 100, 100) && !nv_cpu_compare(0x0202, 100, 200));
+    CHECK("depth less equal", nv_cpu_compare(0x0203, 100, 100) && nv_cpu_compare(0x0203, 100, 200));
+    CHECK("depth greater", nv_cpu_compare(0x0204, 200, 100) && !nv_cpu_compare(0x0204, 100, 200));
+    CHECK("depth not equal", nv_cpu_compare(0x0205, 100, 200) && !nv_cpu_compare(0x0205, 100, 100));
+    CHECK("depth greater equal", nv_cpu_compare(0x0206, 100, 100) && nv_cpu_compare(0x0206, 200, 100));
+    CHECK("depth never always", !nv_cpu_compare(0x0200, 100, 200) && nv_cpu_compare(0x0207, 100, 200));
+    nv_cpu_unpack_normal(1023u | (1025u << 11) | (511u << 22), result);
+    CHECK("packed signed normal", result[0] == 1.0f && result[1] == -1.0f && result[2] == 1.0f);
+        {
+          uint32_t blended;
+          CHECK("additive lighting blend", nv_cpu_blend(0xFF201010u, 0xFF102030u, 1, 1, 0x8006, 0, &blended)
+              && blended == 0xFF303040u);
+          CHECK("source alpha blend", nv_cpu_blend(0x80FF0000u, 0xFF0000FFu, 0x0302, 0x0303, 0x8006, 0, &blended)
+              && blended == 0xBF80007Fu);
+          CHECK("destination color blend", nv_cpu_blend(0xFF808080u, 0xFF808080u, 0x0306, 0, 0x8006, 0, &blended)
+              && blended == 0xFF404040u);
+          CHECK("reject unsupported blend equation", !nv_cpu_blend(0, 0, 1, 1, 0xFFFF, 0, &blended));
+        }
+    CHECK("top-left shared edge owned once",
+          nv_cpu_edge_inside(0, 0, -1, 1) && !nv_cpu_edge_inside(0, 0, 1, 1));
+    CHECK("top-left rule supports reverse winding",
+          nv_cpu_edge_inside(0, 0, 1, -1) && !nv_cpu_edge_inside(0, 0, -1, -1));
+}
+
 int main(void)
 {
     int i;
@@ -397,6 +629,8 @@ int main(void)
     test_dxt_decode();
     test_convert_linear();
     test_fvf_position();
+    test_vertex_program();
+    test_register_combiners();
 
     if (failures == 0) {
         printf("d3d8_smoke: ALL PASS\n");

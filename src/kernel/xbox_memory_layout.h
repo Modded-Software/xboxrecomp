@@ -47,6 +47,9 @@ extern "C" {
 #define XBOX_TOTAL_RAM          (64 * 1024 * 1024)  /* 64 MB (default) */
 #define XBOX_DEVKIT_RAM         (128 * 1024 * 1024) /* 128 MB (debug kit) */
 #define XBOX_GPU_RESERVED       (4 * 1024 * 1024)   /* ~4 MB for GPU */
+#define XBOX_MCPX_BASE          0xFE800000u
+#define XBOX_MCPX_APU_MMIO_END  0xFE830000u
+#define XBOX_MCPX_APU_MMIO_SIZE (XBOX_MCPX_APU_MMIO_END - XBOX_MCPX_BASE)
 
 /* Actual mapped RAM for this run. Defaults to XBOX_TOTAL_RAM; a title with a
  * devkit build calls xbox_SetTotalRam(XBOX_DEVKIT_RAM) before init. Heap top and
@@ -188,6 +191,8 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 uint32_t xbox_ContiguousAllocatedBytes(void);
+void xbox_RecordDmaTranslation(uint32_t guest_va, uint32_t physical);
+uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);

@@ -1311,7 +1311,8 @@ class FunctionTranslator:
         last_setter = None
         for insn in instructions:
             m = insn.mnemonic
-            if m in ("adc", "sbb", "stc", "clc", "cmc", "rcl", "rcr"):
+            if m in ("adc", "sbb", "stc", "clc", "cmc", "rcl", "rcr",
+                     "pushfd", "popfd", "lahf"):
                 return True
             cc = None
             if m.startswith("j") and len(m) > 1:
@@ -1338,13 +1339,20 @@ class FunctionTranslator:
         return False
 
     def _func_has_prologue(self, instructions):
-        """Check if function starts with push ebp; mov ebp, esp."""
+        """Check for a saved EBP followed by a stack-based frame setup."""
         if len(instructions) < 2:
             return False
-        return (instructions[0].mnemonic == "push" and
-                instructions[0].op_str == "ebp" and
-                instructions[1].mnemonic == "mov" and
-                instructions[1].op_str == "ebp, esp")
+        if instructions[0].mnemonic != "push" or instructions[0].op_str != "ebp":
+            return False
+        setup = instructions[1]
+        if setup.mnemonic == "mov" and setup.op_str == "ebp, esp":
+            return True
+        return (setup.mnemonic == "lea" and len(setup.operands) == 2
+                and setup.operands[0].type == "reg"
+                and setup.operands[0].reg == "ebp"
+                and setup.operands[1].type == "mem"
+                and setup.operands[1].mem_base == "esp"
+                and not setup.operands[1].mem_index)
 
     def _func_owns_a_frame(self, instructions):
         """True when the function has a frame, however it got one.
@@ -2050,7 +2058,8 @@ class FunctionTranslator:
         volatile_regs = {"eax", "ecx", "edx", "esp"}
 
         # Ensure ebp tracked if function uses 'leave' (implicit ebp)
-        if any(insn.mnemonic == "leave" for insn in instructions):
+        if {"leave", "pushal", "pushad", "popal", "popad"}.intersection(
+            insn.mnemonic for insn in instructions):
             used_regs.add("ebp")
 
         # PUSHAD/POPAD implicitly read or restore every register.

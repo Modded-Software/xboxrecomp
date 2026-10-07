@@ -26,7 +26,7 @@ two and flood the [UNIMPL] log with `prefetch`.
 import unittest
 
 from .disasm import Instruction, Operand
-from .lifter import Lifter
+from .lifter import Lifter, _EFLAGS_PRESERVE
 
 
 def _lift(mnemonic, op_str="", operands=(), address=0x00012340):
@@ -41,6 +41,40 @@ def _reg(name):
 
 
 class UnimplementedMarkerTest(unittest.TestCase):
+
+    def test_cpu_probe_instructions_have_real_stack_and_feature_semantics(self):
+        for mnemonic in ("pushfd", "popfd", "cpuid"):
+            lifter, out = _lift(mnemonic)
+            self.assertEqual(lifter.unimplemented, {})
+            self.assertNotIn("RECOMP_UNIMPL", out)
+        self.assertIn("PUSH32(esp, (g_eflags", _lift("pushfd")[1])
+        self.assertIn("POP32(esp, g_eflags);", _lift("popfd")[1])
+        self.assertIn("g_df =", _lift("popfd")[1])
+        self.assertIn("0x0383F9FFu", _lift("cpuid")[1])
+        self.assertIn("cpuid", _EFLAGS_PRESERVE)
+
+    def test_all_register_stack_operations_preserve_flags(self):
+        for mnemonic in ("pushal", "pushad", "popal", "popad"):
+            self.assertIn(mnemonic, _EFLAGS_PRESERVE)
+
+    def test_push_all_saves_original_esp_in_register_order(self):
+        for mnemonic in ("pushal", "pushad"):
+            lifter, out = _lift(mnemonic)
+            self.assertEqual(out, "{ uint32_t saved_esp = esp; "
+                             "PUSH32(esp, eax); PUSH32(esp, ecx); "
+                             "PUSH32(esp, edx); PUSH32(esp, ebx); "
+                             "PUSH32(esp, saved_esp); PUSH32(esp, ebp); "
+                             "PUSH32(esp, esi); PUSH32(esp, edi); }")
+            self.assertEqual(lifter.unimplemented, {})
+
+    def test_pop_all_discards_saved_esp(self):
+        for mnemonic in ("popal", "popad"):
+            lifter, out = _lift(mnemonic)
+            self.assertEqual(out, "POP32(esp, edi); POP32(esp, esi); "
+                             "POP32(esp, ebp); esp += 4; "
+                             "POP32(esp, ebx); POP32(esp, edx); "
+                             "POP32(esp, ecx); POP32(esp, eax);")
+            self.assertEqual(lifter.unimplemented, {})
 
     def test_unknown_mnemonic_carries_the_runtime_marker(self):
         # `daa` has no translation and no operands, so nothing about operand

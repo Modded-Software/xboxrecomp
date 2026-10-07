@@ -72,6 +72,35 @@ class EbpInitTest(unittest.TestCase):
         self.assertIn("ebp = g_ebp;", c)
         self.assertLess(c.index("uint32_t ebp = 0;"), c.index("ebp = g_ebp;"), c)
 
+    def test_biased_frame_is_published_before_calls(self):
+        image = bytes.fromhex("558d6c249083ec74e80000000083c4745dc3")
+        code = self._translate(image)
+        self.assertIn("prologue saves caller's frame", code)
+        self.assertIn("g_ebp = ebp;", code)
+        self.assertIn("g_seh_ebp = ebp;", code)
+        self.assertIn("frame stays current across calls", code)
+        self.assertLess(code.index("g_seh_ebp = ebp;"),
+                        code.index("RECOMP_ABI_CALL"))
+
+    def test_cpu_id_toggle_probe_has_balanced_flags_stack_operations(self):
+        image = bytes.fromhex("539c5889c33500002000509d9c58539d39d87405"
+                              "b8010000000fa25bc3")
+        code = self._translate(image)
+        self.assertNotIn("RECOMP_UNIMPL", code)
+        self.assertEqual(code.count("PUSH32(esp, (g_eflags"), 2)
+        self.assertEqual(code.count("POP32(esp, g_eflags);"), 2)
+        self.assertIn("int _cf", code)
+        self.assertIn("0x0383F9FFu", code)
+
+    def test_pushfd_snapshots_comparison_and_popfd_restores_branch_flags(self):
+        image = bytes.fromhex("39d89c9d78029090c3")
+        code = self._translate(image)
+        self.assertIn("g_eflags = (g_eflags & ~0x40u)", code)
+        self.assertIn("g_eflags = (g_eflags & ~0x80u)", code)
+        self.assertIn("if (((g_eflags & 0x80u) != 0))", code)
+        self.assertLess(code.index("g_eflags = (g_eflags & ~0x40u)"),
+                        code.index("PUSH32(esp, (g_eflags"))
+
 
 if __name__ == "__main__":
     unittest.main()

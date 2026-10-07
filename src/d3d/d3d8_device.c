@@ -1505,6 +1505,9 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
     (void)self; (void)Adapter; (void)DeviceType; (void)BehaviorFlags;
     HRESULT hr;
 
+    fprintf(stderr, "D3D8: CreateDevice called (focus=%p, window=%p)\n",
+            (void *)hFocusWindow, pPP ? (void *)pPP->hDeviceWindow : NULL);
+    fflush(stderr);
     if (!pPP || !ppDevice) return E_INVALIDARG;
 
     memset(&g_device_state, 0, sizeof(g_device_state));

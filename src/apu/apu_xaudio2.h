@@ -15,7 +15,7 @@ void xa2_shutdown(void);
 /* Returns 1 if XAudio2 is active. */
 int xa2_is_active(void);
 
-/* Submit interleaved stereo 16-bit samples. Returns 1 if accepted. */
+/* Submit interleaved stereo 16-bit frames: 1 accepted, 0 queue full, -1 error. */
 int xa2_submit_samples(const int16_t *samples, int num_samples);
 
 /* Get the preferred buffer size in samples. */

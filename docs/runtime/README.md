@@ -26,6 +26,11 @@ The Xbox uses a modified Direct3D 8. You need a translation layer to D3D11 (or D
 
 See: [../technical/d3d-translation.md](../technical/d3d-translation.md)
 
+For the implemented Windows command-stream backend used by StarCraft: Ghost,
+see [Native NV2A-to-D3D11 backend](nv2a-d3d11-backend.md). It covers the active
+pushbuffer path, shader/resource translation, guest-memory coherence, and the
+camera-math repair behind the verified menu scene.
+
 ### 4. Input System (`xbox_input.c`)
 
 Map Xbox controller input to Windows XInput. This is usually the simplest piece — Xbox controllers on Windows are nearly 1:1.

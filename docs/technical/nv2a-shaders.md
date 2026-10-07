@@ -1,5 +1,12 @@
 # NV2A Shader Translation
 
+**Scope:** the translators and source paths below describe the separate
+D3D8/PGRAPH implementation, not the active kernel pushbuffer backend used by
+StarCraft: Ghost. For that backend's current vertex/state-program translation,
+fixed-function lighting/texgen, texture stages, combiners, caches and
+limitations, see [Native NV2A-to-D3D11 backend](../runtime/nv2a-d3d11-backend.md).
+Do not apply the cache sizes or missing-texgen statements below to that path.
+
 Xbox games do not ship HLSL. They configure the NV2A's fixed-function combiner
 pipeline, or upload raw vertex-shader microcode. Both have to become something
 D3D11 or OpenGL will accept, and both are translated at runtime and cached.

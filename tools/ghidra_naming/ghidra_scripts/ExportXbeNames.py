@@ -6,7 +6,7 @@
 #   symbols.json      - symbol table: address/name/type/namespace/source
 #   decompiled.json   - per-function decompiled C (OPTIONAL, bounded)
 #
-# This is a Jython (Python 2.7) GhidraScript. Run via analyzeHeadless -postScript.
+# This is a Jython GhidraScript. Run via analyzeHeadless -postScript.
 #
 # Script args (all optional, positional):
 #   arg0  outDir        : output directory (default: program executable dir or cwd)
