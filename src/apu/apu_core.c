@@ -388,37 +388,29 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 path: submit the EP/DSP mixdown already sitting in frame_buf.
+     * Do NOT memset it: the GP/EP output for this window was memcpy'd here by
+     * ep_sink_samples()/dsp_frame_stub(). Wiping it left only the software
+     * mixer audible -- Bink FMV (software buffer) worked while all VP/DSP game
+     * audio was silent. Software voices and the test tone are overdubbed. */
     if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
+        int num_samples = MIXER_FRAME_SAMPLES;  /* one EP/DSP window */
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < num_samples; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.frame_buf[i][0] = s;
+                d->monitor.frame_buf[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
         }
 
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        if (!g_audio_muted)
+            mixer_render(d->monitor.frame_buf, num_samples);
+
+        xa2_submit_samples((const int16_t *)d->monitor.frame_buf, num_samples);
         return;
     }
 
