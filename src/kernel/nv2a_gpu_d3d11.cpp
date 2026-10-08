@@ -2204,7 +2204,7 @@ static bool clear_target_rectangle(const Nv2aGpuDraw &state, Surface *surface, D
     return true;
 }
 
-extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vertices, uint32_t count)
+extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, uint32_t count)
 {
     GpuTimer draw_timer(gpu_timing.draw);
     GpuTimer phase_timer(gpu_timing.draw_setup);
@@ -2506,13 +2506,16 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vert
                     !nv_cpu_finite(vertices[vertex].texture[stage][component])) {
                     static uint32_t shown;
                     if (shown++ < 16)
-                        std::fprintf(stderr, "[TEXCOORD] reject stage %u vertex %u comp %u tex=(%.3f %.3f %.3f %.3f) texgen=(%u %u %u %u) matrix_en %u mode %u fmt %08X\n",
+                        std::fprintf(stderr, "[TEXCOORD] sanitize stage %u vertex %u comp %u tex=(%.3f %.3f %.3f %.3f) texgen=(%u %u %u %u) matrix_en %u mode %u fmt %08X\n",
                             stage, vertex, component,
                             vertices[vertex].texture[stage][0], vertices[vertex].texture[stage][1],
                             vertices[vertex].texture[stage][2], vertices[vertex].texture[stage][3],
                             state->texgen[stage][0], state->texgen[stage][1], state->texgen[stage][2], state->texgen[stage][3],
                             state->texture_matrix_enable[stage], mode, binding.format);
-                    return reject("nonfinite texture coordinate");
+                    /* Hardware does not reject a NaN/inf texcoord: it samples
+                     * texel 0. Dropping the whole batch deletes geometry, so
+                     * fold the bad component to 0 and keep drawing. */
+                    vertices[vertex].texture[stage][component] = 0.0f;
                 }
             if ((mode == 1 || mode == 2) && vertices[vertex].texture[stage][3] == 0) return reject("zero projective texture coordinate");
         }

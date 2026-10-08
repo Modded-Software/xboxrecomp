@@ -415,20 +415,17 @@ _EFLAGS_SETTERS = frozenset({
     "bt", "bts", "btr", "btc",  # Bit test sets CF
     "cmpxchg",           # Compare-and-exchange sets ZF
     "xadd",              # Exchange-and-add sets flags
+    # popfd REPLACES every flag with the word it pops into g_eflags. It is a
+    # setter, not a preserve: a jcc after it must read g_eflags, not the
+    # comparison before it. See _make_condition's "popfd" branch.
+    "popfd",
 })
 
 # Instructions with undefined/unpredictable flags (clear tracking)
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
-    "rdtsc", "cpuid",      # Special instructions
+    "rdtsc",               # Special instruction
     "lock xadd",           # Lock prefix - complex flag behavior
-    # popfd REPLACES every flag with whatever was pushed. Its flags are not
-    # architecturally undefined -- they are simply not knowable from the
-    # instruction stream -- but the tracking action is the same: whatever the
-    # last comparison left is gone, and a jcc after it must not be resolved
-    # from that comparison. It used to sit in _EFLAGS_PRESERVE, next to
-    # pushfd, which does read-and-preserve and does belong there.
-    "popfd",
 })
 
 # SSE compare predicates, by the CMPPS/CMPSS immediate. The named forms
@@ -464,8 +461,11 @@ _EFLAGS_PRESERVE = frozenset({
     # loop still answers the jcc after it.
     "loop", "loope", "loopne",
     # pushfd READS the flags and leaves them alone, so it belongs here.
-    # popfd does NOT -- see _FLAGS_UNDEFINED.
+    # popfd does NOT -- see _EFLAGS_SETTERS.
     "pushfd", "pushal", "pushad", "popal", "popad",
+    # cpuid writes EAX/EBX/ECX/EDX but never EFLAGS, so a comparison before
+    # it still answers a jcc after it.
+    "cpuid",
     "sgdt", "ljmp", "sfence",
     # SSE scalar float
     "movss", "movsd",
@@ -559,6 +559,48 @@ def _make_condition(jcc, flag_setter, flag_ops):
             return f"({dest} == 0)", desc
         if jcc in ("jne", "jnz"):
             return f"({dest} != 0)", desc
+        return None
+
+    # ── popfd: the flags just came off the stack into g_eflags ──
+    #
+    # popfd replaces every flag with the word admitted into g_eflags, so a
+    # following jcc/setcc/cmovcc must read that register rather than re-derive
+    # a condition from the operands of whatever set the flags before. Bits are
+    # the architectural layout: CF=0 PF=2 ZF=6 SF=7 DF=10 OF=11.
+    #
+    # The MSVC CPUID-support probe is `pushfd; pop eax; xor eax,0x200000;
+    # push eax; popfd; pushfd; pop eax; ...; cmp eax,ebx; je` -- with popfd a
+    # no-op the two words were always equal and cpuid was never reached.
+    if flag_setter == "popfd":
+        cf = "(g_eflags & 0x1u) != 0"
+        pf = "(g_eflags & 0x4u) != 0"
+        zf = "(g_eflags & 0x40u) != 0"
+        sf = "(g_eflags & 0x80u) != 0"
+        of = "(g_eflags & 0x800u) != 0"
+        ncf = "(g_eflags & 0x1u) == 0"
+        nzf = "(g_eflags & 0x40u) == 0"
+        nsf = "(g_eflags & 0x80u) == 0"
+        nof = "(g_eflags & 0x800u) == 0"
+        popfd_cond = {
+            "je": zf, "jz": zf,
+            "jne": nzf, "jnz": nzf,
+            "jb": cf, "jnae": cf, "jc": cf,
+            "jae": ncf, "jnb": ncf, "jnc": ncf,
+            "jbe": f"({cf} || {zf})", "jna": f"({cf} || {zf})",
+            "ja": f"({ncf} && {nzf})", "jnbe": f"({ncf} && {nzf})",
+            "js": sf, "jns": nsf,
+            "jp": pf, "jpe": pf,
+            "jnp": "(g_eflags & 0x4u) == 0", "jpo": "(g_eflags & 0x4u) == 0",
+            "jl": f"(({sf}) != ({of}))", "jnge": f"(({sf}) != ({of}))",
+            "jge": f"(({sf}) == ({of}))", "jnl": f"(({sf}) == ({of}))",
+            "jle": f"({zf} || ({sf}) != ({of}))",
+            "jng": f"({zf} || ({sf}) != ({of}))",
+            "jg": f"({nzf} && ({sf}) == ({of}))",
+            "jnle": f"({nzf} && ({sf}) == ({of}))",
+        }
+        expr = popfd_cond.get(jcc)
+        if expr:
+            return f"({expr})", desc
         return None
 
     # A cmp/test that is not fused with its jcc snapshots its operands into
@@ -1326,6 +1368,13 @@ class Lifter:
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
+        # Flag state of the instruction most recently lifted, for instructions
+        # whose semantics depend on it (pushfd materialises the comparison's
+        # flags, and popfd only avoids re-deriving them when it is the setter).
+        # lift_basic_block publishes it here before each lift_instruction call;
+        # a bare Lifter() leaves it empty.
+        self.last_flag_setter = None
+        self.last_flag_ops = []
         # Within the current basic block: {reg: (width, signed)} for a register
         # just loaded by movzx/movsx from a 1- or 2-byte source. Lets a later
         # `cmp reg, imm` snapshot at the narrow width so it merges with a
@@ -1718,6 +1767,66 @@ class Lifter:
                 "  eax = (uint32_t)_tsc; edx = (uint32_t)(_tsc >> 32); }"
                 "  /* rdtsc */",
             ]
+
+        # ── CPU identity ──
+        #
+        # MSVC detects MMX/SSE with `mov eax,1; cpuid; test edx, 0x800000` and
+        # installs its fast blitters only when the bit is set. Leaving cpuid as
+        # an unimpl no-op left EDX reading zero, so every SIMD path stayed on
+        # the scalar C fallback. Report the console's real CPU: a 733 MHz Intel
+        # Pentium III "Coppermine", family 6 model 8 stepping 3.
+        #
+        # EAX is the input leaf; all four registers are outputs. Leaf 1 EDX
+        # 0x0383F9FF is a real Coppermine feature word: FPU(0) TSC(4) CX8(8)
+        # SEP(11) CMOV(15) MMX(23) FXSR(24) SSE(25) set, SSE2(26) and HTT(28)
+        # clear. ECX is zero -- extended features postdate Coppermine.
+        if m == "cpuid":
+            return [
+                "{ switch ((uint32_t)eax) {",
+                "  case 0x00000000u:",
+                "    eax = 0x00000003u; ebx = 0x756E6547u;"
+                " edx = 0x49656E69u; ecx = 0x6C65746Eu; break;",
+                "  case 0x00000001u:",
+                "    eax = 0x00000683u; ebx = 0u; ecx = 0u;"
+                " edx = 0x0383F9FFu; break;",
+                "  case 0x80000000u:",
+                "    eax = 0x80000004u; ebx = 0u; ecx = 0u; edx = 0u; break;",
+                "  default:",
+                "    eax = 0u; ebx = 0u; ecx = 0u; edx = 0u; break;",
+                "} } /* cpuid */",
+            ]
+
+        # ── Push/pop the flags ──
+        #
+        # pushfd materialises the tracked flags into g_eflags and pushes it.
+        # The per-bit updates reuse the exact conditions a jcc would read, so a
+        # comparison before the push is what lands on the stack. Bits the model
+        # does not track (PF, AF) keep whatever g_eflags already had.
+        #
+        # popfd replaces EFLAGS with the word it pops. Keeping it in g_eflags
+        # and marking it the tracked setter lets a following jcc resolve from
+        # the register (see _make_condition's "popfd" branch). Only the bits
+        # ring-0 may write survive the mask, and bit 21 (ID) must survive, or
+        # the MSVC CPUID-support probe never sees its toggle.
+        if m in ("pushfd", "pushf"):
+            out = []
+            fs, fo = self.last_flag_setter, self.last_flag_ops
+            if fs and fs != "popfd":
+                for jcc, bit in (("je", 0x40), ("js", 0x80), ("jp", 0x04),
+                                 ("jb", 0x01), ("jo", 0x800)):
+                    probe = _make_condition(jcc, fs, fo)
+                    cond = probe[0] if probe else "0"
+                    out.append(f"g_eflags = (g_eflags & ~0x{bit:X}u) | "
+                               f"(({cond}) ? 0x{bit:X}u : 0u);")
+            out.append("PUSH32(esp, (g_eflags & ~0x2u) | 0x2u); /* pushfd */")
+            return out
+        if m in ("popfd", "popf"):
+            out = ["POP32(esp, g_eflags);",
+                   "g_eflags = (g_eflags & 0x00254FD5u) | 0x2u;",
+                   "g_df = (g_eflags >> 10) & 1u;"]
+            if self.needs_cf:
+                out.append("_cf = g_eflags & 1u;")
+            return out
 
         # ── Bit scan ──
         # Index of the lowest (bsf) or highest (bsr) set bit. When the source
@@ -4050,6 +4159,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
             results = lifter._lift_neg(
                 curr, curr.operands, preserve_carry=preserve)
         else:
+            # Publish the tracked flags for instructions that need them: pushfd
+            # turns the last comparison into g_eflags, and popfd must see that it
+            # is itself the setter so it does not re-derive the value.
+            lifter.last_flag_setter = last_flag_setter
+            lifter.last_flag_ops = last_flag_ops
             results = lifter.lift_instruction(insns[i])
             # A REPE/REPNE compare whose count is zero leaves EFLAGS alone,
             # but `_flags` would keep whatever it last held -- 0 on entry --

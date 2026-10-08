@@ -72,14 +72,19 @@ void mcpx_debug_end_frame(void) {}
  * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
+extern size_t g_xbox_total_ram, g_xbox_map_size;
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    size_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
     if (a < xbox_ContiguousAllocatedBytes())
         return g_apu_ram_ptr + 0x80000000u + a;
+    /* Heap RAM can sit above 64 MB (RECOMP_HEAP_BASE): no retail wrap there. */
+    if (a < mapped)
+        return g_apu_ram_ptr + a;
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
 }
 

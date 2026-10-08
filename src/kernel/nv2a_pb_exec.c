@@ -148,9 +148,27 @@ static uint32_t dma_resolve(uint32_t offset)
     static int clash = -1;
     if (clash < 0) clash = getenv("RECOMP_APU_CLASH_TRACE") != NULL;
     int apu_touched = clash && xbox_ApuContigTouched(offset);
+    /* A number the title translated as ordinary RAM (MmGetPhysicalAddress)
+     * names RAM, even when a live window block owns the same number. The heap
+     * base (0x00F80000) is below the 64 MB window, so heap VAs and window
+     * offsets share numbers; MmGetPhysicalAddress is the title saying which one
+     * the GPU was handed. Promoting randoms past this reads the window's
+     * unrelated bytes -- the title's texture (e.g. a character face) decodes
+     * black while the rest of the body, whose address is unambiguous, is fine.
+     * ponytail: last-writer-wins per 4 KB page; per-access tagging if a title
+     * ever needs both banks on one page. */
+    static int bank_ram = -1;
+    if (bank_ram < 0)
+        bank_ram = getenv("RECOMP_DMA_BANK_RAM") != NULL;
+    if (bank_ram && xbox_DmaBankOf(offset) == 1)
+        return offset;
+    /* Ownership by *range*, not by block head: a vertex array's attributes sit
+     * at +offset within one allocation (e.g. position at 0x...000, texcoord at
+     * 0x...01C). The head test promoted only the first and left the rest as raw
+     * physical addresses, so they fetched unrelated bytes -- garbage normals,
+     * magenta diffuse, NaN UVs -- while the position looked fine. */
     if (promote && !(skip_apu && xbox_ContigApuOwned(offset)) &&
-            offset < XBOX_CONTIG_SIZE &&
-            xbox_ContiguousBlockSize(XBOX_CONTIG_BASE + offset)) {
+            xbox_ContigOwnsOffset(offset)) {
         if (apu_touched)
             fprintf(stderr, "[GPU-CLASH] offset=0x%08X -> promoted window "
                     "0x%08X (APU wrote this page) head=%d blk=%u bank=%d\n", offset,
@@ -158,6 +176,27 @@ static uint32_t dma_resolve(uint32_t offset)
                     xbox_ContiguousOwnsHead(offset),
                     xbox_ContiguousBlockSize(XBOX_CONTIG_BASE + offset),
                     xbox_DmaBankOf(offset));
+        /* RECOMP_DMA_AMBIG: the number is both a window offset and something
+         * the title translated as ordinary RAM (or a live heap VA). Promoting
+         * it moves the GPU to different bytes than the title wrote. */
+        {
+            static int ambig = -1;
+            if (ambig < 0) ambig = getenv("RECOMP_DMA_AMBIG") != NULL;
+            if (ambig) {
+                static unsigned long an;
+                uint32_t heap = xbox_HeapBlockSize(offset);
+                int bank = xbox_DmaBankOf(offset);
+                if (heap || bank == 1) {
+                    void xbox_DumpArenas(uint32_t, uint32_t);
+                    if (an < 256) {
+                        fprintf(stderr, "[DMA-AMBIG] 0x%08X heap=%u bank=%d\n",
+                                offset, heap, bank);
+                        xbox_DumpArenas(offset, 16);
+                    }
+                    an++;
+                }
+            }
+        }
         return XBOX_CONTIG_BASE + offset;
     }
     if (!surface_hits_image(offset, 1)) {

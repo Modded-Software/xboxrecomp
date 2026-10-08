@@ -111,7 +111,7 @@ typedef struct Nv2aGpuDraw {
 	float light_spot_direction[8][4];    /* xyz = direction, w = spot cone parameter */
 } Nv2aGpuDraw;
 
-int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vertices, uint32_t count);
+int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, uint32_t count);
 /* 1 = queued, 0 = use CPU clear, -1 = native resource failure. */
 int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t color, uint32_t depth);
 int nv2a_gpu_execute_state(const uint32_t program[136][4], const uint32_t valid[136], uint32_t start,

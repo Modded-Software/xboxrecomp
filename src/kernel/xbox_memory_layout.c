@@ -50,6 +50,14 @@ static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
 size_t g_xbox_total_ram = XBOX_DEVKIT_RAM;
 size_t g_xbox_map_size = 0;   /* 0 = same as RAM */
 
+/* Heap bump base. RECOMP_HEAP_BASE lifts it above the contiguous window
+ * (0x04000000): MmGetPhysicalAddress is identity for ordinary RAM, so a heap VA
+ * below XBOX_CONTIG_SIZE is the same number as a window offset and every DMA
+ * consumer (GPU dma_resolve, APU, OHCI) has to guess which one it means. Above
+ * the window the number alone says "ordinary RAM". Read in MemoryLayoutInit. */
+static uint32_t g_heap_base = XBOX_HEAP_BASE;
+static uint32_t g_heap_next = XBOX_HEAP_BASE;
+
 void xbox_SetTotalRam(size_t bytes)
 {
     g_xbox_total_ram = bytes;
@@ -1838,6 +1846,16 @@ RECOMP_TLS uint32_t g_ebp = 0;
  * in different lifted bodies of the same guest routine. */
 RECOMP_TLS int g_df = 0;
 
+/* EFLAGS, as a real register for pushfd/popfd. The lifter keeps every ordinary
+ * flag comparison in static snapshots; this word exists only for the two
+ * instructions that save/restore the whole flag set. pushfd materialises the
+ * tracked comparison into it and pushes it; popfd loads it and a following jcc
+ * reads it. Bit 21 (ID) is the CPUID-support probe's toggle, so the popfd mask
+ * must let it through. Thread-local for the same reason g_df is. Reset to the
+ * architectural 0x2 (bit 1 always set) so a pushfd before any tracked setter
+ * still pushes something well-formed. */
+RECOMP_TLS uint32_t g_eflags = 0x2;
+
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
@@ -2741,9 +2759,21 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     /* Initialize the dynamic heap. */
+    {
+        const char *hb = getenv("RECOMP_HEAP_BASE");
+        uint32_t want = hb && *hb ? (uint32_t)strtoul(hb, NULL, 0) : 0;
+        want = (want + 0xFFFu) & ~0xFFFu;
+        if (want > XBOX_HEAP_BASE && want < XBOX_HEAP_TOP)
+            g_heap_base = want;
+        else if (want)
+            fprintf(stderr, "  WARNING: RECOMP_HEAP_BASE=0x%08X outside "
+                    "0x%08X..0x%08X, ignored\n", want, XBOX_HEAP_BASE,
+                    XBOX_HEAP_TOP);
+        g_heap_next = g_heap_base;
+    }
     fprintf(stderr, "  Heap: %u MB at Xbox VA 0x%08X-0x%08X\n",
-            (unsigned)((XBOX_HEAP_TOP - XBOX_HEAP_BASE) / (1024 * 1024)),
-            XBOX_HEAP_BASE, XBOX_HEAP_TOP);
+            (unsigned)((XBOX_HEAP_TOP - g_heap_base) / (1024 * 1024)),
+            g_heap_base, XBOX_HEAP_TOP);
 
     /*
      * Map mirror views of the 64 MB region.
@@ -3067,8 +3097,6 @@ ptrdiff_t xbox_GetMemoryOffset(void)
  * Returns Xbox VAs within the mapped region so MEM32() works correctly.
  * No free support (bump-only for now).
  */
-static uint32_t g_heap_next = XBOX_HEAP_BASE;
-
 static int g_heap_alloc_count = 0;
 
 /* Block table backing xbox_HeapFree. A bump pointer alone never reclaims,
@@ -3787,8 +3815,8 @@ g_heap_blocks[i].free = 0;
 
     if (result + size > XBOX_HEAP_TOP) {
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
-                size, g_heap_next - XBOX_HEAP_BASE,
-                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
+                size, g_heap_next - g_heap_base,
+                (unsigned)(XBOX_HEAP_TOP - g_heap_base));
         /* Who ate the heap? Group live blocks by size -- an exhausted heap is
          * nearly always one request size repeated, and the count names it. */
         {
@@ -3838,8 +3866,8 @@ g_heap_blocks[i].free = 0;
     if (g_heap_alloc_count <= 32 || (g_heap_alloc_count % 512) == 0) {
         fprintf(stderr, "  [HEAP] #%d: size=%u align=%u → 0x%08X..0x%08X (used %u/%u)\n",
                 g_heap_alloc_count, size, alignment, result, result + size,
-                g_heap_next - XBOX_HEAP_BASE,
-                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
+                g_heap_next - g_heap_base,
+                (unsigned)(XBOX_HEAP_TOP - g_heap_base));
         fflush(stderr);
     }
 
