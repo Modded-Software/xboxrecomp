@@ -152,6 +152,10 @@ typedef struct {
     int      index;
     int      periodic_seen;
     int      ple_seen;
+    /* Set once the pad's interrupt endpoint has delivered a report, i.e. the
+     * interrupt pipe is open. The IRQL holdoff exists only to survive that
+     * opening; after it, a stuck guest IRQL must not gate the pad. */
+    int      pad_live;
     /* Bumped every time the driver writes HcInterruptStatus. The interrupt
      * thread watches it to tell a source nobody is servicing from one that
      * is simply busy -- see the delivery loop. */
@@ -625,6 +629,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             uint8_t rep[32];
             s_n_report++;
             int n = usb_gamepad_report(pad, rep, (int)sizeof rep);
+            hc->pad_live = 1;   /* pipe open: the IRQL holdoff is over */
             if (n > len) n = len;
             if (n > 0 && guest_ptr(cbp, (uint32_t)n))
                 memcpy(guest_ptr(cbp, (uint32_t)n), rep, (size_t)n);
@@ -1194,7 +1199,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * asserted anyway. The common case still holds the ISR out of the
          * guest's critical section; the pathological case costs a delay
          * instead of the device. */
-        if (xbox_IrqlBlocksInterrupts() && ++held_off <= OHCI_IRQ_HOLDOFF) {
+        if (!hc->pad_live && xbox_IrqlBlocksInterrupts()
+                && ++held_off <= OHCI_IRQ_HOLDOFF) {
             if (!held_off_warned) {
                 held_off_warned = 1;
                 fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "

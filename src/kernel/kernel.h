@@ -796,7 +796,7 @@ BOOLEAN __stdcall xbox_HalIsResetOrShutdownPending(void);
 
 KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeGetCurrentIrql(void);
-/* Non-zero while any thread holds IRQL at or above DISPATCH_LEVEL.
+/* Non-zero while the processor is at or above DISPATCH_LEVEL.
  * Device models ask before delivering an interrupt; raising IRQL masks the
  * line for the whole processor on hardware, not just for one thread. */
 int     xbox_IrqlBlocksInterrupts(void);

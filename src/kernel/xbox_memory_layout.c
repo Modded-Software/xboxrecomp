@@ -967,10 +967,49 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* NV2A register aperture accessor, used by the software-method dispatcher,
+ * the pushbuffer executor and the ack thread. */
+volatile uint32_t *xbox_Nv2aRegisterPointer(uint32_t offset, uint32_t bytes)
+{
+    if (!g_nv2a_memory || !bytes || (offset & 3u) ||
+            (uint64_t)offset + bytes > XBOX_NV2A_SIZE) {
+        fprintf(stderr, "[NV2A] unavailable register extent: 0x%08X + %u\n",
+                offset, bytes);
+        return NULL;
+    }
+    return (volatile uint32_t *)((uint8_t *)g_nv2a_memory + offset);
+}
+
+void xbox_Nv2aAcknowledgeHandshakes(void)
+{
+    for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+        volatile uint32_t *r = xbox_Nv2aRegisterPointer(NV2A_ACK[i].offset, 4);
+        if (!r) {
+            fflush(stderr);
+            _Exit(EXIT_FAILURE);
+        }
+        if (*r & NV2A_ACK[i].busy_mask)
+            *r &= ~NV2A_ACK[i].busy_mask;
+    }
+}
+
+volatile int g_ack_phase;   /* diagnostic: where the ack thread is, for the watchdog */
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        g_ack_phase = 1;
+        /* Overlay handshake. D3DDevice::EnableOverlay (0x2C4B10) sets
+         * [0x8704]=1 and then spins at 0x2C4B31 until [0x8700] reads back 0;
+         * [0x8100] is the overlay command latch. Nothing here drives an
+         * overlay, so both belong at zero. Without this the teardown at the
+         * end of a video (tSequence::FreeVideoAndResetGamma -> VIDRender::
+         * exitOverlay) hangs forever, which is exactly where the Blizzard
+         * logo handed off to the Nihilistic logo. */
+        if (regs[0x008704 / 4] & 1u)
+            regs[0x008700 / 4] = 0;
+        regs[0x008100 / 4] = 0;
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
@@ -1030,6 +1069,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 {
                     extern void nv2a_pb_scan(uint32_t, uint32_t);
                     extern void nv2a_pb_scan_report(void);
+                    extern uint32_t nv2a_pb_last_jump(void);
                     static DWORD last_report;
 
                     /* DMA_PUT holds a PHYSICAL address -- Xbox D3D writes
@@ -1057,27 +1097,19 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * the first lap and exact afterwards, and scanning a
                      * little short of the true end costs the same commands
                      * that were being lost anyway. */
-                    static uint32_t put_lo, put_hi;
-                    if (!put_lo || put < put_lo) put_lo = put;
-                    if (put > put_hi) put_hi = put;
-                    if (last_put && put > last_put) {
-                        nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                     XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
-                    } else if (last_put && put < last_put) {
-                        if (put_hi > last_put)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                        if (put > put_lo)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
-                            static unsigned wraps;
-                            if (wraps++ < 8)
-                                fprintf(stderr, "  [NV2A] pushbuffer wrapped "
-                                        "(0x%08X -> 0x%08X)\n", last_put, put);
-                        }
+                    /* Walk GET -> PUT the way the hardware does, following
+                     * every JUMP (including into secondary command buffers)
+                     * and CALL. This replaces the PUT-range bracketing and
+                     * the wrap/jump guessing: the ring wrap is just another
+                     * jump, so nothing is lost across the seam, and batches
+                     * whose real commands live in a jumped-to buffer are now
+                     * executed instead of dropped (which left stale vertex
+                     * arrays -> prim-0 / nonfinite-UV rejects). */
+                    extern void nv2a_pb_run(uint32_t);
+                    if (put != last_put) {
+                        g_ack_phase = 8;
+                        nv2a_pb_run(XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu));
+                        g_ack_phase = 9;
                     }
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
@@ -1102,6 +1134,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     volatile uint32_t *get =
                         (volatile uint32_t *)((char *)regs
                                               + NV2A_USER_DMA_GET);
+                    g_ack_phase = 10;
                     *get = put;
                 }
                 last_put = put; last_put_ms = now_ms;
@@ -1718,6 +1751,7 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
             fprintf(stderr, " %08X",
                     g_icall_trace[(g_icall_trace_idx + k) & 15]);
         fprintf(stderr, "\n");
+        fprintf(stderr, "  ack phase: %d\n", g_ack_phase);
     }
     /* Guest globals worth seeing at the moment of the hang.
      *
@@ -1870,7 +1904,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             0x00800000,             /* 8 MB - above typical PEB/TEB region */
             0x01000000,             /* 16 MB */
             0x02000000,             /* 32 MB */
-            0x10000000,             /* 256 MB */
+            /* 0x10000000 absent on purpose: it lands the tiled alias on
+             * exactly 4 GB, which MapViewOfFileEx rejects (ERROR_INVALID_ADDRESS)
+             * -- the title's first surface write then faults and the screen
+             * stays black. */
+            0x18000000,             /* 384 MB */
             0,                      /* sentinel - let OS choose */
         };
 
@@ -1960,6 +1998,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
 #endif
 
+        size_t tiled_size = xbox_TiledApertureSize();
+        if (tiled_size > XBOX_CONTIG_SIZE)
+            tiled_size = XBOX_CONTIG_SIZE;
         const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
         for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
@@ -1973,6 +2014,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             if (g_memory_base) {
                 if (try_bases[i] != 0 && (uintptr_t)g_memory_base != try_bases[i]) {
                     /* OS gave us a different address, retry */
+                    UnmapViewOfFile(g_memory_base);
+                    g_memory_base = NULL;
+                    continue;
+                }
+                /* A base is only usable if the tiled aperture it implies can
+                 * actually be mapped: every guest aperture sits at its guest
+                 * address plus this base, and one whose alias lands on exactly
+                 * 4 GB (base +0x10000000) is rejected by the file view even
+                 * though a plain reserve there succeeds. Keep the first
+                 * candidate whose tiled alias maps, or the title renders
+                 * through an unmapped window and the screen stays black. */
+                if (!xbox_TiledAliasMappable((uintptr_t)g_memory_base, tiled_size)) {
+                    fprintf(stderr, "  RAM base candidate %p rejected: tiled "
+                            "alias not mappable\n", g_memory_base);
                     UnmapViewOfFile(g_memory_base);
                     g_memory_base = NULL;
                     continue;

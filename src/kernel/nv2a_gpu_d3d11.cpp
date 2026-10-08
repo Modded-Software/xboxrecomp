@@ -2502,7 +2502,18 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, const Nv2aGpuVertex *vert
         if (mode == 9 && (binding.cube || binding.linear)) return reject("dot texture dimensionality");
         for (uint32_t vertex = 0; !dependent && !state->vertex_program && vertex < count; vertex++) {
             for (uint32_t component = 0; component < 4; component++)
-                if (!nv_cpu_finite(vertices[vertex].texture[stage][component])) return reject("nonfinite texture coordinate");
+                if (state->texgen[stage][component] == 0 &&
+                    !nv_cpu_finite(vertices[vertex].texture[stage][component])) {
+                    static uint32_t shown;
+                    if (shown++ < 16)
+                        std::fprintf(stderr, "[TEXCOORD] reject stage %u vertex %u comp %u tex=(%.3f %.3f %.3f %.3f) texgen=(%u %u %u %u) matrix_en %u mode %u fmt %08X\n",
+                            stage, vertex, component,
+                            vertices[vertex].texture[stage][0], vertices[vertex].texture[stage][1],
+                            vertices[vertex].texture[stage][2], vertices[vertex].texture[stage][3],
+                            state->texgen[stage][0], state->texgen[stage][1], state->texgen[stage][2], state->texgen[stage][3],
+                            state->texture_matrix_enable[stage], mode, binding.format);
+                    return reject("nonfinite texture coordinate");
+                }
             if ((mode == 1 || mode == 2) && vertices[vertex].texture[stage][3] == 0) return reject("zero projective texture coordinate");
         }
         if (!binding.source_bytes) return reject("missing texture data");

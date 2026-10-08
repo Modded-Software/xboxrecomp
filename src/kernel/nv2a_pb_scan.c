@@ -43,6 +43,13 @@ static int s_seen_count;
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 static uint32_t s_tot_calls;
+/* Target of the last ring JUMP (not a CALL's) seen by pb_walk: the true start
+ * of the pushbuffer ring. xbox_memory_layout uses it to find the seam on a
+ * wrap instead of guessing the bounds from the PUT range. */
+static uint32_t s_last_jump;
+/* Address of the parameter word most recently handed to the executor: lets a
+ * handler that rejects an out-of-batch command dump the surrounding stream. */
+uint32_t g_pb_current_va;
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
@@ -177,10 +184,17 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                              : (w & 0x1FFFFFFCu);
+            uint32_t tgt = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
             (*jumps)++;
-            if (!in_call)
+            if (!in_call) {
+                /* Record only a backward jump as the ring wrap; a forward
+                 * jump is a mid-ring skip and must not be mistaken for the
+                 * end of the lap (it would poison the wrap handler). */
+                if (tgt <= va)
+                    s_last_jump = tgt;
                 break;                        /* the ring: a jump ends it */
-            va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+            }
+            va = tgt;
             end_va = va + 0x400000u;
             continue;
         }
@@ -209,14 +223,18 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
-                if (s_exec_enabled)
+                if (s_exec_enabled) {
+                    g_pb_current_va = va;
                     nv2a_pb_exec_method(subch, m,
                                         *(const uint32_t *)(mem + va));
+                }
                 va += 4;
                 words++;
             }
             continue;
         }
+        { static unsigned n; if (n++ < 32)
+            fprintf(stderr, "[PB-UNK] va %08X word %08X (end %08X)\n", (unsigned)(va - 4u), w, end_va); }
         (*unknown)++;
     }
     return words;
@@ -236,10 +254,96 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
+    s_last_jump = 0;
     words = pb_walk(start_va, end_va, 0, &jumps, &unknown);
 
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+}
+
+uint32_t nv2a_pb_last_jump(void)
+{
+    return s_last_jump;
+}
+
+/* Walk from the GPU's GET to the title's PUT the way the hardware does:
+ * follow every JUMP (into or out of the ring) and CALL (one return level),
+ * RETURN restores the saved PC, and stop exactly when GET reaches PUT.
+ *
+ * `s_get` persists across kicks so a jump into a secondary command buffer
+ * (D3D8 submits the real BEGIN/vertex-array/indices there) and back is
+ * stitched correctly instead of walking a fixed address range. The ring wrap
+ * is just another jump, so the PUT-bracket guesswork and s_last_jump are not
+ * needed here. PUT only advances on command boundaries, so a packet is never
+ * split and the method loop may consume all of its parameters. */
+void nv2a_pb_run(uint32_t put_va)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    static uint32_t s_get;
+    uint32_t va, ret = 0;
+    uint32_t budget = 0x200000u;
+
+    /* The first kick only establishes where the ring starts; the command
+     * there is executed on the next kick, exactly as the old
+     * scan(last_put, put) did (it set last_put on the first change). Without
+     * this the ring's first submission -- the GPU bootstrap -- was skipped
+     * and the guest hung waiting for it. */
+    if (!s_get) {
+        s_get = put_va;
+        return;
+    }
+    va = s_get;
+
+    if (s_exec_enabled < 0)
+        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+
+    while (va != put_va && budget) {
+        uint32_t w = *(const uint32_t *)(mem + va);
+        va += 4;
+        budget--;
+
+        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {   /* JUMP */
+            uint32_t t = (w & 3u) == 1u ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
+            va = XBOX_CONTIG_BASE | (t & 0x0FFFFFFFu);
+            continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u) {                     /* RETURN */
+            if (ret) { va = ret; ret = 0; }
+            /* A RETURN with no pending CALL is a no-op (the old walker
+             * ignored it at top level); taking it to address 0 walked the
+             * fake TIB and executed garbage, hanging the guest at boot. */
+            continue;
+        }
+        if ((w & 3u) == 2u) {                                       /* CALL */
+            ret = va;
+            va = XBOX_CONTIG_BASE | (w & 0x0FFFFFFCu);
+            continue;
+        }
+        if ((w & 0x00030003u) == 0u) {                              /* methods */
+            uint32_t count = (w >> 18) & 0x7FFu;
+            uint32_t subch = (w >> 13) & 7u;
+            uint32_t method = w & 0x1FFCu;
+            int noninc = (w & 0xE0000000u) == 0x40000000u;
+            for (uint32_t i = 0; i < count; i++, va += 4) {
+                uint32_t m = noninc ? method : method + i * 4;
+                note(subch, m);
+                if (s_exec_enabled) {
+                    g_pb_current_va = va;
+                    nv2a_pb_exec_method(subch, m, *(const uint32_t *)(mem + va));
+                }
+            }
+            continue;
+        }
+        {
+            static unsigned n;
+            if (n++ < 32)
+                fprintf(stderr, "[PB-UNK] va %08X word %08X (put %08X)\n",
+                        (unsigned)(va - 4u), w, put_va);
+        }
+    }
+    if (!budget)
+        fprintf(stderr, "  [PB] walk budget exhausted at %08X, resync to PUT %08X\n", va, put_va);
+    s_get = put_va;
 }

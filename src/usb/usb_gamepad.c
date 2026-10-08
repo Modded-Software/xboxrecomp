@@ -594,12 +594,28 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
                 XBOX_INPUT_STATE probe;
                 DWORD rc = xbox_InputGetState(0, &probe);
                 last = now;
-                fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
-                        "InputGetState=%lu buttons=0x%04X\n",
-                        getenv("RECOMP_KEYBOARD") ? 1 : 0,
+                fprintf(stderr, "  [INPUT] t=%lu kbd_env=%s window_has_RETURN=%d "
+                        "window_has_SPACE=%d InputGetState=%lu buttons=0x%04X "
+                        "A=%u B=%u X=%u Y=%u BL=%u WH=%u LT=%u RT=%u "
+                        "LX=%d LY=%d RX=%d RY=%d\n",
+                        now,
+                        getenv("RECOMP_KEYBOARD") ? getenv("RECOMP_KEYBOARD") : "(unset)",
                         xbox_FramebufferKeyDown(0x0D),
+                        xbox_FramebufferKeyDown(0x20),
                         (unsigned long)rc,
-                        rc == 0 ? probe.Gamepad.wButtons : 0);
+                        rc == 0 ? probe.Gamepad.wButtons : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[0] : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[1] : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[2] : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[3] : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[4] : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[5] : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[6] : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[7] : 0,
+                        rc == 0 ? probe.Gamepad.sThumbLX : 0,
+                        rc == 0 ? probe.Gamepad.sThumbLY : 0,
+                        rc == 0 ? probe.Gamepad.sThumbRX : 0,
+                        rc == 0 ? probe.Gamepad.sThumbRY : 0);
                 fflush(stderr);
             }
         }

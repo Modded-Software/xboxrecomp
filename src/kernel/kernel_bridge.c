@@ -2584,6 +2584,210 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
+/* ------------------------------------------------------------------ *
+ * NV2A software-method dispatch.
+ *
+ * The title's statically linked D3D8 submits method 0x0100 carrying a
+ * pointer to a routine it wants the GPU driver to run, then waits for
+ * the result.  The pushbuffer executor calls xbox_Nv2aSoftwareMethod();
+ * we hand the routine to the timer/interrupt thread, which runs it on
+ * that thread's guest stack at DISPATCH_LEVEL and signals completion.
+ * Without it the title spins forever -- FMV and in-game rendering stall
+ * right after the first few decoded frames.  The routine/context pair
+ * is registered by main.c.
+ * ------------------------------------------------------------------ */
+static HANDLE g_nv2a_wake;
+static struct {
+    recomp_func_t routine;
+    uint32_t context, parameter, depth_clear, color_clear;
+    HANDLE completed;
+    volatile LONG pending;
+    long long frequency, elapsed_ticks;
+    uint64_t requests;
+} g_nv2a_software;
+
+int xbox_Nv2aSoftwareMethodHandler(uint32_t routine, uint32_t context)
+{
+    LARGE_INTEGER frequency;
+    recomp_func_t fn = recomp_lookup(routine);
+    if (!fn) fn = recomp_lookup_manual(routine);
+    if (!fn || g_nv2a_software.routine
+            || !bridge_buf_ok(context, 4, "NV2A software-method context")) {
+        fprintf(stderr, "  [NV2A] Cannot register software-method handler "
+                        "0x%08X context 0x%08X\n", routine, context);
+        fflush(stderr);
+        return -1;
+    }
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) {
+        fprintf(stderr, "  [NV2A] Cannot query software-method timing frequency\n");
+        fflush(stderr);
+        return -1;
+    }
+    g_nv2a_software.completed = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!g_nv2a_software.completed) {
+        fprintf(stderr, "  [NV2A] Cannot create software-method completion "
+                        "event: error %lu\n", GetLastError());
+        fflush(stderr);
+        return -1;
+    }
+    g_nv2a_software.context = context;
+    g_nv2a_software.frequency = frequency.QuadPart;
+    g_nv2a_software.routine = fn;
+    return 0;
+}
+
+static int kernel_start_timer(void);
+static long long kernel_counter(void);
+
+static void kernel_nv2a_software_tick(void)
+{
+    uint32_t stack;
+    int old_irql;
+    if (!InterlockedCompareExchange(&g_nv2a_software.pending, 0, 0))
+        return;
+    {
+        volatile uint32_t *depth = xbox_Nv2aRegisterPointer(0x401A88, 4);
+        volatile uint32_t *color = xbox_Nv2aRegisterPointer(0x40186C, 4);
+        if (!depth || !color) {
+            fflush(stderr);
+            _Exit(EXIT_FAILURE);
+        }
+        *depth = g_nv2a_software.depth_clear;
+        *color = g_nv2a_software.color_clear;
+    }
+    /* The routine is D3D code running on this thread; it can submit its own
+     * pushbuffer commands and then wait for DMA_GET to catch up. The ack
+     * thread that advances GET is the one blocked waiting for this routine to
+     * finish, so without a window of space here the two deadlock and the
+     * guest spins in D3DDevice_MakeSpace forever. Give it everything the
+     * title has submitted so far. */
+    {
+        volatile uint32_t *put = xbox_Nv2aRegisterPointer(0x800040, 4);
+        volatile uint32_t *get = xbox_Nv2aRegisterPointer(0x800044, 4);
+        if (put && get)
+            *get = *put;
+    }
+    stack = g_esp;
+    g_ecx = g_nv2a_software.context;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = g_nv2a_software.parameter;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    old_irql = xbox_IrqlEnterInterrupt(2);  /* DISPATCH_LEVEL */
+    g_nv2a_software.routine();
+    xbox_IrqlLeaveInterrupt(old_irql);
+    if (g_esp != stack) {
+        fprintf(stderr, "  [NV2A] Software method 0x%08X corrupted callback "
+                        "stack: 0x%08X -> 0x%08X\n",
+                g_nv2a_software.parameter, stack, g_esp);
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+    InterlockedExchange(&g_nv2a_software.pending, 0);
+    if (!SetEvent(g_nv2a_software.completed)) {
+        fprintf(stderr, "  [NV2A] Software-method completion failed: error %lu\n",
+                GetLastError());
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+}
+
+static long long kernel_counter(void)
+{
+    LARGE_INTEGER counter;
+    if (!QueryPerformanceCounter(&counter)) {
+        fprintf(stderr, "  [KERNEL] Cannot query performance timing counter\n");
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+    return counter.QuadPart;
+}
+
+void xbox_Nv2aSoftwareMethodReport(void)
+{
+    double seconds;
+    if (!g_nv2a_software.frequency) return;
+    seconds = (double)g_nv2a_software.elapsed_ticks / g_nv2a_software.frequency;
+    fprintf(stderr, "[NV2A] software dispatch: %llu requests, %.3fs wait, %.3fms average\n",
+            (unsigned long long)g_nv2a_software.requests, seconds,
+            g_nv2a_software.requests ? seconds * 1000 / g_nv2a_software.requests : 0);
+}
+
+int xbox_Nv2aSoftwareMethod(uint32_t parameter, uint32_t depth_clear,
+                            uint32_t color_clear)
+{
+    static unsigned trace_count;
+    long long started, spin_ticks;
+    DWORD wait_ms = 0;
+    if (!g_nv2a_software.routine)
+        return 0;
+    if (!kernel_start_timer()
+            || InterlockedCompareExchange(&g_nv2a_software.pending, 0, 0)) {
+        fprintf(stderr, "  [NV2A] Software-method worker unavailable or busy\n");
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+    if (getenv("RECOMP_PB_FAILURE_TRACE") && trace_count++ < 64)
+        fprintf(stderr, "  [NV2A] software method 0x%08X, depth-clear "
+                        "0x%08X, color-clear 0x%08X\n",
+                parameter, depth_clear, color_clear);
+    g_nv2a_software.parameter = parameter;
+    g_nv2a_software.depth_clear = depth_clear;
+    g_nv2a_software.color_clear = color_clear;
+    started = kernel_counter();
+    spin_ticks = g_nv2a_software.frequency / 4000;
+    InterlockedExchange(&g_nv2a_software.pending, 1);
+    if (!SetEvent(g_nv2a_wake)) {
+        fprintf(stderr, "  [NV2A] Cannot wake software-method worker: error %lu\n",
+                GetLastError());
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+    for (;;) {
+        DWORD result = WaitForSingleObject(g_nv2a_software.completed, wait_ms);
+        if (result == WAIT_OBJECT_0) {
+            g_nv2a_software.elapsed_ticks += kernel_counter() - started;
+            g_nv2a_software.requests++;
+            return 1;
+        }
+        if (result != WAIT_TIMEOUT) {
+            fprintf(stderr, "  [NV2A] Software method 0x%08X failed: "
+                            "wait %lu, error %lu\n",
+                    parameter, result, GetLastError());
+            fflush(stderr);
+            _Exit(EXIT_FAILURE);
+        }
+        if (kernel_counter() - started >= spin_ticks)
+            wait_ms = 1;
+        else
+            YieldProcessor();
+        /* PFB flushes and a preceding vblank ISR must still finish while
+         * FIFO execution waits for the shared DPC worker. */
+        xbox_Nv2aAcknowledgeHandshakes();
+    }
+}
+
+/* Like xbox_Nv2aSoftwareMethod, but does not wait for the routine to finish.
+ * The pushbuffer executor calls this: the routine (D3D's
+ * CMiniport::SoftwareMethod) can itself call KickOffAndWaitForIdle, which
+ * waits for the GPU -- and the GPU is the very executor thread that would be
+ * waiting here, so the synchronous form deadlocks and the guest spins in
+ * D3DDevice_MakeSpace forever. Deferring breaks the cycle: the timer thread
+ * runs the routine on its own schedule while the executor keeps draining. */
+void xbox_Nv2aSoftwareMethodDeferred(uint32_t parameter, uint32_t depth_clear,
+                                     uint32_t color_clear)
+{
+    if (!g_nv2a_software.routine)
+        return;
+    if (!kernel_start_timer())
+        return;
+    if (InterlockedCompareExchange(&g_nv2a_software.pending, 0, 0))
+        return;   /* one is already queued; it carries the pending state */
+    g_nv2a_software.parameter = parameter;
+    g_nv2a_software.depth_clear = depth_clear;
+    g_nv2a_software.color_clear = color_clear;
+    InterlockedExchange(&g_nv2a_software.pending, 1);
+    SetEvent(g_nv2a_wake);
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -2615,7 +2819,11 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        Sleep(10);
+        if (g_nv2a_wake)
+            WaitForSingleObject(g_nv2a_wake, 10);
+        else
+            Sleep(10);
+        kernel_nv2a_software_tick();  /* D3D software methods, at DISPATCH_LEVEL */
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
@@ -2653,6 +2861,38 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     }
 }
 
+/* Start the timer/interrupt thread once; also the NV2A software-method
+ * worker, which is driven by that thread's tick. */
+static int kernel_start_timer(void)
+{
+    HANDLE thread;
+
+    if (g_timer_started)
+        return 1;
+    InitializeCriticalSection(&g_timer_lock);
+    g_nv2a_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!g_nv2a_wake) {
+        fprintf(stderr, "  [KERNEL] Cannot create timer wake event: error %lu\n",
+                GetLastError());
+        fflush(stderr);
+        DeleteCriticalSection(&g_timer_lock);
+        return 0;
+    }
+    thread = CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL);
+    if (!thread) {
+        fprintf(stderr, "  [KERNEL] Cannot start timer/interrupt thread: error %lu\n",
+                GetLastError());
+        fflush(stderr);
+        CloseHandle(g_nv2a_wake);
+        g_nv2a_wake = NULL;
+        DeleteCriticalSection(&g_timer_lock);
+        return 0;
+    }
+    CloseHandle(thread);
+    g_timer_started = 1;
+    return 1;
+}
+
 /* Shared by KeSetTimer and KeSetTimerEx; period is 0 for the former. */
 static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                              long period_ms, uint32_t dpc_va)
@@ -2661,10 +2901,9 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     int i, free_slot = -1;
     uint32_t was_set = 0;
 
-    if (!g_timer_started) {
-        InitializeCriticalSection(&g_timer_lock);
-        g_timer_started = 1;
-        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+    if (!kernel_start_timer()) {
+        g_eax = 0;
+        return;
     }
 
     EnterCriticalSection(&g_timer_lock);
