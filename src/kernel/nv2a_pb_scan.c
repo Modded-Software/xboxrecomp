@@ -36,6 +36,13 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static struct { uint32_t method, subch, count; } s_seen[PB_MAX_METHODS];
 static int s_seen_count;
+/* Direct index into s_seen: note() runs once per pushbuffer method word on the
+ * executor thread, so a linear scan of up to PB_MAX_METHODS was a real cost on
+ * every parameter word. Method is (w & 0x1FFC) -> 2048 slots, subchannel 3
+ * bits -> 8, so an [8][2048] table (int16 slots, 32 KB) makes it O(1) while
+ * leaving s_seen and the report untouched. */
+static int16_t s_seen_index[8][2048];
+static int s_seen_index_ready;
 
 /* Parse health. An inventory is only worth reading if the walk stayed in step
  * with the command stream: a decoder that desynchronises produces plausible
@@ -59,11 +66,17 @@ static int s_exec_enabled = -1;
 
 static void note(uint32_t subch, uint32_t method)
 {
-    for (int i = 0; i < s_seen_count; i++) {
-        if (s_seen[i].method == method && s_seen[i].subch == subch) {
-            s_seen[i].count++;
-            return;
-        }
+    uint32_t sub, m;
+    int16_t slot;
+    if (!s_seen_index_ready) {
+        memset(s_seen_index, 0xFF, sizeof s_seen_index);
+        s_seen_index_ready = 1;
+    }
+    sub = subch & 7u; m = (method >> 2) & 0x7FFu;
+    slot = s_seen_index[sub][m];
+    if (slot >= 0) {
+        s_seen[slot].count++;
+        return;
     }
     if (s_seen_count >= PB_MAX_METHODS) {
         /* Silently dropping past the cap is how a truncated inventory reads as
@@ -75,13 +88,13 @@ static void note(uint32_t subch, uint32_t method)
             fprintf(stderr, "[PB] method table full at %d -- inventory is"
                             " truncated\n", PB_MAX_METHODS);
         }
+        return;
     }
-    if (s_seen_count < PB_MAX_METHODS) {
-        s_seen[s_seen_count].method = method;
-        s_seen[s_seen_count].subch  = subch;
-        s_seen[s_seen_count].count  = 1;
-        s_seen_count++;
-    }
+    s_seen_index[sub][m] = (int16_t)s_seen_count;
+    s_seen[s_seen_count].method = method;
+    s_seen[s_seen_count].subch  = subch;
+    s_seen[s_seen_count].count  = 1;
+    s_seen_count++;
 }
 
 /* NV097 (Kelvin 3D class) methods worth naming. The point of the survey is to

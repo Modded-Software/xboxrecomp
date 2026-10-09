@@ -1014,6 +1014,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     static long long kick_freq;
     static unsigned long long kick_n, kick_walk_ticks;
     static DWORD kick_window;
+    static ULONGLONG kick_cpu_k, kick_cpu_u;   /* GetThreadTimes baseline */
     if (kick_stats < 0) {
         LARGE_INTEGER f;
         kick_stats = getenv("RECOMP_KICK_STATS") != NULL;
@@ -1145,14 +1146,32 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                                           / 1000.0;
                             double walk_ms =
                                 (double)kick_walk_ticks / kick_freq * 1000.0;
+                            /* Real CPU time of this thread over the window:
+                             * the walk's wall includes SwitchToThread yields
+                             * while it waits for the GPU, which burn no CPU.
+                             * cpu% near 100 = CPU-bound; low = waiting. */
+                            FILETIME ft_c, ft_e, ft_k, ft_u;
+                            ULONGLONG k = 0, u = 0;
+                            if (GetThreadTimes(GetCurrentThread(), &ft_c, &ft_e,
+                                               &ft_k, &ft_u)) {
+                                k = ((ULONGLONG)ft_k.dwHighDateTime << 32)
+                                    | ft_k.dwLowDateTime;
+                                u = ((ULONGLONG)ft_u.dwHighDateTime << 32)
+                                    | ft_u.dwLowDateTime;
+                            }
+                            double cpu_s = ((double)(k - kick_cpu_k)
+                                            + (double)(u - kick_cpu_u)) / 1e7;
+                            kick_cpu_k = k;
+                            kick_cpu_u = u;
                             fprintf(stderr, "[KICK] %llu kicks / %.1fs "
                                     "(%.1f/s), walk %.1fms total, %.1fus avg, "
-                                    "%.1f%% of wall\n",
+                                    "%.1f%% of wall, ack cpu %.1f%% of window\n",
                                     kick_n, secs, secs ? kick_n / secs : 0.0,
                                     walk_ms,
                                     kick_n ? walk_ms * 1000.0 / kick_n : 0.0,
                                     secs ? walk_ms / (secs * 1000.0) * 100.0
-                                         : 0.0);
+                                         : 0.0,
+                                    secs ? cpu_s / secs * 100.0 : 0.0);
                             fflush(stderr);
                             kick_n = 0;
                             kick_walk_ticks = 0;
