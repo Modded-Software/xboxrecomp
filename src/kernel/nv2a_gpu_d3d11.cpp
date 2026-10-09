@@ -13,6 +13,7 @@
 #include <chrono>
 #include <algorithm>
 #include <set>
+#include <unordered_map>
 #if defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <emmintrin.h>
 #endif
@@ -367,6 +368,19 @@ static std::vector<DepthSurface> depth_surfaces;
 static uint64_t surface_use_serial;
 static uint64_t target_content_serial;
 static std::vector<CachedTexture> textures;
+/* Bind-time lookup: every texture bind used to scan the whole cache comparing
+ * key fields. Guest addresses identify a texture, so index by source and fall
+ * back to the linear scan only when the key fields differ. Rebuilt whenever the
+ * cache size changes (creates and the rare eviction). */
+static std::unordered_map<const void *, size_t> texture_index_by_source;
+static size_t texture_index_count = (size_t)-1;
+static void rebuild_texture_index()
+{
+    texture_index_by_source.clear();
+    for (size_t i = 0; i < textures.size(); i++)
+        texture_index_by_source.emplace(textures[i].source, i);
+    texture_index_count = textures.size();
+}
 static ComPtr<ID3D11InputLayout> input_layout;
 static ComPtr<ID3D11Buffer> constant_buffer;
 static Constants uploaded_constants;
@@ -1594,7 +1608,7 @@ static bool map_stream(DynamicStream &stream, UINT bytes, UINT bind, const char 
                        D3D11_MAPPED_SUBRESOURCE &mapped, UINT &offset)
 {
     if (!stream.buffer || bytes > stream.capacity) {
-        UINT capacity = bind == D3D11_BIND_VERTEX_BUFFER ? 512 * 1024 : 64 * 1024;
+        UINT capacity = (bind & D3D11_BIND_VERTEX_BUFFER) ? 512 * 1024 : 64 * 1024;
         while (capacity < bytes) capacity *= 2;
         D3D11_BUFFER_DESC description = {};
         description.ByteWidth = capacity; description.Usage = D3D11_USAGE_DYNAMIC;
@@ -1797,13 +1811,15 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     {
         GpuTimer hash_timer(gpu_timing.hash);
         gpu_timing.hash_bytes += binding.source_bytes;
-        for (auto &texture : textures) {
-            if (!(texture.source == binding.source && texture.width == binding.width && texture.height == binding.height &&
-                  texture.format == binding.format && texture.cube == binding.cube && texture.depth == binding.depth && texture.pitch == binding.pitch &&
-                  texture.linear == binding.linear && texture.face_stride == binding.face_stride &&
-                  texture.mip_levels == levels &&
-                  texture.source_snapshot.size() == binding.source_bytes))
-                continue;
+        auto key_matches = [&](const CachedTexture &texture) {
+            return texture.source == binding.source && texture.width == binding.width &&
+                   texture.height == binding.height && texture.format == binding.format &&
+                   texture.cube == binding.cube && texture.depth == binding.depth &&
+                   texture.pitch == binding.pitch && texture.linear == binding.linear &&
+                   texture.face_stride == binding.face_stride && texture.mip_levels == levels &&
+                   texture.source_snapshot.size() == binding.source_bytes;
+        };
+        auto check = [&](CachedTexture &texture) -> ID3D11ShaderResourceView * {
             /* Already compared this entry this frame: the verdict still holds -- unless a
              * GPU blit overwrote it since, which forces a fresh compare. */
             if (tex_validate_once() && !texture.force_validate &&
@@ -1815,6 +1831,15 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                 return texture.view.Get();
             }
             refresh = &texture;
+            return nullptr;
+        };
+        if (texture_index_count != textures.size()) rebuild_texture_index();
+        auto index = texture_index_by_source.find(binding.source);
+        if (index != texture_index_by_source.end() && key_matches(textures[index->second])) {
+            if (auto *view = check(textures[index->second])) return view;
+        } else for (auto &texture : textures) {
+            if (!key_matches(texture)) continue;
+            if (auto *view = check(texture)) return view;
             break;
         }
     }
@@ -2612,22 +2637,28 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     phase_timer.next_phase(gpu_timing.draw_streams);
     UINT vertex_stride = state->vertex_program ? sizeof(Nv2aGpuVertex) : sizeof(Nv2aGpuVertex) - sizeof(vertices[0].attributes);
     auto &vertex_stream = vertex_streams[state->vertex_program ? 1 : 0];
+    UINT vertex_bytes = count * vertex_stride;
+    UINT index_bytes = state->indices ? state->index_count * sizeof(uint32_t) : 0;
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     UINT vertex_offset;
-    if (!map_stream(vertex_stream, count * vertex_stride, D3D11_BIND_VERTEX_BUFFER, "vertex", mapped, vertex_offset)) return 0;
+    /* Vertex and index data share one dynamic buffer and are written under a
+     * single Map/Unmap (both are 4-byte aligned, so offsets stay aligned). Two
+     * buffers meant two driver round trips per draw (~1500/frame). */
+    if (!map_stream(vertex_stream, vertex_bytes + index_bytes,
+                    D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER, "geometry", mapped, vertex_offset))
+        return 0;
     uint8_t *vertex_destination = (uint8_t *)mapped.pData + vertex_offset;
-    if (state->vertex_program) std::memcpy(vertex_destination, vertices, count * vertex_stride);
+    if (state->vertex_program) std::memcpy(vertex_destination, vertices, vertex_bytes);
     else for (uint32_t vertex = 0; vertex < count; vertex++)
         std::memcpy(vertex_destination + vertex * vertex_stride, &vertices[vertex], vertex_stride);
-    context->Unmap(vertex_stream.buffer.Get(), 0);
+    UINT index_offset = 0;
     if (state->indices) {
-        UINT index_offset;
-        if (!map_stream(index_stream, state->index_count * sizeof(uint32_t), D3D11_BIND_INDEX_BUFFER, "index", mapped, index_offset))
-            return reject("index buffer upload");
-        std::memcpy((uint8_t *)mapped.pData + index_offset, state->indices, state->index_count * sizeof(uint32_t));
-        context->Unmap(index_stream.buffer.Get(), 0);
-        context->IASetIndexBuffer(index_stream.buffer.Get(), DXGI_FORMAT_R32_UINT, index_offset);
-    } else context->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
+        index_offset = vertex_offset + vertex_bytes;
+        std::memcpy((uint8_t *)mapped.pData + index_offset, state->indices, index_bytes);
+    }
+    context->Unmap(vertex_stream.buffer.Get(), 0);
+    if (state->indices) context->IASetIndexBuffer(vertex_stream.buffer.Get(), DXGI_FORMAT_R32_UINT, index_offset);
+    else context->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
     {
         GpuTimer constants_timer(gpu_timing.constants);
         if (uploaded_constants_valid && !std::memcmp(&uploaded_constants, &constants, sizeof constants)) {
