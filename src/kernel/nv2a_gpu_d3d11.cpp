@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <d3dcompiler.h>
 #include "nv2a_gpu_shader.h"
+#include "../d3d/d3d8_swizzle.h"
 #include <vector>
 #include <array>
 #include <cstring>
@@ -1917,6 +1918,13 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                  * keep the callback. */
                 bool bulk = binding.linear && !binding.cube && !binding.depth && levels == 1 &&
                             (binding.format == 0x12 || binding.format == 0x1E);
+                /* Swizzled 32bpp (0x06 A8R8G8B8, 0x07 X8R8G8B8) is the largest
+                 * per-frame re-upload. The generic path calls the decode callback
+                 * per texel; bulk-unswizzle by Morton order instead. */
+                bool swizzled32 = !binding.linear && !binding.cube && !binding.depth && levels == 1 &&
+                            (binding.format == 0x06 || binding.format == 0x07) &&
+                            width && height && !(width & (width - 1)) && !(height & (height - 1)) &&
+                            (uint64_t)width * height * 4 <= binding.source_bytes;
                 if (bulk) {
                     const uint8_t *base = (const uint8_t *)binding.source;
                     for (uint32_t row = 0; row < height; row++) {
@@ -1926,6 +1934,10 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                         else for (uint32_t column = 0; column < width; column++)
                             destination[column] = source[column] | 0xFF000000u;
                     }
+                } else if (swizzled32) {
+                    xbox_unswizzle_rect(image.data(), binding.source, width, height, 4);
+                    if (binding.format == 0x07)
+                        for (size_t pixel = 0; pixel < image.size(); pixel++) image[pixel] |= 0xFF000000u;
                 } else {
                 for (uint32_t slice = 0; slice < depth; slice++)
                  for (uint32_t row = 0; row < height; row++)
