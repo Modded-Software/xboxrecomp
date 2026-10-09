@@ -1668,8 +1668,16 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         return nullptr;
     }
     Surface *direct = nullptr;
-    if (levels == 1 && !binding.cube && !binding.depth && binding.linear &&
-        (binding.format == 0x12 || binding.format == 0x1E))
+    /* A texture whose memory exactly matches a colour surface can be sampled
+     * straight from that surface's view. 0x12/0x1E (linear A8R8G8B8/X8R8G8B8)
+     * always qualify. 0x07 is the same 32bpp surface sampled as a swizzled
+     * texture (the common render-target-as-texture case, e.g. 0x99753000):
+     * the surface view already holds the resolved pixels, so the guest-side
+     * swizzle is irrelevant and requiring binding.linear would strand it on a
+     * full GPU sync every frame. */
+    bool surface_viewable = (binding.format == 0x12 || binding.format == 0x1E)
+                                ? binding.linear : binding.format == 0x07;
+    if (levels == 1 && !binding.cube && !binding.depth && surface_viewable)
         for (auto &surface : surfaces)
             if (surface.memory == binding.source && surface.width == binding.width &&
                 surface.height == binding.height && surface.pitch == binding.pitch) {
