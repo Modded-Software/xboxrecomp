@@ -1103,6 +1103,21 @@ static bool tex_validate_once(void)
     return s_tex_validate_once != 0;
 }
 
+/* Depth surfaces are only ever consumed by a guest CPU read of their memory;
+ * nothing presents them, and targeted publishes never carry depth anyway. The
+ * full-sync publication (CopyResource + Map + de-swizzle) is otherwise pure
+ * wall-clock per flip. Default on (other titles may read depth back);
+ * RECOMP_DEPTH_PUBLISH=0 skips it, which this game does. */
+static bool publish_depth(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *value = std::getenv("RECOMP_DEPTH_PUBLISH");
+        on = (value && value[0] == '0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
 static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_bytes = 0)
 {
     GpuTimer sync_timer(gpu_timing.sync);
@@ -1164,7 +1179,7 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
                 }
                 has_readback = true;
             }
-        if (!only)
+        if (!only && publish_depth())
         for (auto &surface : depth_surfaces)
             if (surface.dirty) {
                 if (surface.clear_value_valid) {
@@ -1257,7 +1272,9 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
         mark_target_aliases(&surface, surface.memory, (size_t)surface.pitch * surface.height);
         surface.dirty = false;
     }
-    if (!only)
+    if (!only && !publish_depth())
+        for (auto &surface : depth_surfaces) surface.dirty = false;
+    if (!only && publish_depth())
     for (auto &surface : depth_surfaces) {
         if (!surface.dirty) continue;
         if (surface.clear_value_valid) {
