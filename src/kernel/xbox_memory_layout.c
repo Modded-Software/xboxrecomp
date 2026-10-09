@@ -1006,6 +1006,21 @@ volatile int g_ack_phase;   /* diagnostic: where the ack thread is, for the watc
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    /* Kick statistics (RECOMP_KICK_STATS=1): how often the guest hands the
+     * pushbuffer off, and how long the walk that produces DMA_GET takes. If
+     * kicks/s is far above the frame rate the guest is stalling per-draw on the
+     * handshake; if the walk dominates, the wait is execution, not scheduling. */
+    static int kick_stats = -1;
+    static long long kick_freq;
+    static unsigned long long kick_n, kick_walk_ticks;
+    static DWORD kick_window;
+    if (kick_stats < 0) {
+        LARGE_INTEGER f;
+        kick_stats = getenv("RECOMP_KICK_STATS") != NULL;
+        QueryPerformanceFrequency(&f);
+        kick_freq = f.QuadPart ? f.QuadPart : 1;
+        kick_window = GetTickCount();
+    }
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         g_ack_phase = 1;
         /* Overlay handshake. D3DDevice::EnableOverlay (0x2C4B10) sets
@@ -1115,9 +1130,34 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * arrays -> prim-0 / nonfinite-UV rejects). */
                     extern void nv2a_pb_run(uint32_t);
                     if (put != last_put) {
+                        LARGE_INTEGER t0, t1;
+                        QueryPerformanceCounter(&t0);
                         g_ack_phase = 8;
                         nv2a_pb_run(XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu));
                         g_ack_phase = 9;
+                        QueryPerformanceCounter(&t1);
+                        kick_n++;
+                        kick_walk_ticks +=
+                            (unsigned long long)(t1.QuadPart - t0.QuadPart);
+                        if (kick_stats
+                                && GetTickCount() - kick_window >= 2000) {
+                            double secs = (double)(GetTickCount() - kick_window)
+                                          / 1000.0;
+                            double walk_ms =
+                                (double)kick_walk_ticks / kick_freq * 1000.0;
+                            fprintf(stderr, "[KICK] %llu kicks / %.1fs "
+                                    "(%.1f/s), walk %.1fms total, %.1fus avg, "
+                                    "%.1f%% of wall\n",
+                                    kick_n, secs, secs ? kick_n / secs : 0.0,
+                                    walk_ms,
+                                    kick_n ? walk_ms * 1000.0 / kick_n : 0.0,
+                                    secs ? walk_ms / (secs * 1000.0) * 100.0
+                                         : 0.0);
+                            fflush(stderr);
+                            kick_n = 0;
+                            kick_walk_ticks = 0;
+                            kick_window = GetTickCount();
+                        }
                     }
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
@@ -3490,14 +3530,22 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
 
 static uint8_t g_contig_apu[CONTIG_PAGE_COUNT];        /* APU-owned pages */
 
+/* Diagnostic: contiguous-block scan traffic driven by GPU/APU address
+ * resolution. Reports via [DMA-RES] in nv2a_pb_exec_report. */
+unsigned long long g_cba_calls, g_cba_iters;
+int xbox_ContigBlockCount(void) { return g_contig_block_count; }
+
 /* Live block whose range contains window offset `off`, if any. */
 static int contig_block_at(uint32_t off, uint32_t *start_off, uint32_t *size)
 {
     int i, found = 0;
+    int it = 0;
 
     AcquireSRWLockShared(&g_contig_lock);
+    g_cba_calls++;
     for (i = 0; i < g_contig_block_count; i++) {
         uint32_t s;
+        it++;
         if (g_contig_blocks[i].free)
             continue;
         s = g_contig_blocks[i].addr - XBOX_CONTIG_BASE;
@@ -3508,6 +3556,7 @@ static int contig_block_at(uint32_t off, uint32_t *start_off, uint32_t *size)
             break;
         }
     }
+    g_cba_iters += (unsigned)it;
     ReleaseSRWLockShared(&g_contig_lock);
     return found;
 }

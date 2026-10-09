@@ -126,7 +126,13 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
  * in ordinary RAM (Wreckless renders to the tiled alias of physical
  * 0x01954000) keep the first path and are unaffected.
  */
-static uint32_t dma_resolve(uint32_t offset)
+/* Diagnostic counters: how much time dma_resolve costs and how large the
+ * contiguous-block scan it drives is. Printed by nv2a_pb_exec_report. */
+static double s_dma_seconds;
+static unsigned long long s_dma_calls;
+static double gpu_clock_seconds(void);
+
+static uint32_t dma_resolve_impl(uint32_t offset)
 {
     /* Did this runtime hand the offset out as contiguous memory? Then the
      * bytes live in the window. Check live allocation ownership rather than
@@ -208,6 +214,15 @@ static uint32_t dma_resolve(uint32_t offset)
     if ((uint64_t)offset < XBOX_CONTIG_SIZE)
         return XBOX_CONTIG_BASE + offset;
     return offset;                         /* nothing better to offer */
+}
+
+static uint32_t dma_resolve(uint32_t offset)
+{
+    double t0 = gpu_clock_seconds();
+    uint32_t r = dma_resolve_impl(offset);
+    s_dma_seconds += gpu_clock_seconds() - t0;
+    s_dma_calls++;
+    return r;
 }
 
 static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
@@ -4391,6 +4406,13 @@ void nv2a_pb_exec_report(void)
             (double)s_gpu.gpu_zero_bytes_saved / (1024.0 * 1024 * 1024));
     fprintf(stderr, "[GPU-D3D11] executor time: preparation %.3fs backend %.3fs\n",
             s_gpu.gpu_prepare_seconds, s_gpu.gpu_submit_seconds);
+    {
+        extern int xbox_ContigBlockCount(void);
+        extern unsigned long long g_cba_calls, g_cba_iters;
+        fprintf(stderr, "[DMA-RES] blocks %d, calls %llu, iters %llu, time %.3fs (%.1f%% of exec)\n",
+                xbox_ContigBlockCount(), g_cba_calls, g_cba_iters, s_dma_seconds,
+                100.0 * s_dma_seconds / (s_gpu.gpu_prepare_seconds + s_gpu.gpu_submit_seconds + 1e-9));
+    }
     nv2a_gpu_report();
     xbox_Nv2aSoftwareMethodReport();
 #ifdef _WIN32
