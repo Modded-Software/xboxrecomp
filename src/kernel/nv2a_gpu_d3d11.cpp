@@ -1132,7 +1132,7 @@ static void wait_ordering_completion(void)
     static int lag = -1;
     if (lag < 0) {
         const char *value = std::getenv("RECOMP_SYNC_LAG");
-        lag = value ? std::atoi(value) : 2;
+        lag = value ? std::atoi(value) : 4;
         if (lag < 0) lag = 0;
         if (lag > 7) lag = 7;
     }
