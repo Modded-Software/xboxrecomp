@@ -127,6 +127,82 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* Off-focus input injection for automated tests.
+ *
+ * XTEST routes key events to whatever holds the X input focus, and Wine's
+ * wineserver then routes the resulting keyboard hardware message to the
+ * focused window (server/queue.c:find_hardware_message_window). So an
+ * automated tap either steals the user's focus or is dropped; XSendEvent to
+ * the window is worse still, because Wine keeps its own key state and the key
+ * sticks. There is no X-level way around it.
+ *
+ * Instead the test writes the set of held virtual-key codes to a small file
+ * and this window thread applies it whenever it changes, straight into the
+ * same s_key_down[] that WM_KEYDOWN writes. No X, no focus, no Wine keyboard
+ * translation -- the events are injected from inside Wine, which is the only
+ * place the keyboard model can be driven without the foreground. The file
+ * holds whitespace-separated hex VK codes (e.g. "20 57" = Space + W); path is
+ * RECOMP_INPUT_FILE (default C:\recomp-input.txt). */
+static void fb_inject_poll(void)
+{
+    static int enabled = -1;
+    static DWORD last;
+    static unsigned char held[256];
+    unsigned char next[256];
+    const char *path;
+    char buf[4096], *p;
+    DWORD now;
+    size_t n;
+    FILE *f;
+    int i;
+
+    if (enabled < 0)
+        enabled = getenv("RECOMP_INPUT_FILE") != NULL;
+    if (!enabled)
+        return;
+    now = GetTickCount();
+    if (now - last < 8)                    /* ~120 Hz is plenty */
+        return;
+    last = now;
+
+    path = getenv("RECOMP_INPUT_FILE");
+    f = fopen(path, "rb");
+    if (!f)
+        return;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    memset(next, 0, sizeof next);
+    for (p = buf; *p; ) {
+        unsigned long v;
+        while (*p && !((*p >= '0' && *p <= '9') ||
+                       (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')))
+            p++;
+        if (!*p)
+            break;
+        v = strtoul(p, &p, 16);
+        if (v < 256)
+            next[v] = 1;
+    }
+    for (i = 0; i < 256; i++) {
+        if (next[i] == held[i])
+            continue;
+        held[i] = next[i];
+        s_key_down[i] = next[i];
+        if (next[i] && i == VK_F12) {
+            const char *cap = getenv("RECOMP_FB_CAPTURE");
+            if (!cap || !cap[0])
+                cap = "framebuffer.bmp";
+            if (xbox_FramebufferDumpBmp(cap) != 0)
+                fprintf(stderr, "[FBWIN] failed to capture framebuffer to %s\n", cap);
+        }
+        if (getenv("RECOMP_KEY_TRACE"))
+            fprintf(stderr, "  [KEY] inject %s vk=0x%02X\n",
+                    next[i] ? "down" : "up", i);
+    }
+}
+
 /* Mouse state, for the keyboard+mouse mode (src/input, RECOMP_KBM).
  *
  * Absolute cursor position is useless for a camera stick: the pointer hits the
@@ -654,12 +730,20 @@ static DWORD WINAPI fb_thread(LPVOID unused)
      * window while it is topmost makes it the foreground one even when the
      * lock would otherwise say no -- and it is left not-topmost afterwards so
      * nothing else is occluded. */
-    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE);
-    SetForegroundWindow(hwnd);
-    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE);
-    SetFocus(hwnd);
+    /* RECOMP_NO_FOCUS: an automated run must not pull focus away from the
+     * user's work, and with file injection (fb_inject_poll) it does not need
+     * the keyboard at all. Set to 0 to force the window foreground again. */
+    {
+        const char *nf = getenv("RECOMP_NO_FOCUS");
+        if (!(nf && *nf && *nf != '0')) {
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE);
+            SetForegroundWindow(hwnd);
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE);
+            SetFocus(hwnd);
+        }
+    }
     /* Mouse capture is opt-in per click (below), not on creation, so the
      * window can be dragged and other windows reached until the user clicks
      * into the game. */
@@ -738,6 +822,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         /* Pump often enough to sample WM_INPUT/WM_KEYDOWN smoothly, but not
          * so tightly that the window thread monopolises a core. Rendering is
          * gated on a new frame, above. */
+        fb_inject_poll();
         Sleep(4);
     }
 
