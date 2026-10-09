@@ -1810,6 +1810,24 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
             } else {
                 auto &image = pixels[subresource];
                 image.resize((size_t)width * height * depth);
+                /* Linear 32bpp textures (0x12 A8R8G8B8, 0x1E X8R8G8B8) dominate
+                 * the per-frame re-uploads. The generic path calls the decode
+                 * callback once per texel; for these the guest bytes are already
+                 * in the target layout, so copy whole rows instead (0x1E only
+                 * needs alpha forced). Swizzled/compressed/format-shuffled ones
+                 * keep the callback. */
+                bool bulk = binding.linear && !binding.cube && !binding.depth && levels == 1 &&
+                            (binding.format == 0x12 || binding.format == 0x1E);
+                if (bulk) {
+                    const uint8_t *base = (const uint8_t *)binding.source;
+                    for (uint32_t row = 0; row < height; row++) {
+                        const uint32_t *source = (const uint32_t *)(base + (size_t)row * binding.pitch);
+                        uint32_t *destination = &image[(size_t)row * width];
+                        if (binding.format == 0x12) std::memcpy(destination, source, (size_t)width * 4);
+                        else for (uint32_t column = 0; column < width; column++)
+                            destination[column] = source[column] | 0xFF000000u;
+                    }
+                } else {
                 for (uint32_t slice = 0; slice < depth; slice++)
                  for (uint32_t row = 0; row < height; row++)
                     for (uint32_t column = 0; column < width; column++) {
@@ -1828,6 +1846,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                         }
                         if (binding.depth) *pixel = (*pixel & 0xFF00FF00u) | ((*pixel & 255u) << 16) | ((*pixel >> 16) & 255u);
                     }
+                }
                 data[subresource].pSysMem = image.data(); data[subresource].SysMemPitch = width * 4;
                 data[subresource].SysMemSlicePitch = width * height * 4;
                 resource_bytes += (uint64_t)width * height * depth * 4;
