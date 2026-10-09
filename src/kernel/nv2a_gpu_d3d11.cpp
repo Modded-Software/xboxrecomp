@@ -1118,6 +1118,39 @@ static bool publish_depth(void)
     return on != 0;
 }
 
+/* Ordering events (WAIT_FOR_IDLE, semaphore release) only need the GPU to have
+ * caught up; they do not read surfaces back. Waiting for every one serialises
+ * the guest against the GPU -- ~39 full round trips per frame -- but draining
+ * nothing at all was measured a net loss (the guest races ahead and the flip
+ * drains a deep backlog). Keep a small ring of event queries and only wait for
+ * the one from RECOMP_SYNC_LAG events ago, so the GPU runs a bounded distance
+ * ahead. RECOMP_SYNC_LAG=0 restores the per-event wait. */
+static void wait_ordering_completion(void)
+{
+    static ComPtr<ID3D11Query> ring[8];
+    static unsigned produced;
+    static int lag = -1;
+    if (lag < 0) {
+        const char *value = std::getenv("RECOMP_SYNC_LAG");
+        lag = value ? std::atoi(value) : 2;
+        if (lag < 0) lag = 0;
+        if (lag > 7) lag = 7;
+    }
+    unsigned slot = produced++ & 7u;
+    if (!ring[slot]) {
+        D3D11_QUERY_DESC description = {D3D11_QUERY_EVENT, 0};
+        HRESULT created = device->CreateQuery(&description, &ring[slot]);
+        if (FAILED(created)) readback_failed("completion event", created, "create");
+    }
+    context->End(ring[slot].Get());
+    context->Flush();
+    if (produced > (unsigned)lag) {
+        ID3D11Query *old = ring[(produced - 1 - (unsigned)lag) & 7u].Get();
+        while (context->GetData(old, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE)
+            SwitchToThread();
+    }
+}
+
 static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_bytes = 0)
 {
     GpuTimer sync_timer(gpu_timing.sync);
@@ -1142,15 +1175,7 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
         if (pending_draws) {
             GpuTimer wait_timer(gpu_timing.sync_event_wait);
             gpu_timing.completion_waits++;
-            if (!completion_event) {
-                D3D11_QUERY_DESC description = {D3D11_QUERY_EVENT, 0};
-                HRESULT created = device->CreateQuery(&description, &completion_event);
-                if (FAILED(created)) readback_failed("completion event", created, "create");
-            }
-            context->End(completion_event.Get());
-            context->Flush();
-            while (context->GetData(completion_event.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE)
-                SwitchToThread();
+            wait_ordering_completion();
             pending_draws = false;
         }
         return;
