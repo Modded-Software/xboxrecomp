@@ -26,8 +26,8 @@
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024
-#define XA2_NUM_BUFS      8
-#define XA2_PREFILL_BUFS  4  /* Monitor packets are 256 frames: ~21ms of headroom. */
+#define XA2_NUM_BUFS      16 /* queued packets of 256 frames = ~85ms headroom */
+
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
@@ -147,15 +147,11 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
     if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
-    if (!state.BuffersQueued && g_xa2_started) {
-        g_xa2_empty_queue_events++;
-        hr = IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
-        if (FAILED(hr)) {
-            fprintf(stderr, "[XA2] Stop for rebuffering failed: 0x%08lX\n", hr);
-            return -1;
-        }
-        g_xa2_started = 0;
-    }
+    if (!state.BuffersQueued) g_xa2_empty_queue_events++;
+    /* Leave the source running once started: a transiently empty queue makes
+     * XAudio2 emit silence, whereas stopping and re-prefilling it produced an
+     * audible "cut off, then reload" gap on every lull (long streaming samples
+     * lost their tail). */
     if (g_xa2_diagnostic && GetTickCount() - g_xa2_last_report >= 1000) {
         XAUDIO2_PERFORMANCE_DATA performance;
         g_xa2_last_report = GetTickCount();
@@ -181,7 +177,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
     g_xa2_frames_written++;
-    if (!g_xa2_started && state.BuffersQueued + 1 >= XA2_PREFILL_BUFS) {
+    if (!g_xa2_started) {
         hr = IXAudio2SourceVoice_Start(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
         if (FAILED(hr)) {
             fprintf(stderr, "[XA2] Start after prefill failed: 0x%08lX\n", hr);

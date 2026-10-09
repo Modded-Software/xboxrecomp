@@ -5,6 +5,15 @@
 # Global Processor (GP): Stub - effects bypass
 # Encode Processor (EP): Stub - direct mixbin passthrough
 
+set(SAMPLERATE_SOURCES
+    third_party/samplerate/samplerate.c
+    third_party/samplerate/src_sinc.c
+    third_party/samplerate/src_linear.c
+    third_party/samplerate/src_zoh.c
+)
+set_source_files_properties(${SAMPLERATE_SOURCES} PROPERTIES
+    COMPILE_DEFINITIONS HAVE_CONFIG_H)
+
 add_library(xbox_apu STATIC
     apu_core.c
     apu_vp.c
@@ -14,6 +23,7 @@ add_library(xbox_apu STATIC
     dsp/dsp_dma.c
     apu_mmio_hook.c
     apu_xaudio2.c
+    ${SAMPLERATE_SOURCES}
 )
 
 target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

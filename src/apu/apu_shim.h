@@ -173,52 +173,16 @@ static inline uint8_t *memory_region_get_ram_ptr(MemoryRegion *mr) {
 }
 
 /* ============================================================
- * libsamplerate stubs (SRC)
+ * libsamplerate (SRC)
  *
- * The VP uses libsamplerate for pitch-shifted voice resampling.
- * We stub it initially; voices will play at native rate.
+ * The VP uses libsamplerate for pitch-shifted voice resampling. The
+ * library is vendored under third_party/samplerate and linked into
+ * xbox_apu; use the real thing so pitch-shifted voices are anti-aliased
+ * (a bare linear interpolation folds high frequencies down and sounds
+ * like a modem).
  * ============================================================ */
 
-typedef void SRC_STATE;
-
-#define SRC_SINC_FASTEST 2
-
-typedef long (*src_callback_t)(void *cb_data, float **data);
-
-static inline SRC_STATE *src_callback_new(src_callback_t func, int type,
-                                           int channels, int *error,
-                                           void *cb_data) {
-    (void)func; (void)type; (void)channels; (void)cb_data;
-    if (error) *error = 0;
-    /* Return non-NULL so callers think init succeeded */
-    static int dummy_src;
-    return (SRC_STATE *)&dummy_src;
-}
-
-static inline int src_callback_read(SRC_STATE *state, double ratio,
-                                     long frames, float *data) {
-    (void)state; (void)ratio; (void)frames; (void)data;
-    /* Return 0 frames - caller will handle silence */
-    return 0;
-}
-
-static inline void src_reset(SRC_STATE *state) { (void)state; }
-static inline void src_delete(SRC_STATE *state) { (void)state; }
-static inline const char *src_strerror(int error) {
-    (void)error;
-    return "libsamplerate stubbed";
-}
-
-/* Float-to-short conversion (from libsamplerate) */
-static inline void src_float_to_short_array(const float *in, int16_t *out,
-                                             int len) {
-    for (int i = 0; i < len; i++) {
-        float s = in[i] * 32767.0f;
-        if (s > 32767.0f) s = 32767.0f;
-        if (s < -32768.0f) s = -32768.0f;
-        out[i] = (int16_t)s;
-    }
-}
+#include "third_party/samplerate/samplerate.h"
 
 /* ============================================================
  * SDL Audio stubs

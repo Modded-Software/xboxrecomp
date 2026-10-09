@@ -382,6 +382,67 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
+/* Optional raw PCM capture for offline analysis (RECOMP_APU_WAV=<base>):
+ * <base>.emu.raw = EP/DSP mixdown before the software mixer,
+ * <base>.mix.raw = what is actually submitted to the audio backend. */
+static FILE *g_wav_emu, *g_wav_mix;
+static int g_wav_init;
+
+static void apu_wav_capture(const int16_t (*buf)[2], int n, int mix)
+{
+    if (!g_wav_init) {
+        g_wav_init = 1;
+        const char *base = getenv("RECOMP_APU_WAV");
+        if (base) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s.emu.raw", base);
+            g_wav_emu = fopen(path, "wb");
+            snprintf(path, sizeof(path), "%s.mix.raw", base);
+            g_wav_mix = fopen(path, "wb");
+        }
+    }
+    FILE *f = mix ? g_wav_mix : g_wav_emu;
+    if (f) {
+        fwrite(buf, sizeof(int16_t) * 2, n, f);
+    }
+}
+
+/* Declick: a sound that is cut off abruptly makes the mix step from a large
+ * value straight to 0 (or vice versa), which is heard as a loud click/peak.
+ * When a sample jumps farther than any real waveform does in one step, ramps
+ * the jump over a few samples instead of reproducing it. State persists across
+ * monitor windows so a cut landing on a window boundary is still smoothed. */
+#define DECLICK_THRESH 8000
+#define DECLICK_RAMP   32
+static int g_declick_prev[2];
+
+static void apu_declick(int16_t (*buf)[2], int n)
+{
+    for (int ch = 0; ch < 2; ch++) {
+        int prev = g_declick_prev[ch];
+        int i = 0;
+        while (i < n) {
+            int d = buf[i][ch] - prev;
+            if (d > DECLICK_THRESH || d < -DECLICK_THRESH) {
+                int end = i + DECLICK_RAMP;
+                if (end > n) end = n;
+                int target = buf[end - 1][ch];
+                int span = end - i;
+                for (int j = i; j < end; j++) {
+                    buf[j][ch] = (int16_t)(prev +
+                        (int)((long)(target - prev) * (j - i + 1) / span));
+                }
+                prev = buf[end - 1][ch];
+                i = end;
+            } else {
+                prev = buf[i][ch];
+                i++;
+            }
+        }
+        g_declick_prev[ch] = prev;
+    }
+}
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     if ((d->ep_frame_div + 1) % 8) {
@@ -407,8 +468,16 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             }
         }
 
+        apu_wav_capture((const int16_t (*)[2])d->monitor.frame_buf,
+                        num_samples, 0);
+
         if (!g_audio_muted)
             mixer_render(d->monitor.frame_buf, num_samples);
+
+        apu_declick((int16_t (*)[2])d->monitor.frame_buf, num_samples);
+
+        apu_wav_capture((const int16_t (*)[2])d->monitor.frame_buf,
+                        num_samples, 1);
 
         xa2_submit_samples((const int16_t *)d->monitor.frame_buf, num_samples);
         return;
@@ -566,16 +635,22 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
-        uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
-        if (apu_active && !g_test_tone.active) {
-            /* Full pipeline: VP voices → DSP → monitor → waveOut */
+        if (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) {
+            /* Full pipeline: VP voices → DSP → monitor → audio out. This runs
+             * even while FECTL is transiently TRAPPED/HALTED (a method is being
+             * written): the GP just processes no new commands, and the GP/EP
+             * cadence stays in lockstep. Ticking ep_frame_div on those frames
+             * WITHOUT running the GP is what let the EP reader overtake the GP
+             * writer -- a 48000/256 = 187.5 Hz comb ("modem" buzz). */
             se_frame(d);
         } else {
-            /* Lightweight: just monitor frame (test tone + software mixer) */
+            /* APU truly disabled (XCNTMODE off): no DSP runs, so it is safe to
+             * advance the frame clock here. Emit a silent window so the XAudio2
+             * queue never drains -- a drained queue used to stop/re-prefill the
+             * source, cutting long samples off and leaving audible gaps. The
+             * software mixer / test tone still overdub in monitor_frame. */
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
