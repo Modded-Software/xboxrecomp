@@ -187,6 +187,9 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
  * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
  * stands down, so the count follows what was actually drawn. */
 void xbox_Nv2aFrameCounterFlip(void);
+/* Print the flip-interval histogram (RECOMP_FLIP_PACING) for the window just
+ * ended and clear it: used to tell a real 30 FPS vblank cap from slowness. */
+void xbox_Nv2aFlipPacingReport(void);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);

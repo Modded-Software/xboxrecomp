@@ -893,6 +893,12 @@ static bool surface_memory_matches(const SurfaceType &surface, uint32_t bytes)
 static void refresh_surface(Surface &surface)
 {
     if (!surface.needs_refresh) return;
+    /* A dirty surface holds GPU content newer than guest RAM (it has been drawn
+     * into but not published). Uploading RAM here would overwrite the rendered
+     * image with the previous publish -- the corruption seen when publication
+     * went lazy. Keep the GPU copy; the surface is published at the next real
+     * fence, and the texture path samples the GPU view while it is dirty. */
+    if (surface.dirty) { surface.needs_refresh = false; return; }
     if (surface.snapshot_valid && !surface.dirty) {
         size_t row_bytes = (size_t)surface.width * 4;
         D3D11_BOX changed = {surface.width, surface.height, 0, 0, 0, 1};
@@ -1405,6 +1411,28 @@ extern "C" void nv2a_gpu_flush(void)
     for (auto &surface : depth_surfaces) surface.needs_refresh = true;
 }
 
+/* Frame boundary (FLIP_STALL): publish only the surface about to be shown,
+ * advance the texture-validation serial once for the frame, and mark only CLEAN
+ * surfaces for refresh.
+ *
+ * A flip only needs the presented surface in guest RAM, because that is the
+ * only one the window and the title read back here; everything else can stay
+ * GPU-resident until a fence that actually reads it. The full flush above
+ * read back every dirty surface per flip. Dirty surfaces are deliberately not
+ * marked needs_refresh: refreshing one would upload stale RAM over the rendered
+ * image (see the guard in refresh_surface). If no surface is named, fall back
+ * to the full flush. */
+extern "C" void nv2a_gpu_flip(const void *presented, size_t bytes)
+{
+    if (!presented) { nv2a_gpu_flush(); return; }
+    gpu_sync_impl(true, presented, bytes);
+    s_texture_validate_serial++;
+    for (auto &surface : surfaces)
+        if (!surface.dirty) surface.needs_refresh = true;
+    for (auto &surface : depth_surfaces)
+        if (!surface.dirty) surface.needs_refresh = true;
+}
+
 /* A GPU-engine blit wrote guest RAM a cached surface mirrors. Refresh only the
  * surfaces that overlap those bytes from guest RAM; never bump the global
  * texture-validation serial, which would re-upload GPU-only textures (UI). */
@@ -1793,7 +1821,11 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         } else gpu_timing.alias_copy_reuses++;
     } else if (dirty_alias) {
         gpu_timing.texture_alias_syncs++;
-        nv2a_gpu_sync();
+        /* Pull just this texture's source bytes back to guest RAM. A full sync
+         * here republished every dirty surface once per frame, which alone made
+         * the lazy flip worthless: the surface it was about to publish had
+         * already been published by this call. */
+        nv2a_gpu_surface_publish(binding.source, binding.source_bytes);
     }
     if (direct) {
         direct->last_used = ++surface_use_serial;

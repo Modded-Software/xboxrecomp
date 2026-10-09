@@ -13,6 +13,7 @@ int nv2a_gpu_compile(void);
 void nv2a_gpu_sync(void);
 void nv2a_gpu_wait(void);
 void nv2a_gpu_flush(void);
+void nv2a_gpu_flip(const void *presented, size_t bytes);
 void nv2a_gpu_surface_modified(const void *addr, size_t bytes);
 void nv2a_gpu_surface_publish(const void *addr, size_t bytes);
 void nv2a_gpu_invalidate(void);

@@ -76,6 +76,21 @@ static void pb_flush_ordering(void)
     nv2a_pb_exec_flush();
 }
 
+/* Lazy flip: at FLIP_STALL publish only the presented surface instead of every
+ * dirty one. Set RECOMP_LAZY_FLIP=0 to restore the full publish per flip (A/B). */
+static int lazy_flip(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *value = getenv("RECOMP_LAZY_FLIP");
+        on = (value && value[0] == '0') ? 0 : 1;
+        fprintf(stderr, "[GPU] flip publication: %s (RECOMP_LAZY_FLIP=%s)\n",
+                on ? "lazy" : "full", value ? value : "<unset>");
+        fflush(stderr);
+    }
+    return on;
+}
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
@@ -476,6 +491,7 @@ static struct {
     uint32_t state_shader_runs, state_shader_failures;
     double raster_seconds;
     uint64_t gpu_attribute_fetches, gpu_attribute_skips, gpu_zero_bytes_saved;
+    uint64_t gpu_memset_bytes, gpu_unique_vertices;
     double gpu_prepare_seconds, gpu_submit_seconds;
     uint32_t gpu_batches, cpu_batches;
     int combiners_configured;
@@ -2560,8 +2576,10 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
             gpu_vertex_offsets[slot] = *count;
             gpu_indices[gpu_index_count++] = *count;
             destination = &gpu_vertices[(*count)++];
+            s_gpu.gpu_unique_vertices++;
             if ((s_gpu.transform_execution_mode & 3u) == 2u) {
                 memset(destination, 0, sizeof *destination);
+                s_gpu.gpu_memset_bytes += sizeof *destination;
                 for (stage = 0; stage < 16; stage++) {
                     if (gpu_attribute_mask & (1u << stage)) {
                         fetch_attr(&s_gpu.attr[stage], indices[vertex], destination->attributes[stage]);
@@ -2613,7 +2631,9 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
     for (vertex = 0; vertex < vertex_count; vertex++) {
         gpu_indices[gpu_index_count++] = *count;
         Nv2aGpuVertex *destination = &gpu_vertices[(*count)++];
+        s_gpu.gpu_unique_vertices++;
         memset(destination, 0, offsetof(Nv2aGpuVertex, attributes));
+        s_gpu.gpu_memset_bytes += offsetof(Nv2aGpuVertex, attributes);
         s_gpu.gpu_zero_bytes_saved += sizeof destination->attributes;
         memcpy(destination->position, vertices[vertex].output[0], sizeof destination->position);
         memcpy(destination->diffuse, vertices[s_gpu.shade_mode == 0x1D00 ? vertex_count - 1 : vertex].output[3], sizeof destination->diffuse);
@@ -4089,7 +4109,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_FLIP_STALL:
         s_gpu.flush_flip++;
-        nv2a_pb_exec_flush();
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now. */
         s_gpu.flip_read = s_gpu.flip_write;
@@ -4103,16 +4122,32 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * flip, color_offset has already moved to the next buffer. Copying
          * here, rather than letting the window read guest memory on its own
          * clock, is what stops it showing a surface the rasteriser is still
-         * writing. */
+         * writing.
+         *
+         * Only that surface is published (nv2a_gpu_flip): a flip needs the
+         * presented buffer in guest RAM, not every dirty surface. Publishing
+         * all of them per flip was most of the sync cost and is what forced a
+         * per-frame re-decode of render-to-texture surfaces. */
         if (s_gpu.pitch) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                : s_gpu.color_offset;
             if (done) {
+                if (lazy_flip()) {
+                    uint8_t *base = (uint8_t *)xbox_GetMemoryOffset() + dma_resolve(done);
+                    uint32_t h = s_gpu.clip_y + s_gpu.clip_h;
+                    nv2a_gpu_flip(base, (size_t)s_gpu.pitch * (h ? h : 1u));
+                } else {
+                    nv2a_pb_exec_flush();
+                }
                 present_pvideo_overlay(done);
                 xbox_FramebufferWindowSet(dma_resolve(done), s_gpu.pitch);
                 xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
+            } else {
+                nv2a_pb_exec_flush();
             }
+        } else {
+            nv2a_pb_exec_flush();
         }
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
@@ -4404,6 +4439,10 @@ void nv2a_pb_exec_report(void)
             (unsigned long long)s_gpu.gpu_attribute_fetches,
             (unsigned long long)s_gpu.gpu_attribute_skips,
             (double)s_gpu.gpu_zero_bytes_saved / (1024.0 * 1024 * 1024));
+    fprintf(stderr, "[GPU-D3D11] vertex staging: %llu unique vertices, %.3f GiB memset, avg %u B memset\n",
+            (unsigned long long)s_gpu.gpu_unique_vertices,
+            (double)s_gpu.gpu_memset_bytes / (1024.0 * 1024 * 1024),
+            s_gpu.gpu_unique_vertices ? (unsigned)(s_gpu.gpu_memset_bytes / s_gpu.gpu_unique_vertices) : 0);
     fprintf(stderr, "[GPU-D3D11] executor time: preparation %.3fs backend %.3fs\n",
             s_gpu.gpu_prepare_seconds, s_gpu.gpu_submit_seconds);
     {
@@ -4415,6 +4454,7 @@ void nv2a_pb_exec_report(void)
     }
     nv2a_gpu_report();
     xbox_Nv2aSoftwareMethodReport();
+    xbox_Nv2aFlipPacingReport();
 #ifdef _WIN32
     static clock_t previous_time;
     static uint32_t previous_flips;

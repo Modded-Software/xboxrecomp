@@ -781,10 +781,67 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
  */
 static DWORD g_frame_counter_flip_ms;
 
+/* Flip pacing (RECOMP_FLIP_PACING=1): distribution of wall time between
+ * successive flips. The runtime serves vblank at 60 Hz (XBOX_FRAME_PERIOD_MS),
+ * so a title that paces on vblank quantises its present interval to a multiple
+ * of 16.7 ms. A spike in the 2-vblank bucket (24-34 ms) once the executor is
+ * fast enough is the fingerprint of a 30 FPS cap; the bucket spread at low FPS
+ * (three or more vblanks) only says the executor is slow, not that the title is
+ * capped. Read alongside the window FPS. */
+static int     s_flip_pacing = -1;
+static ULONGLONG g_flip_pacing_qpc, g_flip_pacing_freq;
+static uint64_t g_flip_pacing_buckets[7];
+static uint64_t g_flip_pacing_flips;
+static ULONGLONG g_flip_pacing_last;
+
+static void flip_pacing_record(void)
+{
+    static const char *names[7] = {"<16.7", "16.7-24", "24-34", "34-50", "50-67", "67-100", ">100"};
+    ULONGLONG now;
+    int bucket;
+    (void)names;
+
+    if (s_flip_pacing < 0) {
+        const char *value = getenv("RECOMP_FLIP_PACING");
+        s_flip_pacing = value && value[0] == '0' ? 0 : 1;
+        QueryPerformanceFrequency((LARGE_INTEGER *)&g_flip_pacing_freq);
+    }
+    if (!s_flip_pacing || !g_flip_pacing_freq) return;
+    QueryPerformanceCounter((LARGE_INTEGER *)&now);
+    if (g_flip_pacing_last) {
+        double ms = (double)(now - g_flip_pacing_last) * 1000.0 / (double)g_flip_pacing_freq;
+        bucket = ms < 16.7 ? 0 : ms < 24 ? 1 : ms < 34 ? 2 : ms < 50 ? 3 : ms < 67 ? 4 : ms < 100 ? 5 : 6;
+        g_flip_pacing_buckets[bucket]++;
+        g_flip_pacing_flips++;
+    }
+    g_flip_pacing_last = now;
+}
+
+void xbox_Nv2aFlipPacingReport(void)
+{
+    static const char *names[7] = {"<16.7", "16.7-24", "24-34", "34-50", "50-67", "67-100", ">100"};
+    uint64_t total = 0;
+    int i;
+    (void)names;
+    if (s_flip_pacing <= 0 || !g_flip_pacing_flips) return;
+    for (i = 0; i < 7; i++) total += g_flip_pacing_buckets[i];
+    fprintf(stderr, "[FLIP] interval ms buckets over %llu flips:",
+            (unsigned long long)g_flip_pacing_flips);
+    for (i = 0; i < 7; i++)
+        fprintf(stderr, " %s=%llu(%.0f%%)", names[i],
+                (unsigned long long)g_flip_pacing_buckets[i],
+                total ? 100.0 * (double)g_flip_pacing_buckets[i] / (double)total : 0.0);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    for (i = 0; i < 7; i++) g_flip_pacing_buckets[i] = 0;
+    g_flip_pacing_flips = 0;
+}
+
 void xbox_Nv2aFrameCounterFlip(void)
 {
     int i;
 
+    flip_pacing_record();
     g_frame_counter_flip_ms = GetTickCount();
     if (!g_frame_counter_flip_ms)
         g_frame_counter_flip_ms = 1;          /* 0 means "never" */
