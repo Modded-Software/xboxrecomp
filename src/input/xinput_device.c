@@ -357,17 +357,21 @@ static void kbm_cam_setf(uint32_t camera, uint32_t offset, float v)
 /* Face/triggers, matching what the build actually does (not what the docs
  * guess): A is jump, B is use, X is melee, LT is crouch. So jump is on Space,
  * melee on F, crouch on Control. A pad is expected to be the primary device,
- * so this is the "there is no pad" scheme. Override any binding with
- *   RECOMP_KBM_MAP="A=Return,B=E,X=Space,Y=R,BLACK=Shift,WHITE=Q,LT=Control,START=Tab,BACK=Escape" */
-static int k_a = VK_SPACE, k_b = 'E', k_x = 'F', k_y = 'R',
-           k_black = VK_SHIFT, k_white = 'Q', k_lt = VK_CONTROL,
-           k_start = VK_TAB, k_back = VK_ESCAPE;
+ * so this is the "there is no pad" scheme. Y is the right mouse button (no
+ * key); left stick click is R; right stick click is the middle mouse button.
+ * Override any key binding with
+ *   RECOMP_KBM_MAP="A=Return,B=E,X=Space,BLACK=Shift,WHITE=G,LT=Control,START=Tab,BACK=Escape,LTHUMB=R" */
+static int k_a = VK_SPACE, k_b = 'E', k_x = 'F', k_y = 0,
+           k_black = VK_SHIFT, k_white = 'G', k_lt = VK_CONTROL,
+           k_start = VK_TAB, k_back = VK_ESCAPE,
+           k_lthumb = 'R', k_rthumb = 0;
 
 struct kbm_bind { const char *name; int *vk; };
 static struct kbm_bind kbm_binds[] = {
     { "A", &k_a }, { "B", &k_b }, { "X", &k_x }, { "Y", &k_y },
     { "BLACK", &k_black }, { "WHITE", &k_white }, { "LT", &k_lt },
     { "START", &k_start }, { "BACK", &k_back },
+    { "LTHUMB", &k_lthumb }, { "RTHUMB", &k_rthumb },
 };
 
 static int kbm_vk_name(const char *name)
@@ -413,6 +417,10 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     static float look_gain, look_gain_y;
     static float dbg_last_pitch, dbg_last_yaw;
     static int dbg_have;
+    /* Scroll -> left-stick alias: a notch is a single poll, which the title's
+     * per-frame integration barely sees, so hold the deflection for a beat. */
+    static int wheel_dir;
+    static DWORD wheel_until;
     WORD b = 0;
     int dx, dy, wheel;
 
@@ -445,10 +453,12 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
         configured = 1;
         fprintf(stderr, "[KBM] profile: deadzone=%u stick_deadzone=%u invert_y=%u maxdelta=%u "
                 "sens=%u ratio=%u look_direct=%u look_gain=%.4f look_gain_y=%.4f "
-                "A=%d B=%d X=%d Y=%d BLACK=%d WHITE=%d LT=%d START=%d BACK=%d\n",
+                "A=%d B=%d X=%d Y=%d BLACK=%d WHITE=%d LT=%d START=%d BACK=%d "
+                "LTHUMB=%d RTHUMB=%d\n",
                 deadzone, stick_deadzone, invert_y, maxdelta, sens, ratio,
                 look_direct, look_gain, look_gain_y,
-                k_a, k_b, k_x, k_y, k_black, k_white, k_lt, k_start, k_back);
+                k_a, k_b, k_x, k_y, k_black, k_white, k_lt, k_start, k_back,
+                k_lthumb, k_rthumb);
     }
 
     memset(pState, 0, sizeof(*pState));
@@ -653,20 +663,30 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     wheel = xbox_FramebufferMouseWheel();
     if (wheel > 0) b |= XBOX_GAMEPAD_DPAD_UP;
     if (wheel < 0) b |= XBOX_GAMEPAD_DPAD_DOWN;
+    /* Scroll also aliases the left stick's up/down (forward/back). */
+    if (wheel > 0)      { wheel_dir =  1; wheel_until = GetTickCount() + 150; }
+    else if (wheel < 0) { wheel_dir = -1; wheel_until = GetTickCount() + 150; }
+    if (wheel_dir && (long)(GetTickCount() - wheel_until) < 0)
+        pState->Gamepad.sThumbLY = wheel_dir > 0 ? 32767 : -32767;
     if (key_down(k_start)) b |= XBOX_GAMEPAD_START;
     /* BackSpace stays a Back alias regardless of the configured Back key. */
     if (key_down(k_back) || key_down(VK_BACK)) b |= XBOX_GAMEPAD_BACK;
+    /* Stick clicks: left on a key, right on the middle mouse button. */
+    if (key_down(k_lthumb)) b |= XBOX_GAMEPAD_LEFT_THUMB;
+    if (key_down(k_rthumb) || xbox_FramebufferMouseButton(2))
+        b |= XBOX_GAMEPAD_RIGHT_THUMB;
     pState->Gamepad.wButtons = b;
 
-    /* Analog face buttons and triggers. Right mouse is aim (White); crouch
-     * lives on the LT button, which the map puts on Control. */
+    /* Analog face buttons and triggers. Y is the right mouse button; White
+     * (the old right-mouse action) is on G; crouch lives on the LT button,
+     * which the map puts on Control. */
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]     = key_down(k_a) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]     = key_down(k_b) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]     = key_down(k_x) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]     = key_down(k_y) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
+        (key_down(k_y) || xbox_FramebufferMouseButton(1)) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] = key_down(k_black) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
-        (key_down(k_white) || xbox_FramebufferMouseButton(1)) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] = key_down(k_white) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] =
         key_down(k_lt) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] =
