@@ -352,6 +352,11 @@ void nv2a_pb_run(uint32_t put_va)
     /* Last 16 JUMP/CALLs taken this kick (diagnostic for walks that loop). */
     struct { uint32_t from, w; } jtrace[16];
     unsigned jtrace_n = 0;
+    /* Return PCs for out-of-line forward JUMPs (see the JUMP handling below).
+     * One level like DMA_SUBROUTINE, but per kick: a shared draw buffer is
+     * entered and left inside a single submission. */
+    uint32_t ret_u[4];
+    unsigned ret_u_n = 0;
 
     while (va != put_va && budget && !desync) {
         if (va < win_lo || va + 4u > win_hi || (va & 3u)) {
@@ -415,6 +420,28 @@ void nv2a_pb_run(uint32_t put_va)
         jtrace[jtrace_n & 15u].from = va - 4u;
         jtrace[jtrace_n & 15u].w = w;
         jtrace_n++;
+        /* D3D8 draws compiled geometry by JUMPing into a shared buffer that
+         * ends in a JUMP back to the caller. The title rewrites that exit word
+         * with the current return address before each use (nothing on the GPU
+         * reads it stale), but this GET->PUT batch walk only sees one value:
+         * the first caller's. A plain JUMP saves no return, so the walk loops
+         * from every other caller back to the first forever. Model an
+         * out-of-line forward JUMP as a call and a backward JUMP as its
+         * return, so the buffer comes back to the site that entered it. A
+         * backward JUMP with nothing pending is an ordinary ring wrap. */
+        {
+            uint32_t src = va - 4u;
+            uint32_t tgt = win_lo | off;
+            if ((w & 3u) != 2u) {                    /* a real CALL sets ret above */
+                if (tgt > src && (tgt >> 16) != (src >> 16)) {
+                    if (ret_u_n < 4u)
+                        ret_u[ret_u_n++] = va;       /* src + 4 */
+                } else if (tgt < src && ret_u_n
+                        && (tgt >> 16) != (src >> 16)) {
+                    off = ret_u[--ret_u_n] & 0x0FFFFFFFu;
+                }
+            }
+        }
         va = win_lo | off;
     }
     if (desync) {
@@ -451,6 +478,34 @@ void nv2a_pb_run(uint32_t put_va)
             fprintf(stderr, "  [PB] %u jumps/calls taken; last ones (from word):\n", jtrace_n);
             for (unsigned k = jtrace_n > 16u ? jtrace_n - 16u : 0u; k < jtrace_n; k++)
                 fprintf(stderr, "    J %08X %08X\n", jtrace[k & 15u].from, jtrace[k & 15u].w);
+            /* The whole head of the walk, so the first misparse is visible: a
+             * runaway walk only repeats a small cycle, so the words before the
+             * first entry into it are the ones that matter. */
+            fprintf(stderr, "  [PB] FULL KICK words %u:\n", kick_n2);
+            for (unsigned k = 0; k < kick_n2; k++) {
+                uint32_t rw = kickwords[k].w;
+                const char *kind = (rw & 3u) == 2u ? "CALL" :
+                                   ((rw & 3u) == 1u || (rw & 0xE0000003u) == 0x20000000u) ? "JUMP" :
+                                   rw == 0x00020000u ? "RET " :
+                                   (rw & 0xE0030003u) == 0u ? "METH" : "    ";
+                fprintf(stderr, "    K %08X %08X %s\n", kickwords[k].va, rw, kind);
+            }
+            /* Raw guest words around each of the last four jump sites: a jump
+             * read out of a method payload shows up as a plausible-looking
+             * neighbour sequence, which is how the first misparse is told from a
+             * real command. */
+            for (unsigned k = (jtrace_n > 4u ? jtrace_n - 4u : 0u); k < jtrace_n; k++) {
+                uint32_t from = jtrace[k & 15u].from;
+                if (from < win_lo + 32u || from + 32u > win_hi)
+                    continue;
+                fprintf(stderr, "  [PB] around %08X:\n", from);
+                for (int d = -8; d <= 8; d++) {
+                    uint32_t a = from + (uint32_t)(d * 4);
+                    fprintf(stderr, "      %s %08X %08X\n",
+                            d == 0 ? "->" : "  ", a,
+                            *(const uint32_t *)(mem + a));
+                }
+            }
         }
     }
     /* A kick that did not stop cleanly at PUT leaves no packet to resume. */
