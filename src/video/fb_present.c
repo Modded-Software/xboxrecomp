@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern int xbox_VideoDesiredResolution(uint32_t *width, uint32_t *height);
@@ -293,6 +294,139 @@ void xbox_FramebufferMouseCapture(int on)
     }
 }
 
+/* ---- input recording and replay ------------------------------------------
+ *
+ * RECOMP_INPUT_RECORD=<path> writes every input edge the window thread sees --
+ * key down/up, mouse delta, button and wheel -- with a millisecond timestamp,
+ * so a hands-on session can be replayed later. RECOMP_INPUT_REPLAY=<path> feeds
+ * such a file back at the same times, with no human and no X focus involved.
+ *
+ * Recording happens on the window thread, at the same place WM_KEYDOWN and the
+ * raw-input path already write s_key_down/s_mouse_*, so nothing else has to be
+ * instrumented and no lock is needed. */
+static FILE *s_rec;
+static DWORD s_rec_start;
+static int s_rec_state = -1;
+
+static void rec_init(void)
+{
+    const char *path;
+    s_rec_state = 0;
+    path = getenv("RECOMP_INPUT_RECORD");
+    if (!path || !path[0])
+        return;
+    s_rec = fopen(path, "wb");
+    if (!s_rec) {
+        fprintf(stderr, "[REC] cannot open %s for recording\n", path);
+        return;
+    }
+    s_rec_start = GetTickCount();
+    s_rec_state = 1;
+    fprintf(s_rec, "# recomp input record v1: t_ms type args\n");
+    fflush(s_rec);
+    fprintf(stderr, "[REC] recording input to %s\n", path);
+}
+
+static void rec_event(const char *fmt, ...)
+{
+    va_list ap;
+    if (s_rec_state < 0)
+        rec_init();
+    if (!s_rec)
+        return;
+    fprintf(s_rec, "%lu ", (unsigned long)(GetTickCount() - s_rec_start));
+    va_start(ap, fmt);
+    vfprintf(s_rec, fmt, ap);
+    va_end(ap);
+    fputc('\n', s_rec);
+    fflush(s_rec);
+}
+
+struct RecEvent { DWORD t; char type; long a, b; };
+static struct RecEvent *s_rep;
+static int s_rep_n, s_rep_cap, s_rep_i;
+static DWORD s_rep_start;
+static int s_rep_state = -1;
+
+static void rep_load(void)
+{
+    FILE *f;
+    const char *path = getenv("RECOMP_INPUT_REPLAY");
+    char line[256];
+    s_rep_state = 0;
+    if (!path || !path[0])
+        return;
+    f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[REP] cannot open %s for replay\n", path);
+        return;
+    }
+    while (fgets(line, sizeof line, f)) {
+        struct RecEvent e;
+        char ty = 0;
+        if (line[0] == '#' || line[0] == '\n')
+            continue;
+        e.a = e.b = 0;
+        if (sscanf(line, "%lu %c %li %li", &e.t, &ty, &e.a, &e.b) < 2)
+            continue;
+        e.type = ty;
+        if (s_rep_n == s_rep_cap) {
+            int cap = s_rep_cap ? s_rep_cap * 2 : 256;
+            struct RecEvent *grown = (struct RecEvent *)realloc(s_rep, (size_t)cap * sizeof *grown);
+            if (!grown) break;
+            s_rep = grown;
+            s_rep_cap = cap;
+        }
+        s_rep[s_rep_n++] = e;
+    }
+    fclose(f);
+    s_rep_start = GetTickCount();
+    s_rep_state = 1;
+    /* The pad stand-in only reads keys/mouse while the cursor is captured. */
+    if (getenv("RECOMP_KBM"))
+        xbox_FramebufferMouseCapture(1);
+    fprintf(stderr, "[REP] replaying %d events from %s\n", s_rep_n, path);
+}
+
+static void rep_apply(const struct RecEvent *e)
+{
+    switch (e->type) {
+    case 'k':
+        if ((unsigned)e->a < 256)
+            s_key_down[e->a] = e->b ? 1 : 0;
+        break;
+    case 'u':
+        memset((void *)s_key_down, 0, sizeof s_key_down);
+        s_mouse_btn[0] = s_mouse_btn[1] = s_mouse_btn[2] = 0;
+        break;
+    case 'm':
+        InterlockedExchangeAdd(&s_mouse_dx, (LONG)e->a);
+        InterlockedExchangeAdd(&s_mouse_dy, (LONG)e->b);
+        break;
+    case 'b':
+        if ((unsigned)e->a < 3)
+            s_mouse_btn[e->a] = e->b ? 1 : 0;
+        break;
+    case 'w':
+        InterlockedExchangeAdd(&s_mouse_wheel, (LONG)e->a);
+        break;
+    default:
+        break;
+    }
+}
+
+void fb_replay_poll(void)
+{
+    DWORD now;
+    if (s_rep_state < 0)
+        rep_load();
+    if (!s_rep)
+        return;
+    now = GetTickCount() - s_rep_start;
+    while (s_rep_i < s_rep_n && s_rep[s_rep_i].t <= now)
+        rep_apply(&s_rep[s_rep_i++]);
+}
+
 static void fb_exit_process(void)
 {
     InterlockedExchange(&s_fb_running, 0);
@@ -314,6 +448,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        rec_event("k %x 1", (unsigned)w);
         if (w == VK_F12) {
             const char *path = getenv("RECOMP_FB_CAPTURE");
             if (!path || !path[0]) path = "framebuffer.bmp";
@@ -365,6 +500,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYUP:
     case WM_SYSKEYUP:
+        rec_event("k %x 0", (unsigned)w);
         if ((unsigned)w < 256)
             s_key_down[w] = 0;
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
@@ -395,6 +531,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 if (dy > -2 && dy < 2) dy = 0;
                 if (dx || dy) {
                     POINT p;
+                    rec_event("m %d %d", dx, dy);
                     InterlockedExchangeAdd(&s_mouse_dx, dx);
                     InterlockedExchangeAdd(&s_mouse_dy, dy);
                     p.x = cx; p.y = cy;
@@ -404,6 +541,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             }
         } else {
             if (s_mouse_have) {
+                if (x != s_mouse_x || y != s_mouse_y)
+                    rec_event("m %d %d", x - s_mouse_x, y - s_mouse_y);
                 InterlockedExchangeAdd(&s_mouse_dx, x - s_mouse_x);
                 InterlockedExchangeAdd(&s_mouse_dy, y - s_mouse_y);
             }
@@ -420,6 +559,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                                 sizeof(RAWINPUTHEADER)) == sizeof(raw) &&
                 raw.header.dwType == RIM_TYPEMOUSE &&
                 !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+                rec_event("m %d %d", (int)raw.data.mouse.lLastX, (int)raw.data.mouse.lLastY);
                 InterlockedExchangeAdd(&s_mouse_dx, raw.data.mouse.lLastX);
                 InterlockedExchangeAdd(&s_mouse_dy, raw.data.mouse.lLastY);
             }
@@ -440,15 +580,17 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
          * it again so the window can be dragged. */
         if (getenv("RECOMP_KBM"))
             xbox_FramebufferMouseCapture(1);
+        rec_event("b 0 1");
         s_mouse_btn[0] = 1;
         return 0;
-    case WM_LBUTTONUP:   s_mouse_btn[0] = 0; return 0;
-    case WM_RBUTTONDOWN: s_mouse_btn[1] = 1; return 0;
-    case WM_RBUTTONUP:   s_mouse_btn[1] = 0; return 0;
-    case WM_MBUTTONDOWN: s_mouse_btn[2] = 1; return 0;
-    case WM_MBUTTONUP:   s_mouse_btn[2] = 0; return 0;
+    case WM_LBUTTONUP:   rec_event("b 0 0"); s_mouse_btn[0] = 0; return 0;
+    case WM_RBUTTONDOWN: rec_event("b 1 1"); s_mouse_btn[1] = 1; return 0;
+    case WM_RBUTTONUP:   rec_event("b 1 0"); s_mouse_btn[1] = 0; return 0;
+    case WM_MBUTTONDOWN: rec_event("b 2 1"); s_mouse_btn[2] = 1; return 0;
+    case WM_MBUTTONUP:   rec_event("b 2 0"); s_mouse_btn[2] = 0; return 0;
 
     case WM_MOUSEWHEEL:
+        rec_event("w %d", (int)(GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA));
         InterlockedExchangeAdd(&s_mouse_wheel,
                                (LONG)(GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA));
         return 0;
@@ -458,6 +600,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
+        rec_event("u");
         memset((void *)s_key_down, 0, sizeof s_key_down);
         s_mouse_btn[0] = s_mouse_btn[1] = s_mouse_btn[2] = 0;
         xbox_FramebufferMouseCapture(0);
@@ -823,6 +966,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
          * so tightly that the window thread monopolises a core. Rendering is
          * gated on a new frame, above. */
         fb_inject_poll();
+        if (s_rec_state < 0)
+            rec_init();
+        fb_replay_poll();
         Sleep(4);
     }
 
