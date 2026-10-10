@@ -367,8 +367,18 @@ static void rep_load(void)
         if (line[0] == '#' || line[0] == '\n')
             continue;
         e.a = e.b = 0;
-        if (sscanf(line, "%lu %c %li %li", &e.t, &ty, &e.a, &e.b) < 2)
+        if (sscanf(line, "%lu %c", &e.t, &ty) < 2)
             continue;
+        /* Key codes are recorded in hex ("k %x"); everything else is decimal. */
+        if (ty == 'k') {
+            unsigned long vk = 0;
+            long down = 0;
+            sscanf(line, "%lu %c %lx %li", &e.t, &ty, &vk, &down);
+            e.a = (long)vk;
+            e.b = down;
+        } else {
+            sscanf(line, "%lu %c %li %li", &e.t, &ty, &e.a, &e.b);
+        }
         e.type = ty;
         if (s_rep_n == s_rep_cap) {
             int cap = s_rep_cap ? s_rep_cap * 2 : 256;
@@ -394,6 +404,12 @@ static void rep_apply(const struct RecEvent *e)
     case 'k':
         if ((unsigned)e->a < 256)
             s_key_down[e->a] = e->b ? 1 : 0;
+        if (getenv("RECOMP_KEY_TRACE")) {
+            static unsigned n;
+            if (n++ < 80)
+                fprintf(stderr, "  [KEY] replay %s vk=0x%02X\n",
+                        e->b ? "down" : "up", (unsigned)e->a);
+        }
         break;
     case 'u':
         memset((void *)s_key_down, 0, sizeof s_key_down);
