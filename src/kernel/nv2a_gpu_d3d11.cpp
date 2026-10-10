@@ -389,9 +389,12 @@ static bool uploaded_constants_valid;
 struct DynamicStream {
     ComPtr<ID3D11Buffer> buffer;
     UINT capacity = 0, used = 0;
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    bool active = false;   /* Map held across draws until the ring wraps / frame ends */
 };
 static std::array<DynamicStream,2> vertex_streams;
 static DynamicStream index_stream;
+static void release_stream(DynamicStream &stream);
 static ComPtr<ID3D11RasterizerState> rasterizer;
 static std::array<ComPtr<ID3D11RasterizerState>,12> raster_states;
 
@@ -1427,6 +1430,8 @@ extern "C" void nv2a_gpu_flip(const void *presented, size_t bytes)
 {
     if (!presented) { nv2a_gpu_flush(); return; }
     gpu_sync_impl(true, presented, bytes);
+    /* Frame boundary: the GPU has consumed the stream; release the held Map. */
+    for (auto &stream : vertex_streams) release_stream(stream);
     s_texture_validate_serial++;
     for (auto &surface : surfaces)
         if (!surface.dirty) surface.needs_refresh = true;
@@ -1455,6 +1460,7 @@ extern "C" void nv2a_gpu_surface_modified(const void *addr, size_t bytes)
 extern "C" void nv2a_gpu_invalidate(void)
 {
     nv2a_gpu_sync();
+    for (auto &stream : vertex_streams) release_stream(stream);
     surfaces.clear();
     depth_surfaces.clear();
 }
@@ -1633,10 +1639,22 @@ extern "C" int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t
     return 1;
 }
 
-static bool map_stream(DynamicStream &stream, UINT bytes, UINT bind, const char *kind,
-                       D3D11_MAPPED_SUBRESOURCE &mapped, UINT &offset)
+static void release_stream(DynamicStream &stream)
+{
+    if (stream.active && stream.buffer) {
+        context->Unmap(stream.buffer.Get(), 0);
+        stream.active = false;
+    }
+}
+
+/* Keep one Map alive across draws. A Map/Unmap pair per draw was ~800 driver
+ * round trips per frame (281 k appends / 10 s); only re-map (DISCARD) when the
+ * ring wraps or the buffer must be recreated. Draws issued while the buffer is
+ * mapped read the committed append region normally. */
+static bool map_stream(DynamicStream &stream, UINT bytes, UINT bind, const char *kind, UINT &offset)
 {
     if (!stream.buffer || bytes > stream.capacity) {
+        release_stream(stream);
         UINT capacity = (bind & D3D11_BIND_VERTEX_BUFFER) ? 512 * 1024 : 64 * 1024;
         while (capacity < bytes) capacity *= 2;
         D3D11_BUFFER_DESC description = {};
@@ -1649,14 +1667,24 @@ static bool map_stream(DynamicStream &stream, UINT bytes, UINT bind, const char 
         stream.capacity = capacity;
         stream.used = 0;
     }
-    bool discard = !stream.used || bytes > stream.capacity - stream.used;
-    offset = discard ? 0 : stream.used;
-    if (!target_operation_succeeded(kind, "map stream",
-        context->Map(stream.buffer.Get(), 0, discard ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped)))
-        return false;
-    stream.used = offset + bytes;
-    if (discard) gpu_timing.stream_discards++;
-    else gpu_timing.stream_appends++;
+    UINT aligned = (stream.used + 15u) & ~15u;
+    if (stream.active && (aligned > stream.capacity || bytes > stream.capacity - aligned)) {
+        release_stream(stream);
+        stream.used = 0;
+        aligned = 0;
+    }
+    if (!stream.active) {
+        if (!target_operation_succeeded(kind, "map stream",
+            context->Map(stream.buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &stream.mapped)))
+            return false;
+        stream.active = true;
+        aligned = 0;
+        gpu_timing.stream_discards++;
+    } else {
+        gpu_timing.stream_appends++;
+    }
+    offset = aligned;
+    stream.used = aligned + bytes;
     return true;
 }
 
@@ -2683,24 +2711,21 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     auto &vertex_stream = vertex_streams[state->vertex_program ? 1 : 0];
     UINT vertex_bytes = count * vertex_stride;
     UINT index_bytes = state->indices ? state->index_count * sizeof(uint32_t) : 0;
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
     UINT vertex_offset;
-    /* Vertex and index data share one dynamic buffer and are written under a
-     * single Map/Unmap (both are 4-byte aligned, so offsets stay aligned). Two
-     * buffers meant two driver round trips per draw (~1500/frame). */
+    /* Vertex and index data share one dynamic buffer, written under one Map
+     * that is held across draws and released at the frame boundary. */
     if (!map_stream(vertex_stream, vertex_bytes + index_bytes,
-                    D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER, "geometry", mapped, vertex_offset))
+                    D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER, "geometry", vertex_offset))
         return 0;
-    uint8_t *vertex_destination = (uint8_t *)mapped.pData + vertex_offset;
+    uint8_t *vertex_destination = (uint8_t *)vertex_stream.mapped.pData + vertex_offset;
     if (state->vertex_program) std::memcpy(vertex_destination, vertices, vertex_bytes);
     else for (uint32_t vertex = 0; vertex < count; vertex++)
         std::memcpy(vertex_destination + vertex * vertex_stride, &vertices[vertex], vertex_stride);
     UINT index_offset = 0;
     if (state->indices) {
         index_offset = vertex_offset + vertex_bytes;
-        std::memcpy((uint8_t *)mapped.pData + index_offset, state->indices, index_bytes);
+        std::memcpy((uint8_t *)vertex_stream.mapped.pData + index_offset, state->indices, index_bytes);
     }
-    context->Unmap(vertex_stream.buffer.Get(), 0);
     if (state->indices) context->IASetIndexBuffer(vertex_stream.buffer.Get(), DXGI_FORMAT_R32_UINT, index_offset);
     else context->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
     {
@@ -2708,9 +2733,10 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         if (uploaded_constants_valid && !std::memcmp(&uploaded_constants, &constants, sizeof constants)) {
             gpu_timing.constant_reuses++;
         } else {
+            D3D11_MAPPED_SUBRESOURCE constant_map = {};
             if (!target_operation_succeeded("constants", "upload map",
-                context->Map(constant_buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return 0;
-            std::memcpy(mapped.pData, &constants, sizeof constants);
+                context->Map(constant_buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &constant_map))) return 0;
+            std::memcpy(constant_map.pData, &constants, sizeof constants);
             context->Unmap(constant_buffer.Get(), 0);
             uploaded_constants = constants;
             uploaded_constants_valid = true;
