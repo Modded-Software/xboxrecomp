@@ -2766,7 +2766,19 @@ static int gpu_raster_batch(void)
         binding->control0 = texture->control0; binding->control0_valid = texture->control0_valid;
         binding->filter = texture->filter;
         if (!nv2a_gpu_texture_mode_samples(mode)) continue;
-        if (!nv2a_gpu_texture_enabled(binding)) return gpu_batch_rejected("disabled texture used by sampling shader mode");
+        if (!nv2a_gpu_texture_enabled(binding)) {
+            /* The stage program samples, but the NV2A texture unit is disabled
+             * (TEXTURE_CONTROL0 enable clear). Hardware does not drop the
+             * draw; the lookup collapses to a default texel. A 1x1 white
+             * binding is the identity for the combiner's modulate stage and,
+             * unlike rejecting the whole batch, keeps the geometry. */
+            binding->disabled = 1;
+            binding->source = NULL; binding->source_bytes = 0;
+            binding->width = 1; binding->height = 1; binding->pitch = 4;
+            binding->format = 0; binding->linear = 0;
+            binding->depth = 0; binding->cube = 0; binding->mip_levels = 1;
+            continue;
+        }
         if (!texture->valid) return gpu_batch_rejected("invalid texture binding");
         if (((texture->raw_format >> 4) & 15u) == 3u)
             binding->depth = 1u << (texture->raw_format >> 28);
@@ -3520,8 +3532,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (method == 0) {
             uint32_t instance;
             if (!ramht_instance(param, &instance)) {
-                fflush(stderr);
-                _Exit(EXIT_FAILURE);
+                /* A SET_OBJECT whose handle is not in the RAMHT is either a
+                 * value this title never legitimately sends or a bogus method
+                 * from a desynced pushbuffer walk. Dying turns a recoverable
+                 * desync into a crash (observed: handle 0x34009800); the
+                 * subchannel>=8 path below already ignores the same failure.
+                 * Leave the class stale and carry on. */
+                static unsigned shown;
+                if (shown++ < 8)
+                    fprintf(stderr, "[GPU] SET_OBJECT handle 0x%08X not in RAMHT on subch %u; ignored\n",
+                            param, subch);
+                return;
             }
             volatile uint32_t *object = xbox_Nv2aRegisterPointer(0x700000 + instance, 4);
             if (!object) {
@@ -3589,7 +3610,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     if (method == 0x0100) {
-        extern void xbox_Nv2aSoftwareMethodDeferred(uint32_t, uint32_t, uint32_t);
+        extern int xbox_Nv2aSoftwareMethodDeferred(uint32_t, uint32_t, uint32_t);
         if (!param)
             return;
         if (xbox_Nv2aNativeFencesEnabled()) {
@@ -4013,6 +4034,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     case NV097_SET_BEGIN_END:
+        if (getenv("RECOMP_BE_TRACE")) {
+            extern uint32_t g_pb_current_va;
+            static unsigned be_n;
+            if (be_n++ < 600)
+                fprintf(stderr, "[BE] %-5s param %u idx_count %u prim_before %u va %08X\n",
+                        param ? "BEGIN" : "END", param, s_gpu.idx_count, s_gpu.prim,
+                        g_pb_current_va);
+        }
         if (param) {
             s_gpu.prim = param;
             s_gpu.idx_count = 0;

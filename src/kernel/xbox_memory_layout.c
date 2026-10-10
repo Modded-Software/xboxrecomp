@@ -892,17 +892,57 @@ static void frame_counters_tick(void)
     }
 }
 
-static void fence_mirrors_tick(void)
+static uint32_t g_fence_snapshot[XBOX_MAX_FENCE_MIRRORS];
+static int g_fence_snapshot_valid[XBOX_MAX_FENCE_MIRRORS];
+
+/* Read each mirror's PUT value now. Called immediately before the pushbuffer
+ * walk: the value read here is the one whose work that walk executes, so
+ * publishing it afterwards reports *executed* work. Re-reading after the walk
+ * (which this used to do) picked up whatever the title submitted mid-walk and
+ * told it the GPU had retired commands that were never run -- the same
+ * lost-command/fence race the DMA_GET ordering above fixes. */
+static void fence_mirrors_snapshot(void)
 {
     for (int i = 0; i < g_fence_mirror_count; i++) {
-        uint32_t dev, get_ptr;
+        uint32_t dev;
 
+        g_fence_snapshot_valid[i] = 0;
         if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
             continue;
         dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
                                      + g_memory_offset);
-        if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4)
-                || !fence_readable(dev + g_fence_mirrors[i].put_off, 4))
+        if (!fence_readable(dev + g_fence_mirrors[i].put_off, 4))
+            continue;
+        g_fence_snapshot[i] =
+            *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
+                                   + g_memory_offset);
+        g_fence_snapshot_valid[i] = 1;
+    }
+}
+
+static void fence_mirrors_tick(void)
+{
+    /* With native fences the executor's 0x1D70 semaphore release writes the
+     * GPU time at the exact stream position, which is the only honest value.
+     * [dev+0x2C] is D3D's NEXT fence (SetFence writes T, then sets 0x2C=T+2),
+     * so publishing it claims a fence retired that was never emitted. D3D
+     * stamps resources with that same value (RunPushBuffer: pb->Lock =
+     * [dev+0x2C]), so a push buffer still pending in the unexecuted stream
+     * looked idle; the next RunPushBuffer took the "idle" path and re-patched
+     * its tail JUMP to the new call site past PUT, and the walker followed it
+     * off into vertex data ([PB] desync / walk budget exhausted). */
+    if (xbox_Nv2aNativeFencesEnabled())
+        return;
+    for (int i = 0; i < g_fence_mirror_count; i++) {
+        uint32_t dev, get_ptr;
+
+        if (!g_fence_snapshot_valid[i])
+            continue;
+        if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
+            continue;
+        dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
+                                     + g_memory_offset);
+        if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4))
             continue;
         get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
                                          + g_memory_offset);
@@ -911,11 +951,8 @@ static void fence_mirrors_tick(void)
         {
             volatile uint32_t *fence =
                 (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
-            uint32_t put =
-                *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
-                                       + g_memory_offset);
-            if (*fence != put)
-                *fence = put;
+            if (*fence != g_fence_snapshot[i])
+                *fence = g_fence_snapshot[i];
         }
     }
 }
@@ -1117,8 +1154,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * lost-command race.
          *
          * The advance now happens after the scan, further down, which is
-         * also the only ordering that gives the title real back-pressure. */
-        fence_mirrors_tick();
+         * also the only ordering that gives the title real back-pressure.
+         *
+         * The same rule was being broken one line down: fence_mirrors_tick()
+         * copied the device's issued fence ([dev+0x2C]) into the fence the
+         * title polls BEFORE the walk below had executed anything, so D3D
+         * believed every command had retired and reused the ring, dynamic
+         * vertex buffers and font glyph quads while the ack thread was still
+         * reading them -- the walk then saw zeroed memory with a stale word
+         * left over and followed it as a JUMP. It now runs after the walk
+         * (below), reporting only executed work. See
+         * docs/19-nv2a-completion-ack-audit.md. */
         dsp_ack_tick();
         poke_tick();
         counter_mirrors_tick();
@@ -1191,6 +1237,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         LARGE_INTEGER t0, t1;
                         QueryPerformanceCounter(&t0);
                         g_ack_phase = 8;
+                        fence_mirrors_snapshot();
                         nv2a_pb_run(XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu));
                         g_ack_phase = 9;
                         QueryPerformanceCounter(&t1);
@@ -2933,6 +2980,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                         m + 1, (unsigned)XBOX_TILED_BASE);
                 continue;
             }
+            /* Mirror 16 lands on the contiguous window already mapped below
+             * (guest 0x80000000). Real hardware has no such mirror; it is a
+             * RenderWare address-wrap emulation, so skip it like the tiled
+             * aperture rather than reporting a failure for a deliberate
+             * mapping. */
+            if (guest_lo < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
+                    && XBOX_CONTIG_BASE < guest_hi) {
+                fprintf(stderr, "  Mirror %d: skipped, overlaps the contiguous"
+                                " window at 0x%08X\n",
+                        m + 1, (unsigned)XBOX_CONTIG_BASE);
+                continue;
+            }
             /* Inside the reservation this hands back the slice we are about
              * to use; outside it (no reservation) this is a no-op on an
              * address we never held. */
@@ -2948,8 +3007,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             if (g_mirror_views[m]) {
                 mirrors_ok++;
             } else {
-                fprintf(stderr, "  Mirror %d: FAILED at %p (error %lu)\n",
-                        m + 1, (void *)mirror_base, GetLastError());
+                /* A host range already in use (Wine's KUSER_SHARED_DATA lives
+                 * at 0x7FFE0000, inside mirror 12's window here). The mirror
+                 * is optional emulation, so this is not an error; a guest
+                 * access there still ends in a loud [CRASH]. */
+                fprintf(stderr, "  Mirror %d: not mapped (err %lu), guest"
+                                " 0x%08X-0x%08X left unbacked\n",
+                        m + 1, GetLastError(), (unsigned)guest_lo,
+                        (unsigned)(guest_hi - 1));
             }
         }
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",

@@ -41,6 +41,7 @@ typedef struct Nv2aGpuTexture {
 	uint32_t address_w, filter, control0, control0_valid, border_color;
 	uint32_t color_key;
 	uint32_t mip_levels;
+	uint32_t disabled; /* sampled by the stage program but the texture unit is off */
 	float bump_matrix[4], bump_scale, bump_offset;
 	void *decode_context;
 	int (*decode)(void *, uint32_t, uint32_t, uint32_t *);

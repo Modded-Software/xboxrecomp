@@ -133,8 +133,9 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x1760, "SET_VERTEX_DATA_ARRAY_FORMAT" },
     { 0x17FC, "SET_BEGIN_END" },
     { 0x1800, "ARRAY_ELEMENT16" },
-    { 0x1808, "INLINE_ARRAY" },
+    { 0x1808, "ARRAY_ELEMENT32" },
     { 0x1810, "DRAW_ARRAYS" },
+    { 0x1818, "INLINE_ARRAY" },
     { 0x1B00, "SET_TEXTURE_OFFSET" },
     { 0x1B04, "SET_TEXTURE_FORMAT" },
     { 0x1B08, "SET_TEXTURE_ADDRESS" },
@@ -298,7 +299,13 @@ void nv2a_pb_run(uint32_t put_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     static uint32_t s_get;
-    uint32_t va, ret = 0;
+    /* The CALL return PC persists across kicks: on hardware it lives in
+     * DMA_SUBROUTINE (0x324C), and D3D can split a submission so that a kick
+     * ends inside a called buffer and the matching RETURN arrives on the next
+     * one. A local here lost it, and the RETURN then went nowhere (or worse,
+     * took the stale s_get). */
+    static uint32_t ret;
+    uint32_t va;
     uint32_t budget = 0x200000u;
     const uint32_t win_lo = XBOX_CONTIG_BASE;
     const uint32_t win_hi = XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;   /* exclusive */
@@ -319,20 +326,32 @@ void nv2a_pb_run(uint32_t put_va)
 
     /* Any walk that leaves the 64 MB contiguous window means we lost sync with
      * PUT: the stream was misparsed, a CALL/RETURN was unbalanced, or the ring
-     * wrapped unannounced. Reading there used to follow a stray word that
-     * decoded as a JUMP straight out of the mapping (nv2a_pb_run+0x73 access
-     * violation). Every read and every jump/call target is now validated
+     * wrapped unannounced. Every read and every jump/call target is validated
      * against the window; the first violation aborts the walk and resyncs to
      * PUT, so a desync degrades to one dropped kick instead of a crash. */
     int desync = 0;
     const char *why = "?";
 
+    /* PFIFO DMA_STATE. The hardware keeps the in-flight method packet across
+     * kicks, so a packet whose payload crosses PUT (a GET->PUT kick boundary
+     * landing in the middle of a header's parameters) is resumed on the next
+     * kick. Dropping it -- the old `if (va == put_va) break;` -- left the
+     * walker to re-read a payload word as a header, which executed garbage and
+     * was the source of the `index command rejected (prim 0)` storm. */
+    static struct { uint32_t method, subch, count; int noninc; } st;
+
     /* Keep the last top-level words the walk read, so the first time it lands
      * on an undecodable word (or a jump/call out of the window) we can show
      * what packets led there. A misparse -- one word read as a method/jump
      * header -- is otherwise invisible until it has already run off the end. */
-    static struct { uint32_t va, w; } recent[32];
+    static struct { uint32_t va, w; } recent[64];
     static unsigned recent_n;
+    static struct { uint32_t va, w; } kickwords[16384];
+    static unsigned kick_n2;
+    kick_n2 = 0;
+    /* Last 16 JUMP/CALLs taken this kick (diagnostic for walks that loop). */
+    struct { uint32_t from, w; } jtrace[16];
+    unsigned jtrace_n = 0;
 
     while (va != put_va && budget && !desync) {
         if (va < win_lo || va + 4u > win_hi || (va & 3u)) {
@@ -341,89 +360,103 @@ void nv2a_pb_run(uint32_t put_va)
             break;
         }
         uint32_t w = *(const uint32_t *)(mem + va);
-        unsigned slot = recent_n++ & 31u;
+        unsigned slot = recent_n++ & 63u;
         recent[slot].va = va;
         recent[slot].w = w;
+        if (kick_n2 < 16384) { kickwords[kick_n2].va = va; kickwords[kick_n2].w = w; kick_n2++; }
         va += 4;
         budget--;
 
-        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {   /* JUMP */
-            uint32_t t = (w & 3u) == 1u ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
-            uint32_t off = t & 0x0FFFFFFFu;
-            if (off + 4u > XBOX_CONTIG_SIZE) {
-                why = "jump target out of window";
-                desync = 1;
-                break;
+        if (st.count) {                                             /* payload */
+            note(st.subch, st.method);
+            if (s_exec_enabled) {
+                g_pb_current_va = va - 4u;
+                nv2a_pb_exec_method(st.subch, st.method, w);
             }
-            va = win_lo | off;
+            if (!st.noninc) st.method += 4;
+            st.count--;
             continue;
         }
-        if ((w & 0xFFFF0003u) == 0x00020000u) {                     /* RETURN */
+
+        uint32_t off;
+        if ((w & 0xE0000003u) == 0x20000000u) {                     /* old JUMP */
+            off = w & 0x1FFFFFFCu;
+        } else if ((w & 3u) == 1u) {                                /* JUMP */
+            off = w & 0x0FFFFFFCu;
+        } else if ((w & 3u) == 2u) {                                /* CALL */
+            ret = va;                                               /* after CALL */
+            off = w & 0x0FFFFFFCu;
+        } else if (w == 0x00020000u) {                              /* RETURN */
+            /* A RETURN with no pending CALL is a no-op; taking it to address 0
+             * walked the fake TIB and executed garbage, hanging at boot. */
             if (ret) { va = ret; ret = 0; }
-            /* A RETURN with no pending CALL is a no-op (the old walker
-             * ignored it at top level); taking it to address 0 walked the
-             * fake TIB and executed garbage, hanging the guest at boot. */
             continue;
-        }
-        if ((w & 3u) == 2u) {                                       /* CALL */
-            uint32_t off = w & 0x0FFFFFFCu;
-            if (off + 4u > XBOX_CONTIG_SIZE) {
-                why = "call target out of window";
-                desync = 1;
-                break;
-            }
-            ret = va;
-            va = win_lo | off;
+        } else if ((w & 0xE0030003u) == 0u
+                || (w & 0xE0030003u) == 0x40000000u) {              /* method */
+            /* The method, subchannel, remaining count and non-increment bit
+             * were what the old loop held in locals and dropped at PUT. Count
+             * 0 (including a 0x00000000 word) is a no-op. */
+            st.method = w & 0x1FFCu;
+            st.subch  = (w >> 13) & 7u;
+            st.count  = (w >> 18) & 0x7FFu;
+            st.noninc = (w >> 30) & 1u;
             continue;
+        } else {
+            why = "reserved command";
+            desync = 1;
+            break;
         }
-        if ((w & 0x00030003u) == 0u) {                              /* methods */
-            uint32_t count = (w >> 18) & 0x7FFu;
-            uint32_t subch = (w >> 13) & 7u;
-            uint32_t method = w & 0x1FFCu;
-            int noninc = (w & 0xE0000000u) == 0x40000000u;
-            for (uint32_t i = 0; i < count; i++, va += 4) {
-                /* PUT only advances on a command boundary, so the last payload
-                 * word ends exactly at PUT: stop the moment we reach it and
-                 * never read a word past the frame. */
-                if (va == put_va) break;
-                if (va < win_lo || va + 4u > win_hi) {
-                    why = "method payload out of window";
-                    desync = 1;
-                    break;
-                }
-                uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
-                if (s_exec_enabled) {
-                    g_pb_current_va = va;
-                    nv2a_pb_exec_method(subch, m, *(const uint32_t *)(mem + va));
-                }
-            }
-            continue;
+        off &= 0x0FFFFFFFu;
+        if (off + 4u > XBOX_CONTIG_SIZE) {
+            why = "jump/call target out of window";
+            desync = 1;
+            break;
         }
-        {
-            static unsigned n;
-            if (n++ < 4) {
-                fprintf(stderr, "[PB-UNK] va %08X word %08X (get %08X put %08X ret %08X); last packets:\n",
-                        (unsigned)(va - 4u), w, s_get, put_va, ret);
-                for (int k = 31; k >= 0; k--) {
-                    unsigned idx = (recent_n - 1u - (unsigned)k) & 31u;
-                    uint32_t rw = recent[idx].w;
-                    const char *kind = (rw & 3u) == 2u ? "CALL" :
-                                       ((rw & 3u) == 1u || (rw & 0xE0000003u) == 0x20000000u) ? "JUMP" :
-                                       (rw & 0xFFFF0003u) == 0x00020000u ? "RET " :
-                                       (rw & 0x00030003u) == 0u ? "METH" : "    ";
-                    fprintf(stderr, "    %08X %08X %s\n", recent[idx].va, rw, kind);
-                }
-            }
-        }
+        jtrace[jtrace_n & 15u].from = va - 4u;
+        jtrace[jtrace_n & 15u].w = w;
+        jtrace_n++;
+        va = win_lo | off;
     }
     if (desync) {
         static unsigned n;
-        if (n++ < 8)
+        if (n < 8) {
             fprintf(stderr, "  [PB] desync at %08X (get %08X put %08X ret %08X): %s; resync to PUT\n",
                     va, s_get, put_va, ret, why);
+            if (n == 0) {
+                fprintf(stderr, "  [PB] FULL KICK words %u:\n", kick_n2);
+                for (unsigned k = 0; k < kick_n2; k++) {
+                    uint32_t rw = kickwords[k].w;
+                    const char *kind = (rw & 3u) == 2u ? "CALL" :
+                                       ((rw & 3u) == 1u || (rw & 0xE0000003u) == 0x20000000u) ? "JUMP" :
+                                       rw == 0x00020000u ? "RET " :
+                                       (rw & 0xE0030003u) == 0u ? "METH" : "    ";
+                    fprintf(stderr, "    K %08X %08X %s\n", kickwords[k].va, rw, kind);
+                }
+            }
+            for (int k = 63; k >= 0; k--) {
+                unsigned idx = (recent_n - 1u - (unsigned)k) & 63u;
+                uint32_t rw = recent[idx].w;
+                const char *kind = (rw & 3u) == 2u ? "CALL" :
+                                   ((rw & 3u) == 1u || (rw & 0xE0000003u) == 0x20000000u) ? "JUMP" :
+                                   rw == 0x00020000u ? "RET " :
+                                   (rw & 0xE0030003u) == 0u ? "METH" : "    ";
+                fprintf(stderr, "    %08X %08X %s\n", recent[idx].va, rw, kind);
+            }
+        }
+        n++;
     } else if (!budget) {
+        static unsigned nb;
         fprintf(stderr, "  [PB] walk budget exhausted at %08X, resync to PUT %08X\n", va, put_va);
+        if (nb++ < 4) {
+            fprintf(stderr, "  [PB] %u jumps/calls taken; last ones (from word):\n", jtrace_n);
+            for (unsigned k = jtrace_n > 16u ? jtrace_n - 16u : 0u; k < jtrace_n; k++)
+                fprintf(stderr, "    J %08X %08X\n", jtrace[k & 15u].from, jtrace[k & 15u].w);
+        }
+    }
+    /* A kick that did not stop cleanly at PUT leaves no packet to resume. */
+    if (desync || !budget) {
+        st.count = 0;
+        ret = 0;
     }
     s_get = put_va;
 }

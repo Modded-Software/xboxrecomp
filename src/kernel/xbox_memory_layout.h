@@ -222,6 +222,10 @@ int xbox_Nv2aSoftwareMethodHandler(uint32_t routine, uint32_t context);
 int xbox_Nv2aSoftwareMethod(uint32_t parameter, uint32_t depth_clear,
                             uint32_t color_clear);
 void xbox_Nv2aSoftwareMethodReport(void);
+/* Queue a software method for the timer thread; 0 = busy, re-issue later. */
+int xbox_Nv2aSoftwareMethodDeferred(uint32_t parameter, uint32_t depth_clear,
+                                    uint32_t color_clear);
+int xbox_Nv2aSoftwareMethodPending(void);
 /* Recursive guest audio exclusion; worker callbacks defer with TryEnter. */
 void xbox_GuestAudioGuardEnter(void);
 int xbox_GuestAudioGuardTryEnter(void);

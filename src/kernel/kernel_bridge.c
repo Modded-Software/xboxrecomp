@@ -2771,21 +2771,30 @@ int xbox_Nv2aSoftwareMethod(uint32_t parameter, uint32_t depth_clear,
  * waits for the GPU -- and the GPU is the very executor thread that would be
  * waiting here, so the synchronous form deadlocks and the guest spins in
  * D3DDevice_MakeSpace forever. Deferring breaks the cycle: the timer thread
- * runs the routine on its own schedule while the executor keeps draining. */
-void xbox_Nv2aSoftwareMethodDeferred(uint32_t parameter, uint32_t depth_clear,
-                                     uint32_t color_clear)
+ * runs the routine on its own schedule while the executor keeps draining.
+ *
+ * Returns 0 if another request is still pending and this one was NOT queued:
+ * the caller must re-issue it (the pusher stalls, as on hardware). Dropping it
+ * lost D3D push-buffer fixups (types 0xC-0xE), leaving a stale tail JUMP the
+ * walker then looped on. */
+int xbox_Nv2aSoftwareMethodDeferred(uint32_t parameter, uint32_t depth_clear,
+                                    uint32_t color_clear)
 {
-    if (!g_nv2a_software.routine)
-        return;
-    if (!kernel_start_timer())
-        return;
+    if (!g_nv2a_software.routine || !kernel_start_timer())
+        return 1;   /* no handler: nothing to wait for */
     if (InterlockedCompareExchange(&g_nv2a_software.pending, 0, 0))
-        return;   /* one is already queued; it carries the pending state */
+        return 0;
     g_nv2a_software.parameter = parameter;
     g_nv2a_software.depth_clear = depth_clear;
     g_nv2a_software.color_clear = color_clear;
     InterlockedExchange(&g_nv2a_software.pending, 1);
     SetEvent(g_nv2a_wake);
+    return 1;
+}
+
+int xbox_Nv2aSoftwareMethodPending(void)
+{
+    return InterlockedCompareExchange(&g_nv2a_software.pending, 0, 0) != 0;
 }
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
@@ -3397,14 +3406,24 @@ static void bridge_NtCreateFile(void)
     {
         extern uint32_t xbox_LastFileError(void);
         uint32_t _e = g_eax ? xbox_LastFileError() : 0u;
-        if (g_eax)
+        /* The title searches several folders for each asset, so the two exact
+         * "this name is not here" results (STATUS_OBJECT_NAME_NOT_FOUND /
+         * STATUS_OBJECT_PATH_NOT_FOUND returned with the matching Win32 code)
+         * are the normal answer to a probe the title handles, not an error.
+         * Any other pairing is still reported as FAILED so a status-mapping
+         * bug is not hidden. */
+        if (!g_eax)
+            fprintf(stderr, "  [FILE] -> 0x00000000\n");
+        else if ((g_eax == 0xC0000034u && _e == 2u)
+                || (g_eax == 0xC000003Au && _e == 3u))
+            fprintf(stderr, "  [FILE] -> 0x%08X (absent; returned to title)\n",
+                    g_eax);
+        else
             fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s)\n",
                     g_eax, _e,
                     _e == 32u ? " ERROR_SHARING_VIOLATION"
                   : _e ==  2u ? " ERROR_FILE_NOT_FOUND"
                   : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "");
-        else
-            fprintf(stderr, "  [FILE] -> 0x%08X\n", g_eax);
     }
     fflush(stderr);
 }

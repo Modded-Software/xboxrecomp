@@ -1774,6 +1774,23 @@ static ID3D11ShaderResourceView *get_feedback_texture(const Surface &destination
     return feedback_view.Get();
 }
 
+static ID3D11ShaderResourceView *default_white_view()
+{
+    static ComPtr<ID3D11ShaderResourceView> view;
+    if (view) return view.Get();
+    if (!device) return nullptr;
+    const uint32_t white = 0xFFFFFFFFu;
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = 1; desc.Height = 1; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_IMMUTABLE; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA data = {}; data.pSysMem = &white; data.SysMemPitch = 4;
+    ComPtr<ID3D11Texture2D> texture;
+    if (FAILED(device->CreateTexture2D(&desc, &data, &texture)) ||
+        FAILED(device->CreateShaderResourceView(texture.Get(), nullptr, &view))) return nullptr;
+    return view.Get();
+}
+
 static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, const Surface &destination)
 {
     GpuTimer texture_timer(gpu_timing.texture);
@@ -2687,7 +2704,19 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         }
         if (!nv2a_gpu_texture_mode_samples(mode)) continue;
         const auto &binding = state->textures[stage];
-        if (!nv2a_gpu_texture_enabled(&binding)) return reject("disabled texture used by sampling shader mode");
+        if (binding.disabled || !nv2a_gpu_texture_enabled(&binding)) {
+            /* See gpu_raster_batch: a disabled texture sampled by the shader
+             * collapses to a default texel. Bind 1x1 white (identity for the
+             * combiner) instead of rejecting, which would delete geometry. */
+            ID3D11ShaderResourceView *white = default_white_view();
+            if (!white) return reject("default white texture");
+            views[stage] = white;
+            constants.texture_info[stage][0] = 1.0f;
+            constants.texture_info[stage][1] = 1.0f;
+            constants.texture_info[stage][2] = 0.0f;
+            constants.texture_info[stage][3] = 0.0f;
+            continue;
+        }
         if ((mode == 2) != (binding.depth != 0) || (binding.depth && (binding.cube || binding.linear)))
             return reject("projective volume texture dimensionality");
         uint32_t sign_mask = binding.filter >> 28;
