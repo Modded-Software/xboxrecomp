@@ -1655,7 +1655,11 @@ static bool map_stream(DynamicStream &stream, UINT bytes, UINT bind, const char 
 {
     if (!stream.buffer || bytes > stream.capacity) {
         release_stream(stream);
-        UINT capacity = (bind & D3D11_BIND_VERTEX_BUFFER) ? 512 * 1024 : 64 * 1024;
+        /* The vertex+index ring resets every frame (release_stream at flip,
+         * then the next map starts at 0). A frame carries ~15 MB of fixed
+         * function vertices, so 512 KB wrapped it ~30-120x per frame and each
+         * DISCARD became a DXVK rename/wait. Size it to hold a whole frame. */
+        UINT capacity = (bind & D3D11_BIND_VERTEX_BUFFER) ? 32u * 1024 * 1024 : 64 * 1024;
         while (capacity < bytes) capacity *= 2;
         D3D11_BUFFER_DESC description = {};
         description.ByteWidth = capacity; description.Usage = D3D11_USAGE_DYNAMIC;
@@ -2720,7 +2724,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     uint8_t *vertex_destination = (uint8_t *)vertex_stream.mapped.pData + vertex_offset;
     if (state->vertex_program) std::memcpy(vertex_destination, vertices, vertex_bytes);
     else for (uint32_t vertex = 0; vertex < count; vertex++)
-        std::memcpy(vertex_destination + vertex * vertex_stride, &vertices[vertex], vertex_stride);
+        std::memcpy(vertex_destination + vertex * vertex_stride, &vertices[vertex], offsetof(Nv2aGpuVertex, attributes));
     UINT index_offset = 0;
     if (state->indices) {
         index_offset = vertex_offset + vertex_bytes;
