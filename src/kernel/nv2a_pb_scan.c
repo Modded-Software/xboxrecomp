@@ -29,6 +29,9 @@
 #ifndef XBOX_CONTIG_BASE
 #define XBOX_CONTIG_BASE 0x80000000u   /* physical P is at this + P */
 #endif
+#ifndef XBOX_CONTIG_SIZE
+#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
+#endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -297,6 +300,8 @@ void nv2a_pb_run(uint32_t put_va)
     static uint32_t s_get;
     uint32_t va, ret = 0;
     uint32_t budget = 0x200000u;
+    const uint32_t win_lo = XBOX_CONTIG_BASE;
+    const uint32_t win_hi = XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;   /* exclusive */
 
     /* The first kick only establishes where the ring starts; the command
      * there is executed on the next kick, exactly as the old
@@ -312,14 +317,35 @@ void nv2a_pb_run(uint32_t put_va)
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
 
-    while (va != put_va && budget) {
+    /* Any walk that leaves the 64 MB contiguous window means we lost sync with
+     * PUT: the stream was misparsed, a CALL/RETURN was unbalanced, or the ring
+     * wrapped unannounced. Reading there used to follow a stray word that
+     * decoded as a JUMP straight out of the mapping (nv2a_pb_run+0x73 access
+     * violation). Every read and every jump/call target is now validated
+     * against the window; the first violation aborts the walk and resyncs to
+     * PUT, so a desync degrades to one dropped kick instead of a crash. */
+    int desync = 0;
+    const char *why = "?";
+
+    while (va != put_va && budget && !desync) {
+        if (va < win_lo || va + 4u > win_hi || (va & 3u)) {
+            why = "read out of contiguous window";
+            desync = 1;
+            break;
+        }
         uint32_t w = *(const uint32_t *)(mem + va);
         va += 4;
         budget--;
 
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {   /* JUMP */
             uint32_t t = (w & 3u) == 1u ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
-            va = XBOX_CONTIG_BASE | (t & 0x0FFFFFFFu);
+            uint32_t off = t & 0x0FFFFFFFu;
+            if (off + 4u > XBOX_CONTIG_SIZE) {
+                why = "jump target out of window";
+                desync = 1;
+                break;
+            }
+            va = win_lo | off;
             continue;
         }
         if ((w & 0xFFFF0003u) == 0x00020000u) {                     /* RETURN */
@@ -330,8 +356,14 @@ void nv2a_pb_run(uint32_t put_va)
             continue;
         }
         if ((w & 3u) == 2u) {                                       /* CALL */
+            uint32_t off = w & 0x0FFFFFFCu;
+            if (off + 4u > XBOX_CONTIG_SIZE) {
+                why = "call target out of window";
+                desync = 1;
+                break;
+            }
             ret = va;
-            va = XBOX_CONTIG_BASE | (w & 0x0FFFFFFCu);
+            va = win_lo | off;
             continue;
         }
         if ((w & 0x00030003u) == 0u) {                              /* methods */
@@ -340,6 +372,11 @@ void nv2a_pb_run(uint32_t put_va)
             uint32_t method = w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
             for (uint32_t i = 0; i < count; i++, va += 4) {
+                if (va < win_lo || va + 4u > win_hi) {
+                    why = "method payload out of window";
+                    desync = 1;
+                    break;
+                }
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
                 if (s_exec_enabled) {
@@ -356,7 +393,13 @@ void nv2a_pb_run(uint32_t put_va)
                         (unsigned)(va - 4u), w, put_va);
         }
     }
-    if (!budget)
+    if (desync) {
+        static unsigned n;
+        if (n++ < 8)
+            fprintf(stderr, "  [PB] desync at %08X (get %08X put %08X ret %08X): %s; resync to PUT\n",
+                    va, s_get, put_va, ret, why);
+    } else if (!budget) {
         fprintf(stderr, "  [PB] walk budget exhausted at %08X, resync to PUT %08X\n", va, put_va);
+    }
     s_get = put_va;
 }
