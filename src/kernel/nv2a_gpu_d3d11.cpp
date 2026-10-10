@@ -1,5 +1,6 @@
 #include "nv2a_gpu.h"
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <wrl/client.h>
 #include <cstdio>
 #include <cstdlib>
@@ -54,6 +55,7 @@ static struct {
     uint64_t stream_discards, stream_appends;
     uint64_t alias_copies, alias_copy_bytes, alias_copy_reuses, texture_alias_syncs;
     uint64_t compatible_target_views, partial_target_clears, target_layout_syncs;
+    uint64_t memcmp_bytes, scan_fallbacks, scan_steps;
 } gpu_timing;
 
 struct GpuTimer {
@@ -101,6 +103,9 @@ extern "C" void nv2a_gpu_report(void)
                  (unsigned long long)gpu_timing.native_clears, (unsigned long long)gpu_timing.clear_fallbacks);
     std::fprintf(stderr, "[GPU-D3D11] streams: %llu discard maps, %llu append maps\n",
                  (unsigned long long)gpu_timing.stream_discards, (unsigned long long)gpu_timing.stream_appends);
+    std::fprintf(stderr, "[GPU-D3D11] texture validate: %.3f GiB memcmp, %llu scan fallbacks, %llu scan steps\n",
+                 (double)gpu_timing.memcmp_bytes / 1073741824.0,
+                 (unsigned long long)gpu_timing.scan_fallbacks, (unsigned long long)gpu_timing.scan_steps);
     std::fprintf(stderr, "[GPU-D3D11] source aliases: %llu GPU copies, %.3f GiB, %llu reused; %llu CPU synchronization fallbacks\n",
                  (unsigned long long)gpu_timing.alias_copies, (double)gpu_timing.alias_copy_bytes / 1073741824.0,
                  (unsigned long long)gpu_timing.alias_copy_reuses, (unsigned long long)gpu_timing.texture_alias_syncs);
@@ -157,6 +162,10 @@ extern "C" void nv2a_gpu_report(void)
 
 static ComPtr<ID3D11Device> device;
 static ComPtr<ID3D11DeviceContext> context;
+/* D3D11.1 context, if the device supports constant-buffer offsetting. Lets the
+ * whole constant buffer live in one dynamic ring bound by offset, instead of a
+ * Map(DISCARD)/Unmap rename per draw. Null => fall back to the single buffer. */
+static ComPtr<ID3D11DeviceContext1> context1;
 static ComPtr<ID3D11Query> completion_event;
 static bool pending_draws;
 
@@ -386,6 +395,8 @@ static ComPtr<ID3D11InputLayout> input_layout;
 static ComPtr<ID3D11Buffer> constant_buffer;
 static Constants uploaded_constants;
 static bool uploaded_constants_valid;
+/* Offset within constant_stream.buffer of the currently uploaded_constants. */
+static UINT constant_upload_offset;
 struct DynamicStream {
     ComPtr<ID3D11Buffer> buffer;
     UINT capacity = 0, used = 0;
@@ -393,7 +404,12 @@ struct DynamicStream {
     bool active = false;   /* Map held across draws until the ring wraps / frame ends */
 };
 static std::array<DynamicStream,2> vertex_streams;
+static DynamicStream constant_stream;
 static DynamicStream index_stream;
+/* Ring slot for one Constants upload, 256-byte aligned as VSSetConstantBuffers1
+ * requires. NumConstants must cover the whole HLSL cbuffer. */
+static constexpr UINT kConstantSlot = (UINT)((sizeof(Constants) + 255u) & ~255u);
+static constexpr UINT kConstantCount = kConstantSlot / 16u;
 static void release_stream(DynamicStream &stream);
 static ComPtr<ID3D11RasterizerState> rasterizer;
 static std::array<ComPtr<ID3D11RasterizerState>,12> raster_states;
@@ -1432,6 +1448,7 @@ extern "C" void nv2a_gpu_flip(const void *presented, size_t bytes)
     gpu_sync_impl(true, presented, bytes);
     /* Frame boundary: the GPU has consumed the stream; release the held Map. */
     for (auto &stream : vertex_streams) release_stream(stream);
+    release_stream(constant_stream);
     s_texture_validate_serial++;
     for (auto &surface : surfaces)
         if (!surface.dirty) surface.needs_refresh = true;
@@ -1461,6 +1478,7 @@ extern "C" void nv2a_gpu_invalidate(void)
 {
     nv2a_gpu_sync();
     for (auto &stream : vertex_streams) release_stream(stream);
+    release_stream(constant_stream);
     surfaces.clear();
     depth_surfaces.clear();
 }
@@ -1659,7 +1677,8 @@ static bool map_stream(DynamicStream &stream, UINT bytes, UINT bind, const char 
          * then the next map starts at 0). A frame carries ~15 MB of fixed
          * function vertices, so 512 KB wrapped it ~30-120x per frame and each
          * DISCARD became a DXVK rename/wait. Size it to hold a whole frame. */
-        UINT capacity = (bind & D3D11_BIND_VERTEX_BUFFER) ? 32u * 1024 * 1024 : 64 * 1024;
+        UINT capacity = (bind & D3D11_BIND_VERTEX_BUFFER) ? 32u * 1024 * 1024 :
+                        (bind & D3D11_BIND_CONSTANT_BUFFER) ? 32u * 1024 * 1024 : 64 * 1024;
         while (capacity < bytes) capacity *= 2;
         D3D11_BUFFER_DESC description = {};
         description.ByteWidth = capacity; description.Usage = D3D11_USAGE_DYNAMIC;
@@ -1890,6 +1909,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
             if (tex_validate_once() && !texture.force_validate &&
                     texture.validated_serial == s_texture_validate_serial)
                 return texture.view.Get();
+            gpu_timing.memcmp_bytes += binding.source_bytes;
             if (std::memcmp(texture.source_snapshot.data(), binding.source, binding.source_bytes) == 0) {
                 texture.validated_serial = s_texture_validate_serial;
                 texture.force_validate = false;
@@ -1902,10 +1922,14 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         auto index = texture_index_by_source.find(binding.source);
         if (index != texture_index_by_source.end() && key_matches(textures[index->second])) {
             if (auto *view = check(textures[index->second])) return view;
-        } else for (auto &texture : textures) {
-            if (!key_matches(texture)) continue;
-            if (auto *view = check(texture)) return view;
-            break;
+        } else {
+            gpu_timing.scan_fallbacks++;
+            for (auto &texture : textures) {
+                gpu_timing.scan_steps++;
+                if (!key_matches(texture)) continue;
+                if (auto *view = check(texture)) return view;
+                break;
+            }
         }
     }
     GpuTimer upload_timer(gpu_timing.upload);
@@ -2732,10 +2756,25 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     }
     if (state->indices) context->IASetIndexBuffer(vertex_stream.buffer.Get(), DXGI_FORMAT_R32_UINT, index_offset);
     else context->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
+    UINT constants_offset = 0;
+    bool constants_ring = false;
     {
         GpuTimer constants_timer(gpu_timing.constants);
-        if (uploaded_constants_valid && !std::memcmp(&uploaded_constants, &constants, sizeof constants)) {
+        if (context1 && uploaded_constants_valid && constant_stream.active &&
+                !std::memcmp(&uploaded_constants, &constants, sizeof constants)) {
+            /* Same constants as the last upload this frame: rebind its offset. */
             gpu_timing.constant_reuses++;
+            constants_offset = constant_upload_offset;
+            constants_ring = true;
+        } else if (context1) {
+            if (!map_stream(constant_stream, kConstantSlot, D3D11_BIND_CONSTANT_BUFFER, "constants", constants_offset))
+                return 0;
+            std::memcpy((uint8_t *)constant_stream.mapped.pData + constants_offset, &constants, sizeof constants);
+            constant_upload_offset = constants_offset;
+            uploaded_constants = constants;
+            uploaded_constants_valid = true;
+            gpu_timing.constant_uploads++;
+            constants_ring = true;
         } else {
             D3D11_MAPPED_SUBRESOURCE constant_map = {};
             if (!target_operation_succeeded("constants", "upload map",
@@ -2760,6 +2799,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     phase_timer.next_phase(gpu_timing.draw_submit);
     UINT stride = vertex_stride, offset = vertex_offset;
     ID3D11Buffer *buffers[] = {vertex_stream.buffer.Get()}, *constants_buffer[] = {constant_buffer.Get()};
+    ID3D11Buffer *constant_ring_buffer = constant_stream.buffer.Get();
     ID3D11RenderTargetView *target = surface->target.Get();
     ID3D11ShaderResourceView *resources[12] = {}; ID3D11SamplerState *sampler_states[4];
     for (uint32_t stage = 0; stage < 4; stage++) {
@@ -2779,8 +2819,15 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         guest_vertex || state->fixed_transform || state->flat_shading ? geometry_shader.Get() : nullptr;
     context->GSSetShader(geometry, nullptr, 0);
     context->PSSetShader(program, nullptr, 0);
-    context->VSSetConstantBuffers(0, 1, constants_buffer); context->PSSetConstantBuffers(0, 1, constants_buffer);
-    context->GSSetConstantBuffers(0, 1, constants_buffer);
+    if (constants_ring && context1) {
+        UINT first = constants_offset / 16u, num = kConstantCount;
+        context1->VSSetConstantBuffers1(0, 1, &constant_ring_buffer, &first, &num);
+        context1->PSSetConstantBuffers1(0, 1, &constant_ring_buffer, &first, &num);
+        context1->GSSetConstantBuffers1(0, 1, &constant_ring_buffer, &first, &num);
+    } else {
+        context->VSSetConstantBuffers(0, 1, constants_buffer); context->PSSetConstantBuffers(0, 1, constants_buffer);
+        context->GSSetConstantBuffers(0, 1, constants_buffer);
+    }
     context->PSSetShaderResources(0, 12, resources); context->PSSetSamplers(0, 4, sampler_states);
     D3D11_VIEWPORT viewport = {0,0,(float)state->width,(float)state->height,0,1};
     D3D11_BOX region = {};
@@ -2886,6 +2933,14 @@ extern "C" int nv2a_gpu_available(void)
             return 0;
         }
         std::fprintf(stderr, "[GPU-D3D11] device ready: feature level 0x%X, hardware\n", (unsigned)level);
+        if (SUCCEEDED(context.As(&context1))) {
+            D3D11_FEATURE_DATA_D3D11_OPTIONS options = {};
+            if (FAILED(device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof options)) ||
+                !options.ConstantBufferOffsetting)
+                context1.Reset();
+        }
+        std::fprintf(stderr, "[GPU-D3D11] constant buffer offsetting: %s\n",
+                     context1 ? "supported" : "unavailable, using per-draw Map");
     }
     return device != nullptr;
 }
