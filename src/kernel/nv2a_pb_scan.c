@@ -327,6 +327,13 @@ void nv2a_pb_run(uint32_t put_va)
     int desync = 0;
     const char *why = "?";
 
+    /* Keep the last top-level words the walk read, so the first time it lands
+     * on an undecodable word (or a jump/call out of the window) we can show
+     * what packets led there. A misparse -- one word read as a method/jump
+     * header -- is otherwise invisible until it has already run off the end. */
+    static struct { uint32_t va, w; } recent[32];
+    static unsigned recent_n;
+
     while (va != put_va && budget && !desync) {
         if (va < win_lo || va + 4u > win_hi || (va & 3u)) {
             why = "read out of contiguous window";
@@ -334,6 +341,9 @@ void nv2a_pb_run(uint32_t put_va)
             break;
         }
         uint32_t w = *(const uint32_t *)(mem + va);
+        unsigned slot = recent_n++ & 31u;
+        recent[slot].va = va;
+        recent[slot].w = w;
         va += 4;
         budget--;
 
@@ -372,6 +382,10 @@ void nv2a_pb_run(uint32_t put_va)
             uint32_t method = w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
             for (uint32_t i = 0; i < count; i++, va += 4) {
+                /* PUT only advances on a command boundary, so the last payload
+                 * word ends exactly at PUT: stop the moment we reach it and
+                 * never read a word past the frame. */
+                if (va == put_va) break;
                 if (va < win_lo || va + 4u > win_hi) {
                     why = "method payload out of window";
                     desync = 1;
@@ -388,9 +402,19 @@ void nv2a_pb_run(uint32_t put_va)
         }
         {
             static unsigned n;
-            if (n++ < 32)
-                fprintf(stderr, "[PB-UNK] va %08X word %08X (put %08X)\n",
-                        (unsigned)(va - 4u), w, put_va);
+            if (n++ < 4) {
+                fprintf(stderr, "[PB-UNK] va %08X word %08X (get %08X put %08X ret %08X); last packets:\n",
+                        (unsigned)(va - 4u), w, s_get, put_va, ret);
+                for (int k = 31; k >= 0; k--) {
+                    unsigned idx = (recent_n - 1u - (unsigned)k) & 31u;
+                    uint32_t rw = recent[idx].w;
+                    const char *kind = (rw & 3u) == 2u ? "CALL" :
+                                       ((rw & 3u) == 1u || (rw & 0xE0000003u) == 0x20000000u) ? "JUMP" :
+                                       (rw & 0xFFFF0003u) == 0x00020000u ? "RET " :
+                                       (rw & 0x00030003u) == 0u ? "METH" : "    ";
+                    fprintf(stderr, "    %08X %08X %s\n", recent[idx].va, rw, kind);
+                }
+            }
         }
     }
     if (desync) {
