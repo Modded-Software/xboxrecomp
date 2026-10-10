@@ -46,6 +46,31 @@
 
 static volatile LONG g_cpu_irql = PASSIVE_LEVEL;
 
+/* A host ISR/DPC thread runs the interrupted work at its own device level,
+ * which the guest must never observe: on hardware the dispatcher restores the
+ * interrupted IRQL before that thread runs again, so no guest thread can read
+ * the ISR's level. Here the device threads run concurrently with guest threads,
+ * and swapping the one shared g_cpu_irql let them: a guest KfRaiseIrql(2) that
+ * landed inside an ISR got 16 back and later lowered to 16 "while at 2" (the
+ * gate left shut and 16 written into KPCR), and an IrqlLeaveInterrupt restored
+ * its saved level over a raise the guest made meanwhile. The ISR level is kept
+ * per host thread; the guest's shared level is left alone, which is also why
+ * the shared model below stays. */
+static RECOMP_TLS int t_isr_irql = -1;   /* this ISR/DPC thread's level; -1 = not in one */
+static volatile LONG g_isr_active;       /* host ISRs/DPCs in flight */
+
+static KIRQL irql_swap(KIRQL v)
+{
+    if (t_isr_irql >= 0) { KIRQL o = (KIRQL)t_isr_irql; t_isr_irql = v; return o; }
+    return (KIRQL)InterlockedExchange(&g_cpu_irql, (LONG)v);
+}
+
+static KIRQL irql_now(void)
+{
+    return t_isr_irql >= 0 ? (KIRQL)t_isr_irql
+                           : (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0);
+}
+
 /* The current IRQL, where guest code reads it: KPCR.Irql, fs:[0x24].
  *
  * The XDK does not always ask the kernel. DirectSound's lock
@@ -65,7 +90,7 @@ static void irql_publish(void)
     if (g_fs_base)
         *(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + g_fs_base
                               + 0x24) =
-            (uint8_t)InterlockedCompareExchange(&g_cpu_irql, 0, 0);
+            (uint8_t)irql_now();
 }
 
 /* Non-zero while the processor is at or above DISPATCH_LEVEL. Device models
@@ -74,7 +99,8 @@ static void irql_publish(void)
  * rather than lost. */
 int xbox_IrqlBlocksInterrupts(void)
 {
-    return (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0) >= DISPATCH_LEVEL;
+    return InterlockedCompareExchange(&g_isr_active, 0, 0) > 0
+        || (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0) >= DISPATCH_LEVEL;
 }
 
 /* The current level, for callers that want to report it. A level that stays
@@ -82,7 +108,9 @@ int xbox_IrqlBlocksInterrupts(void)
  * never lowered, not a counter artefact. */
 int xbox_IrqlRaisedCount(void)
 {
-    return (int)(KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0);
+    KIRQL guest = (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0);
+    KIRQL isr = InterlockedCompareExchange(&g_isr_active, 0, 0) > 0 ? 16 : 0;
+    return (int)(guest > isr ? guest : isr);
 }
 
 static int  s_trace = -1;
@@ -202,19 +230,27 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  * DPC, the device level for an ISR -- and code checks: see irql_publish. */
 int xbox_IrqlEnterInterrupt(int level)
 {
-    KIRQL old = (KIRQL)InterlockedExchange(&g_cpu_irql, (LONG)(KIRQL)level);
+    int saved = t_isr_irql;
+    KIRQL old;
+    if (saved < 0)
+        InterlockedIncrement(&g_isr_active);
+    old = saved < 0 ? PASSIVE_LEVEL : (KIRQL)saved;
+    t_isr_irql = level;
     if (old != (KIRQL)level) {
         irql_track(old, (KIRQL)level, IRQL_CALLER());
         irql_publish();
     }
-    return (int)old;
+    return saved;
 }
 
 void xbox_IrqlLeaveInterrupt(int saved)
 {
-    KIRQL old = (KIRQL)InterlockedExchange(&g_cpu_irql, (LONG)(KIRQL)saved);
-    if (old != (KIRQL)saved) {
-        irql_track(old, (KIRQL)saved, IRQL_CALLER());
+    KIRQL cur = (KIRQL)t_isr_irql;
+    t_isr_irql = saved;                   /* dispatcher epilogue: restore the interrupted level */
+    if (saved < 0)
+        InterlockedDecrement(&g_isr_active);
+    if (cur != (KIRQL)(saved < 0 ? PASSIVE_LEVEL : saved)) {
+        irql_track(cur, saved < 0 ? PASSIVE_LEVEL : (KIRQL)saved, IRQL_CALLER());
         irql_publish();
     }
 }
@@ -225,7 +261,7 @@ void xbox_IrqlLeaveInterrupt(int saved)
  */
 KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 {
-    KIRQL old = (KIRQL)InterlockedExchange(&g_cpu_irql, (LONG)NewIrql);
+    KIRQL old = irql_swap(NewIrql);
 
     if (NewIrql < old) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
@@ -244,7 +280,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
  */
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
-    KIRQL old = (KIRQL)InterlockedExchange(&g_cpu_irql, (LONG)NewIrql);
+    KIRQL old = irql_swap(NewIrql);
 
     if (NewIrql > old) {
         /* A lower that sets a higher level than the processor is at. That is
@@ -273,7 +309,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
  */
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
-    KIRQL old = (KIRQL)InterlockedExchange(&g_cpu_irql, DISPATCH_LEVEL);
+    KIRQL old = irql_swap(DISPATCH_LEVEL);
 
     irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
     irql_publish();
