@@ -382,7 +382,7 @@ static std::vector<CachedTexture> textures;
  * key fields. Guest addresses identify a texture, so index by source and fall
  * back to the linear scan only when the key fields differ. Rebuilt whenever the
  * cache size changes (creates and the rare eviction). */
-static std::unordered_map<const void *, size_t> texture_index_by_source;
+static std::unordered_multimap<const void *, size_t> texture_index_by_source;
 static size_t texture_index_count = (size_t)-1;
 static void rebuild_texture_index()
 {
@@ -1919,18 +1919,19 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
             return nullptr;
         };
         if (texture_index_count != textures.size()) rebuild_texture_index();
-        auto index = texture_index_by_source.find(binding.source);
-        if (index != texture_index_by_source.end() && key_matches(textures[index->second])) {
-            if (auto *view = check(textures[index->second])) return view;
-        } else {
-            gpu_timing.scan_fallbacks++;
-            for (auto &texture : textures) {
-                gpu_timing.scan_steps++;
-                if (!key_matches(texture)) continue;
-                if (auto *view = check(texture)) return view;
-                break;
-            }
+        /* key_matches includes source equality, so only same-source entries can
+         * match: a multimap bounds the search to that bucket instead of the
+         * whole cache. */
+        auto range = texture_index_by_source.equal_range(binding.source);
+        int candidates = 0;
+        for (auto it = range.first; it != range.second; ++it) {
+            candidates++;
+            gpu_timing.scan_steps++;
+            if (!key_matches(textures[it->second])) continue;
+            if (auto *view = check(textures[it->second])) return view;
+            break;
         }
+        if (candidates > 1) gpu_timing.scan_fallbacks++;
     }
     GpuTimer upload_timer(gpu_timing.upload);
     uint32_t faces = binding.cube ? 6 : 1;
