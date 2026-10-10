@@ -56,6 +56,7 @@ static struct {
     uint64_t alias_copies, alias_copy_bytes, alias_copy_reuses, texture_alias_syncs;
     uint64_t compatible_target_views, partial_target_clears, target_layout_syncs;
     uint64_t memcmp_bytes, scan_fallbacks, scan_steps;
+    uint64_t texture_calls, surface_scan_iters, surface_count, depth_surface_count;
 } gpu_timing;
 
 struct GpuTimer {
@@ -82,6 +83,9 @@ extern "C" void nv2a_gpu_report(void)
     std::fprintf(stderr, "[GPU-D3D11] draw phases: setup %.3fs textures %.3fs streams %.3fs shaders %.3fs submit %.3fs bookkeeping %.3fs\n",
                  gpu_timing.draw_setup, gpu_timing.draw_textures, gpu_timing.draw_streams,
                  gpu_timing.draw_shaders, gpu_timing.draw_submit, gpu_timing.draw_bookkeeping);
+    std::fprintf(stderr, "[GPU-D3D11] get_texture: %llu calls, %llu surface-scan iters; %llu surfaces, %llu depth surfaces\n",
+                 (unsigned long long)gpu_timing.texture_calls, (unsigned long long)gpu_timing.surface_scan_iters,
+                 (unsigned long long)gpu_timing.surface_count, (unsigned long long)gpu_timing.depth_surface_count);
     std::fprintf(stderr, "[GPU-D3D11] states created: %llu blend, %llu depth, %llu sampler\n",
                  (unsigned long long)gpu_timing.blend_created, (unsigned long long)gpu_timing.depth_created,
                  (unsigned long long)gpu_timing.sampler_created);
@@ -1773,6 +1777,9 @@ static ID3D11ShaderResourceView *get_feedback_texture(const Surface &destination
 static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, const Surface &destination)
 {
     GpuTimer texture_timer(gpu_timing.texture);
+    gpu_timing.texture_calls++;
+    gpu_timing.surface_count = surfaces.size();
+    gpu_timing.depth_surface_count = depth_surfaces.size();
     static const bool mirror_aliases = []() {
         const char *setting = std::getenv("RECOMP_NV2A_GPU_ALIAS_COPIES");
         return !setting || std::strcmp(setting, "0") != 0;
@@ -1814,15 +1821,18 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     bool surface_viewable = (binding.format == 0x12 || binding.format == 0x1E)
                                 ? binding.linear : binding.format == 0x07;
     if (levels == 1 && !binding.cube && !binding.depth && surface_viewable)
-        for (auto &surface : surfaces)
+        for (auto &surface : surfaces) {
+            gpu_timing.surface_scan_iters++;
             if (surface.memory == binding.source && surface.width == binding.width &&
                 surface.height == binding.height && surface.pitch == binding.pitch) {
                 direct = &surface;
                 break;
             }
+        }
     bool dirty_alias = false, copyable_aliases = mirror_aliases && direct && !direct->dirty;
     uint64_t alias_serial = 0;
     for (auto &surface : surfaces) {
+        gpu_timing.surface_scan_iters++;
         uintptr_t surface_begin = (uintptr_t)surface.memory, surface_end = surface_begin + (size_t)surface.pitch * surface.height;
         if (begin >= surface_end || end <= surface_begin) continue;
         if (&surface != direct && surface.dirty) {
@@ -1833,6 +1843,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         }
     }
     for (auto &surface : depth_surfaces) {
+        gpu_timing.surface_scan_iters++;
         uintptr_t surface_begin = (uintptr_t)surface.memory, surface_end = surface_begin + (size_t)surface.pitch * surface.height;
         if (begin < surface_end && end > surface_begin) {
             if (surface.dirty) { dirty_alias = true; copyable_aliases = false; }
