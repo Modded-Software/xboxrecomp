@@ -491,6 +491,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 xbox_FramebufferMouseCapture(0);
             return 0;
         }
+        /* Alt+F10 is the keyboard maximize on most desktops; the framebuffer
+         * window must stay 1:1, so swallow the chord. */
+        if (w == VK_F10 && (GetKeyState(VK_MENU) & 0x8000))
+            return 0;
         /* Alt (VK_MENU) must not reach the default handler: it opens the
          * system-menu loop, which swallowed the Esc. Other system keys (Alt+F4)
          * still fall through. */
@@ -629,7 +633,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     /* The window is never maximized. The WM force-fits a window larger than
      * the monitor, which crops a 1:1 framebuffer to the screen and makes the
-     * window look fullscreen, so both the state and the size are pinned. */
+     * window look fullscreen, so every path to a maximized state is pinned:
+     * the style (no WS_MAXIMIZEBOX, below), the tracked size, the size-change
+     * notification, the non-client double-click, the system menu/keyboard
+     * command, and the window manager's own EWMH maximize request. Wine
+     * maximizes to the work area regardless of WS_MAXIMIZEBOX, so the style
+     * alone is not enough. */
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mmi = (MINMAXINFO *)l;
         RECT r;
@@ -641,10 +650,40 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     }
 
+    /* Double-clicking the title bar toggles maximize on Windows; some window
+     * managers do the same, so swallow it. */
+    case WM_NCLBUTTONDBLCLK:
+        if (w == HTCAPTION || w == HTSYSMENU)
+            return 0;
+        break;
+
+    /* Alt+F10 is the keyboard maximize on most systems; the window must stay
+     * 1:1. Handled alongside the other key chords below. */
+
     case WM_SIZE:
-        if (IsZoomed(h))
+        if (w == SIZE_MAXIMIZED || IsZoomed(h))
             ShowWindow(h, SW_RESTORE);
         return 0;
+
+    /* A window manager can maximize through EWMH without sending the system
+     * command; catch the resulting zoomed or oversized state and put the
+     * window back to the 1:1 framebuffer size. */
+    case WM_WINDOWPOSCHANGED: {
+        RECT r, want;
+        want.left = 0; want.top = 0;
+        want.right = (LONG)s_fb_width; want.bottom = (LONG)s_fb_height;
+        AdjustWindowRect(&want, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, FALSE);
+        GetWindowRect(h, &r);
+        if (IsZoomed(h) ||
+            (r.right - r.left) > (want.right - want.left) ||
+            (r.bottom - r.top) > (want.bottom - want.top)) {
+            ShowWindow(h, SW_RESTORE);
+            SetWindowPos(h, NULL, 0, 0,
+                         want.right - want.left, want.bottom - want.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        break;
+    }
 
     case WM_SYSCOMMAND:
         if ((w & 0xFFF0) == SC_MAXIMIZE)

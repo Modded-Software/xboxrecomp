@@ -31,6 +31,36 @@ static LRESULT CALLBACK vp_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         InterlockedExchange(&s_playing, 0);
         return 0;
     }
+    /* The video window is a fixed 640x480 surface; like the framebuffer it
+     * must never maximize (Windows or a Wine window manager), or the movie
+     * is force-fitted to the screen. */
+    switch (m) {
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO *mmi = (MINMAXINFO *)l;
+        RECT r;
+        r.left = 0; r.top = 0; r.right = VP_WINDOW_W; r.bottom = VP_WINDOW_H;
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, FALSE);
+        mmi->ptMaxSize.x = mmi->ptMaxTrackSize.x = r.right - r.left;
+        mmi->ptMaxSize.y = mmi->ptMaxTrackSize.y = r.bottom - r.top;
+        return 0;
+    }
+    case WM_NCLBUTTONDBLCLK:
+        if (w == HTCAPTION || w == HTSYSMENU)
+            return 0;
+        break;
+    case WM_SYSKEYDOWN:
+        if (w == VK_F10 && (l & (1 << 29)))
+            return 0;
+        break;
+    case WM_SIZE:
+        if (w == SIZE_MAXIMIZED || IsZoomed(h))
+            ShowWindow(h, SW_RESTORE);
+        return 0;
+    case WM_SYSCOMMAND:
+        if ((w & 0xFFF0) == SC_MAXIMIZE)
+            return 0;
+        break;
+    }
     return DefWindowProcA(h, m, w, l);
 }
 
@@ -47,9 +77,9 @@ static HWND vp_create_window(void)
     RegisterClassA(&wc);
 
     r.left = 0; r.top = 0; r.right = VP_WINDOW_W; r.bottom = VP_WINDOW_H;
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, FALSE);
     return CreateWindowExA(0, "XboxRecompVideo", "Xbox Recomp - Video",
-                           WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                           (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,
                            NULL, NULL, GetModuleHandleA(NULL), NULL);
