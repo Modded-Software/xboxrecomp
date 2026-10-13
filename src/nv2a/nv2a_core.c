@@ -23,6 +23,112 @@ NV2AState *nv2a_get_state(void) {
     return g_nv2a;
 }
 
+/* Snapshot the guest-programmed display gamma ramp (PRMDIO VGA DAC palette)
+ * for the framebuffer window. out is 256*3 bytes, R,G,B per entry; may be NULL
+ * if the caller only wants the identity check. Returns nonzero when the ramp
+ * is not identity, so the caller can keep its zero-cost memcpy fast path.
+ *
+ * RECOMP_GAMMA=<percent> is a debug/ test override: it synthesises a uniform
+ * brightness ramp (100 = identity) so the display path can be exercised
+ * without driving the in-game slider. */
+static int (*volatile s_gamma_source)(uint8_t *out) = NULL;
+
+void xbox_GammaSetSourceHook(int (*hook)(uint8_t *out))
+{
+    s_gamma_source = hook;
+}
+
+int xbox_GammaRampGet(uint8_t *out)
+{
+    NV2AState *d = g_nv2a;
+    uint8_t ramp[256 * 3];
+    int i, identity = 1;
+
+    static int override_ready = 0;
+    static double override_percent = 100.0;
+    if (!override_ready) {
+        const char *v = getenv("RECOMP_GAMMA");
+        if (v && *v)
+            override_percent = strtod(v, NULL);
+        override_ready = 1;
+    }
+    if (override_percent != 100.0) {
+        for (i = 0; i < 256; i++) {
+            int o = (int)(i * override_percent / 100.0 + 0.5);
+            if (o < 0) o = 0;
+            if (o > 255) o = 255;
+            ramp[i * 3 + 0] = (uint8_t)o;
+            ramp[i * 3 + 1] = (uint8_t)o;
+            ramp[i * 3 + 2] = (uint8_t)o;
+        }
+        if (out) memcpy(out, ramp, sizeof(ramp));
+        return 1;
+    }
+
+    if (s_gamma_source && s_gamma_source(ramp)) {
+        /* Title-supplied ramp (the one D3D accepted); skip the DAC copy. */
+    } else if (!d) {
+        for (i = 0; i < 256; i++)
+            ramp[i * 3 + 0] = ramp[i * 3 + 1] = ramp[i * 3 + 2] = (uint8_t)i;
+        if (out) memcpy(out, ramp, sizeof(ramp));
+        return 0;
+    } else for (;;) {
+        /* Seqlock read: retry until the writer is idle across the copy. */
+        LONG s1 = d->puserdac.seq;
+        LONG s2;
+        if (s1 & 1)
+            continue;
+        memcpy(ramp, d->puserdac.palette, sizeof(ramp));
+        s2 = d->puserdac.seq;
+        if (s1 == s2)
+            break;
+    }
+
+    for (i = 0; i < 256 && identity; i++) {
+        if (ramp[i * 3 + 0] != (uint8_t)i ||
+            ramp[i * 3 + 1] != (uint8_t)i ||
+            ramp[i * 3 + 2] != (uint8_t)i)
+            identity = 0;
+    }
+
+    if (!identity && out && getenv("DIAG")) {
+        static int logged = 0;
+        if (!logged) {
+            logged = 1;
+            fprintf(stderr, "  NV2A: gamma ramp active: %02X %02X %02X ... "
+                            "%02X %02X %02X\n",
+                    ramp[0], ramp[1], ramp[2],
+                    ramp[765], ramp[766], ramp[767]);
+            fflush(stderr);
+        }
+    }
+
+    /* Log every change to the captured ramp, so a slider move can be told
+     * apart from the boot-time default. */
+    if (out && getenv("DIAG")) {
+        static uint8_t last[256 * 3];
+        static int have_last = 0;
+        if (!have_last || memcmp(last, ramp, sizeof(ramp)) != 0) {
+            int k, ndiff = 0, maxd = 0;
+            have_last = 1;
+            memcpy(last, ramp, sizeof(ramp));
+            for (k = 0; k < 256; k++) {
+                int d = (int)ramp[k * 3] - k;
+                if (d < 0) d = -d;
+                if (d) { ndiff++; if (d > maxd) maxd = d; }
+            }
+            fprintf(stderr, "  NV2A: gamma ramp now: r[64]=%02X r[128]=%02X "
+                            "r[192]=%02X r[255]=%02X  ndiff=%d maxdiff=%d\n",
+                    ramp[64 * 3], ramp[128 * 3], ramp[192 * 3], ramp[255 * 3],
+                    ndiff, maxd);
+            fflush(stderr);
+        }
+    }
+
+    if (out) memcpy(out, ramp, sizeof(ramp));
+    return !identity;
+}
+
 int nv2a_get_pvideo_overlay(uint32_t *offset, uint32_t *pitch,
                             uint32_t *width, uint32_t *height,
                             uint32_t *out_x, uint32_t *out_y,
@@ -509,6 +615,95 @@ void pramdac_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 }
 
 /* ============================================================
+ * PRMDIO - VGA DAC palette (display gamma)
+ * ============================================================
+ *
+ * The block aliases the VGA DAC ports: the guest writes an entry index to
+ * NV_USER_DAC_WRITE_MODE_ADDRESS (0x3C8) and then the R, G, B bytes of each
+ * palette entry to NV_USER_DAC_PALETTE_DATA (0x3C9). The Xbox D3D miniport
+ * programs the display gamma ramp this way (D3D::CMiniport::
+ * DacProgramGammaRamp) when the title calls IDirect3DDevice8::SetGammaRamp,
+ * which is what the in-game brightness slider drives. This used to be a stub,
+ * so the ramp was dropped and the slider had no effect. Captured here, applied
+ * by the framebuffer window (xbox_GammaRampGet -> fb_present.c). */
+
+uint64_t prmdio_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    uint64_t r = 0;
+
+    switch (addr) {
+    case NV_USER_DAC_WRITE_MODE_ADDRESS:
+        r = d->puserdac.write_mode_address;
+        break;
+    case NV_USER_DAC_PALETTE_DATA:
+        r = d->puserdac.palette[d->puserdac.address * 3 + d->puserdac.position];
+        if (++d->puserdac.position == 3) {
+            d->puserdac.position = 0;
+            d->puserdac.address = (uint8_t)((d->puserdac.address + 1) & 0xFF);
+        }
+        break;
+    default:
+        break;
+    }
+
+    nv2a_reg_log_read(NV_PRMDIO, addr, size, r);
+    return r;
+}
+
+void prmdio_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
+{
+    NV2AState *d = (NV2AState *)opaque;
+
+    nv2a_reg_log_write(NV_PRMDIO, addr, size, val);
+
+    switch (addr) {
+    case NV_USER_DAC_WRITE_MODE_ADDRESS:
+        d->puserdac.write_mode_address = (uint8_t)val;
+        d->puserdac.address = (uint8_t)val;
+        d->puserdac.position = 0;
+        break;
+    case NV_USER_DAC_PALETTE_DATA: {
+        /* Seqlock: seq is odd while the table mutates, so a reader that sees
+         * the same even value before and after copied a consistent ramp. The
+         * cursor auto-increments after the third byte (R,G,B) of an entry,
+         * matching the DAC hardware. */
+        LONG seq = d->puserdac.seq;
+        d->puserdac.seq = seq + 1;
+        d->puserdac.palette[d->puserdac.address * 3 + d->puserdac.position] =
+            (uint8_t)val;
+        if (++d->puserdac.position == 3) {
+            d->puserdac.position = 0;
+            d->puserdac.address = (uint8_t)((d->puserdac.address + 1) & 0xFF);
+        }
+        d->puserdac.identity = 0;
+        d->puserdac.seq = seq + 2;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* Host entries used by the NV2A register trap in xbox_memory_layout.c.
+ *
+ * That build backs the 0xFD000000 aperture as ordinary RAM and never routes
+ * through the block table, so the DAC palette writes have to be trapped at the
+ * page and fed back here by hand. These wrappers keep the NV2AState out of the
+ * kernel file. */
+void xbox_GammaDacInit(void)
+{
+    if (!g_nv2a)
+        nv2a_init_standalone(NULL, 0, NULL, 0);
+}
+
+void xbox_Nv2aDacWrite(uint32_t off, uint32_t val)
+{
+    if (g_nv2a)
+        nv2a_mmio_write(g_nv2a, off, val, 1);
+}
+
+/* ============================================================
  * PVIDEO - video overlay (stub)
  * ============================================================ */
 
@@ -739,7 +934,7 @@ const NV2ABlockInfo blocktable[NV_NUM_BLOCKS] = {
     ENTRY(PCRTC,    pcrtc,    0x600000, 0x001000),
     STUB_ENTRY(PRMCIO,        0x601000, 0x001000),
     ENTRY(PRAMDAC,  pramdac,  0x680000, 0x001000),
-    STUB_ENTRY(PRMDIO,        0x681000, 0x001000),
+    ENTRY(PRMDIO,   prmdio,   0x681000, 0x001000),
     /* NV_PRAMIN = 19 */
     { .name = NULL },
     /* NV_USER = 20 */
@@ -793,6 +988,7 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
     if (g_nv2a) return g_nv2a;
 
     NV2AState *d = (NV2AState *)calloc(1, sizeof(NV2AState));
+    int i;
     if (!d) return NULL;
 
     /* Set up VRAM */
@@ -813,6 +1009,15 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
     /* Default PLL: 233 MHz core clock (Xbox default) */
     d->pramdac.core_clock_coeff = 0x00011C01; /* n=0x1C, m=1, p=0 */
     d->pramdac.core_clock_freq = NV2A_CRYSTAL_FREQ * 0x1C; /* ~233 MHz */
+
+    /* Display gamma starts at identity; the guest's DAC palette writes
+     * (prmdio_write) replace it. */
+    for (i = 0; i < 256; i++) {
+        d->puserdac.palette[i * 3 + 0] = (uint8_t)i;
+        d->puserdac.palette[i * 3 + 1] = (uint8_t)i;
+        d->puserdac.palette[i * 3 + 2] = (uint8_t)i;
+    }
+    d->puserdac.identity = 1;
 
     /* Default timer divisors */
     d->ptimer.numerator = 1;

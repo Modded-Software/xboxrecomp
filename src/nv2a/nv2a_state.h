@@ -148,8 +148,16 @@ typedef struct NV2AState {
         uint32_t fp_hvalid_end;
     } pramdac;
 
+    /* VGA DAC palette (PRMDIO block, NV_USER_DAC_* ports). The guest programs
+     * the display gamma ramp here through IDirect3DDevice8::SetGammaRamp
+     * (D3D::CMiniport::DacProgramGammaRamp). Captured so the window can apply
+     * it at display time; see xbox_GammaRampGet(). */
     struct {
         uint16_t write_mode_address;
+        uint8_t address;    /* auto-incrementing entry cursor (0x3C8 write) */
+        uint8_t position;   /* R/G/B sub-position within an entry (0x3C9) */
+        uint8_t identity;   /* 1 while palette[] is the identity ramp */
+        volatile LONG seq;  /* seqlock: odd while palette[] is being written */
         uint8_t palette[256*3];
     } puserdac;
 
@@ -201,7 +209,22 @@ DEFINE_PROTO(pfb)
 DEFINE_PROTO(pgraph)
 DEFINE_PROTO(pcrtc)
 DEFINE_PROTO(pramdac)
+DEFINE_PROTO(prmdio)
 #undef DEFINE_PROTO
+
+/* Copy the guest-programmed display gamma ramp (PRMDIO VGA DAC palette),
+ * snapshot under a seqlock so the window thread never sees a torn ramp.
+ * Returns nonzero when the ramp differs from identity. out is 256*3 bytes,
+ * R,G,B per entry. */
+int xbox_GammaRampGet(uint8_t *out);
+
+/* Optional title-supplied gamma source. The DAC palette is only programmed
+ * from the D3D miniport's queued-flip service, which in the recompiled runtime
+ * runs only sporadically, so a title wrapper can supply the ramp D3D last
+ * accepted in SetGammaRamp instead. The hook fills out (256*3, R,G,B per
+ * entry) and returns nonzero when it produced a valid ramp; zero falls back
+ * to the captured DAC palette. */
+void xbox_GammaSetSourceHook(int (*hook)(uint8_t *out));
 
 /* Stub read/write for blocks we haven't implemented yet */
 uint64_t nv2a_stub_read(void *opaque, hwaddr addr, unsigned int size);
@@ -229,6 +252,11 @@ void nv2a_mmio_write(NV2AState *d, hwaddr addr, uint64_t val, unsigned int size)
 
 /* Get the global NV2A state instance */
 NV2AState *nv2a_get_state(void);
+
+/* NV2A register-trap bridge (xbox_memory_layout.c traps the PRMDIO page and
+ * feeds the writes back here; see nv2a_core.c). */
+void xbox_GammaDacInit(void);
+void xbox_Nv2aDacWrite(uint32_t off, uint32_t val);
 
 /* Snapshot the active PVIDEO overlay for the lightweight guest framebuffer
  * presenter. Returns zero when the overlay is not enabled. */

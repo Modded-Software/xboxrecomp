@@ -23,6 +23,12 @@
 #include <unistd.h>   /* _exit */
 #endif
 
+/* NV2A display-gamma bridge (nv2a_core.c). The PRMDIO page trap below feeds
+ * each trapped DAC write here; declared here rather than pulling in the NV2A
+ * headers, which this file otherwise does not need. */
+extern void xbox_GammaDacInit(void);
+extern void xbox_Nv2aDacWrite(uint32_t off, uint32_t val);
+
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
 #define XBE_BASE_ADDR_OFFSET    0x0104
@@ -467,6 +473,105 @@ static void ac97_arm_write_trap(void)
     fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
                     " (channel reset completes on write)\n",
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+}
+
+/* ============================================================
+ * NV2A display-gamma (VGA DAC palette) write trap
+ * ============================================================
+ *
+ * The 0xFD000000 aperture is backed as ordinary RAM (see the allocation in
+ * MemoryLayoutInit), so the NV2A block table and its PRMDIO handler are never
+ * reached: the D3D miniport's DacProgramGammaRamp pokes the DAC index and data
+ * bytes straight into RAM and they vanish. The in-game brightness slider calls
+ * IDirect3DDevice8::SetGammaRamp, so with the writes dropped the slider does
+ * nothing.
+ *
+ * The PRMDIO block is exactly one page (0x681000..0x682000). Making it
+ * PAGE_READONLY turns each DAC write into a fault; the handler single-steps
+ * the write (so it still lands in RAM, harmless), then replays the byte
+ * through the NV2A PRMDIO handler. That handler's cursor reproduces the DAC's
+ * auto-increment, which the raw RAM backing cannot -- without it every byte
+ * would overwrite the same address. Reads stay at full speed.
+ */
+#define NV2A_PRMDIO_OFFSET 0x681000u   /* NV_PRMDIO within the NV2A aperture */
+#define NV2A_PRMDIO_SIZE   0x1000u     /* one page */
+
+static void *g_gamma_page = NULL;      /* host address of the trapped page */
+static void *g_gamma_veh  = NULL;
+static RECOMP_TLS int s_gamma_stepping = 0;
+static RECOMP_TLS uint32_t s_gamma_off = 0;
+static int s_gamma_nwrites = 0;
+
+static LONG CALLBACK gamma_write_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    DWORD old;
+
+    if (!g_gamma_page)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    /* Second half: the write has now executed and its byte sits in RAM. Feed
+     * it to the DAC cursor, then close the page again. Thread-local so another
+     * thread cannot consume this single-step and re-protect the page out from
+     * under us. */
+    if (code == EXCEPTION_SINGLE_STEP && s_gamma_stepping) {
+        uint8_t val =
+            *(volatile uint8_t *)((char *)g_gamma_page + s_gamma_off);
+        s_gamma_stepping = 0;
+        xbox_Nv2aDacWrite(NV2A_PRMDIO_OFFSET + s_gamma_off, val);
+        if (getenv("DIAG") && s_gamma_nwrites < 6) {
+            fprintf(stderr, "  NV2A: gamma DAC write off=0x%X val=0x%02X\n",
+                    (unsigned)s_gamma_off, (unsigned)val);
+            s_gamma_nwrites++;
+        }
+        VirtualProtect(g_gamma_page, NV2A_PRMDIO_SIZE, PAGE_READONLY, &old);
+        ep->ContextRecord->EFlags &= ~0x100u;   /* clear TF */
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if (code == EXCEPTION_ACCESS_VIOLATION
+            && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+
+        if (fault >= (uintptr_t)g_gamma_page
+                && fault < (uintptr_t)g_gamma_page + NV2A_PRMDIO_SIZE) {
+            s_gamma_off = (uint32_t)(fault - (uintptr_t)g_gamma_page);
+            if (!VirtualProtect(g_gamma_page, NV2A_PRMDIO_SIZE,
+                                PAGE_READWRITE, &old))
+                return EXCEPTION_CONTINUE_SEARCH;
+            s_gamma_stepping = 1;
+            ep->ContextRecord->EFlags |= 0x100u;   /* TF: step the write */
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void gamma_arm_write_trap(void)
+{
+    DWORD old;
+
+    if (!g_nv2a_memory || g_gamma_page)
+        return;
+
+    g_gamma_page = (char *)g_nv2a_memory + NV2A_PRMDIO_OFFSET;
+    /* First, so it runs before the game target's own crash reporter, which
+     * would otherwise print a DAC write as an access violation. */
+    xbox_GammaDacInit();
+    g_gamma_veh = AddVectoredExceptionHandler(1, gamma_write_veh);
+    if (!g_gamma_veh
+            || !VirtualProtect(g_gamma_page, NV2A_PRMDIO_SIZE,
+                               PAGE_READONLY, &old)) {
+        if (g_gamma_veh) {
+            RemoveVectoredExceptionHandler(g_gamma_veh);
+            g_gamma_veh = NULL;
+        }
+        g_gamma_page = NULL;
+        fprintf(stderr, "  NV2A: could not arm the display-gamma write trap\n");
+        return;
+    }
+    fprintf(stderr, "  NV2A: display-gamma DAC writes trapped at 0x%08X\n",
+            XBOX_NV2A_BASE + NV2A_PRMDIO_OFFSET);
 }
 
 /*
@@ -2796,6 +2901,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",
                     XBOX_NV2A_SIZE / (1024 * 1024), XBOX_NV2A_BASE);
+            gamma_arm_write_trap();
         } else {
             fprintf(stderr, "  WARNING: NV2A aperture at 0x%08X failed "
                     "(error %lu); D3D register access will fault\n",

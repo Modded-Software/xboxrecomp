@@ -31,10 +31,55 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern int xbox_VideoDesiredResolution(uint32_t *width, uint32_t *height);
 int xbox_FramebufferDumpBmp(const char *path);
+/* Display gamma ramp the guest programmed into the NV2A VGA DAC palette
+ * (IDirect3DDevice8::SetGammaRamp -> CMiniport::DacProgramGammaRamp, captured
+ * by the PRMDIO handler). Returns nonzero when the ramp is not identity. */
+extern int xbox_GammaRampGet(uint8_t *out);
 
 static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
+
+/* Per-channel display gamma LUT, refreshed from xbox_GammaRampGet() each
+ * frame. s_gamma_identity keeps the common case a plain memcpy. */
+static uint8_t  s_gamma_r[256], s_gamma_g[256], s_gamma_b[256];
+static int      s_gamma_identity = 1;
+
+static void fb_gamma_refresh(void)
+{
+    uint8_t ramp[256 * 3];
+    int i;
+
+    if (!xbox_GammaRampGet(ramp)) {
+        s_gamma_identity = 1;
+        return;
+    }
+    for (i = 0; i < 256; i++) {
+        s_gamma_r[i] = ramp[i * 3 + 0];
+        s_gamma_g[i] = ramp[i * 3 + 1];
+        s_gamma_b[i] = ramp[i * 3 + 2];
+    }
+    s_gamma_identity = 0;
+}
+
+/* Write `n` pixels of 0x00RRGGBB through the display gamma LUT. dst may equal
+ * src. */
+static void fb_gamma_apply(uint32_t *dst, const uint32_t *src, size_t n)
+{
+    size_t i;
+
+    if (s_gamma_identity) {
+        if (dst != src)
+            memcpy(dst, src, n * sizeof(*dst));
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t v = src[i];
+        dst[i] = ((uint32_t)s_gamma_r[(v >> 16) & 0xFF] << 16) |
+                 ((uint32_t)s_gamma_g[(v >> 8) & 0xFF] << 8) |
+                  (uint32_t)s_gamma_b[v & 0xFF];
+    }
+}
 
 /* A finished frame, taken at the flip and shown until the next one.
  *
@@ -705,7 +750,7 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
         uint32_t *dst = s_rgb + (size_t)y * s_fb_width;
 
         if (bpp == 4) {
-            memcpy(dst, row, (size_t)s_fb_width * 4);
+            fb_gamma_apply(dst, (const uint32_t *)row, s_fb_width);
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
             for (x = 0; x < s_fb_width; x++) {
@@ -713,6 +758,11 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
                 uint32_t r = (uint32_t)((v >> 11) & 0x1F) * 255u / 31u;
                 uint32_t g = (uint32_t)((v >>  5) & 0x3F) * 255u / 63u;
                 uint32_t b = (uint32_t)( v        & 0x1F) * 255u / 31u;
+                if (!s_gamma_identity) {
+                    r = s_gamma_r[r];
+                    g = s_gamma_g[g];
+                    b = s_gamma_b[b];
+                }
                 dst[x] = (r << 16) | (g << 8) | b;
             }
         } else {
@@ -998,6 +1048,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 title_frame = frame;
             }
         }
+        fb_gamma_refresh();
         if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
@@ -1005,8 +1056,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             LONG idx = s_present_idx;
             if (idx != last_drawn) {
                 if (s_present[idx])
-                    memcpy(s_rgb, s_present[idx],
-                           (size_t)s_fb_width * s_fb_height * 4);
+                    fb_gamma_apply(s_rgb, s_present[idx],
+                                   (size_t)s_fb_width * s_fb_height);
                 StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
                               0, 0, (int)s_fb_width, (int)s_fb_height,
                               s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
