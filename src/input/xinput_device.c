@@ -501,6 +501,7 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
         if (camera) {
             float startP = kbm_camf(camera, 0x114u);
             float startY = kbm_camf(camera, 0x11Cu);
+            float rest = kbm_camf(camera, 0x104u);
             float dY = -(float)dx * look_gain;
             float dP = (invert_y ? (float)dy : -(float)dy) * look_gain_y;
             float yaw = startY + dY;
@@ -513,16 +514,20 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
             kbm_cam_setf(camera, 0x11Cu, yaw);
             kbm_cam_setf(camera, 0x114u, pitch);
             /* While moving, tSimCamera::UpdatePitch recenters +0x114 toward
-             * (+0x124 + +0x104) = (0 + rest). Writing our pitch into the rest
-             * field makes that recenter target *our* pitch, so vertical look
-             * survives movement instead of snapping back to -10. */
-            kbm_cam_setf(camera, 0x104u, pitch);
+             * (+0x124 + +0x104). Add the applied delta to the rest field
+             * +0x104 rather than copying the live pitch into it: copying made
+             * the recenter target grow by the game's +0x124 offset every tick.
+             * cControl::UpdateCameraLedgeHang writes +0x124 each tick while
+             * hanging, so the pitch ran away (the "stuck looking up on a
+             * ledge" bug). Accumulating the applied delta keeps vertical look
+             * across movement without letting the offset compound. */
+            kbm_cam_setf(camera, 0x104u, rest + (pitch - startP));
             /* the aim/desired fields the weapon path reads (SetYaw/SetPitch) */
             kbm_cam_setf(camera, 0x20Cu, yaw);
             kbm_cam_setf(camera, 0x204u, pitch);
             if (kbm_valid(look)) {
                 float tY = kbm_camf(look, 0x14u) + dY;
-                float tP = kbm_camf(look, 0x10u) + dP;
+                float tP = kbm_camf(look, 0x10u) + (pitch - startP);
                 while (tY >= 360.0f) tY -= 360.0f;
                 while (tY <    0.0f) tY += 360.0f;
                 if (tP >  89.0f) tP =  89.0f;
