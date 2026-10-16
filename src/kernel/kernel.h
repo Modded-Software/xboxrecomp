@@ -394,9 +394,16 @@ typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
 /* Contiguous / physical memory window. Mapped by xbox_MemoryLayoutInit;
  * MmAllocateContiguousMemory hands back addresses inside it, and
  * MmClaimGpuInstanceMemory reports GPU instance memory at its top. Shared so
- * the layout and the bridges cannot disagree about where it is. */
+ * the layout and the bridges cannot disagree about where it is.
+ *
+ * The window mirrors the machine's physical RAM, so it must be as large as the
+ * RAM the title is told it has. Ghost.xbe is a Debug/devkit XBE run at the
+ * 128 MB devkit size (XBOX_DEVKIT_RAM, main.c), but this was pinned at the
+ * retail 64 MB: the title budgeted caches against 128 MB and filled the 64 MB
+ * window, so every MmAllocateContiguousMemory past ~63 MB failed and the title
+ * wedged (presentation froze) when a level checkpoint tried to allocate. */
 #define XBOX_CONTIG_BASE 0x80000000u
-#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
+#define XBOX_CONTIG_SIZE (128u * 1024u * 1024u)
 
 /* Default GPU instance size, used when a caller asks to claim everything. */
 #define XBOX_GPU_INSTANCE_DEFAULT (128u * 1024u)

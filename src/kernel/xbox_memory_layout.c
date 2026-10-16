@@ -3743,6 +3743,7 @@ static uint32_t g_contig_next = XBOX_CONTIG_BASE + 0x1000u;
 static struct { uint32_t addr, size; int free; } g_contig_blocks[CONTIG_MAX_BLOCKS];
 static int g_contig_block_count;
 static SRWLOCK g_contig_lock = SRWLOCK_INIT;
+unsigned long long g_contig_allocs, g_contig_frees, g_contig_free_hits, g_contig_free_bytes;
 
 static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
 {
@@ -3754,6 +3755,53 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
     g_contig_blocks[at].size = size;
     g_contig_blocks[at].free = is_free;
     g_contig_block_count++;
+}
+
+/* Report the arena composition (caller holds g_contig_lock). Names the largest
+ * live blocks so an exhausted window points at what is holding it. */
+static void contig_report_locked(const char *why, uint32_t req)
+{
+    int i, n;
+    unsigned live = 0, live_bytes = 0, free_bytes = 0;
+    struct { uint32_t off, size; } top[8];
+    int ntop = 0;
+
+    for (i = 0; i < g_contig_block_count; i++) {
+        uint32_t off = g_contig_blocks[i].addr - XBOX_CONTIG_BASE;
+        if (g_contig_blocks[i].free) {
+            free_bytes += g_contig_blocks[i].size;
+            continue;
+        }
+        live++;
+        live_bytes += g_contig_blocks[i].size;
+        if (ntop < 8) {
+            top[ntop].off = off;
+            top[ntop].size = g_contig_blocks[i].size;
+            ntop++;
+        } else {
+            int m = 0;
+            for (n = 1; n < 8; n++)
+                if (top[n].size < top[m].size) m = n;
+            if (g_contig_blocks[i].size > top[m].size) {
+                top[m].off = off;
+                top[m].size = g_contig_blocks[i].size;
+            }
+        }
+    }
+    fprintf(stderr,
+            "[CONTIG-REPORT] %s req=%u blocks=%d live=%u live_bytes=%u "
+            "free_bytes=%u bump=0x%X\n",
+            why, req, g_contig_block_count, live, live_bytes, free_bytes,
+            g_contig_next - XBOX_CONTIG_BASE);
+    fprintf(stderr,
+            "[CONTIG-REPORT] allocs=%llu frees=%llu free_hits=%llu "
+            "freed_bytes=%llu reclaim=%d\n",
+            g_contig_allocs, g_contig_frees, g_contig_free_hits,
+            g_contig_free_bytes, xbox_HeapReclaimEnabled());
+    for (i = 0; i < ntop; i++)
+        fprintf(stderr, "[CONTIG-REPORT]   live off=0x%06X size=%u\n",
+                top[i].off, top[i].size);
+    fflush(stderr);
 }
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
@@ -3802,6 +3850,13 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
             fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
                     size, g_contig_next - XBOX_CONTIG_BASE,
                     (unsigned)XBOX_CONTIG_SIZE);
+            {
+                static int reports;
+                if (reports < 12) {
+                    reports++;
+                    contig_report_locked("exhausted", size);
+                }
+            }
             fflush(stderr);
             ReleaseSRWLockExclusive(&g_contig_lock);
             return 0;
@@ -3812,6 +3867,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
         contig_insert(g_contig_block_count, result, size, 0);
         g_contig_next = result + size;
     }
+    g_contig_allocs++;
     ReleaseSRWLockExclusive(&g_contig_lock);
 
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
@@ -3827,11 +3883,14 @@ int xbox_ContiguousFree(uint32_t addr)
     if (!xbox_HeapReclaimEnabled())
         return 0;
     AcquireSRWLockExclusive(&g_contig_lock);
+    g_contig_frees++;
     for (i = 0; i < g_contig_block_count; i++) {
         if (g_contig_blocks[i].addr != addr || g_contig_blocks[i].free)
             continue;
         g_contig_blocks[i].free = 1;
         found = 1;
+        g_contig_free_hits++;
+        g_contig_free_bytes += g_contig_blocks[i].size;
         if (i + 1 < g_contig_block_count && g_contig_blocks[i + 1].free
                 && g_contig_blocks[i].addr + g_contig_blocks[i].size == g_contig_blocks[i + 1].addr) {
             g_contig_blocks[i].size += g_contig_blocks[i + 1].size;

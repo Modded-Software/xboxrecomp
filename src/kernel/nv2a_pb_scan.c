@@ -30,7 +30,7 @@
 #define XBOX_CONTIG_BASE 0x80000000u   /* physical P is at this + P */
 #endif
 #ifndef XBOX_CONTIG_SIZE
-#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
+#define XBOX_CONTIG_SIZE (128u * 1024u * 1024u)
 #endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
