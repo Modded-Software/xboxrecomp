@@ -1,12 +1,10 @@
 # xboxrecomp
 
-**xboxrecomp** is a runtime for statically recompiled original Xbox games. The
-game's x86 code is lifted to C and runs natively; the runtime emulates the
-console hardware underneath it.
+Runtime for statically recompiled Xbox games, forked from
+[sp00nznet/xboxrecomp](https://github.com/sp00nznet/xboxrecomp) to run
+StarCraft: Ghost in [xbox-on-deb](../xbox-on-deb).
 
-This fork aims for hardware emulation accuracy: the runtime behaves the way the
-Xbox hardware does, so the game's own code paths run unchanged. It is developed
-for StarCraft: Ghost in [xbox-on-deb](../xbox-on-deb).
+We aim for accurate hardware emulation.
 
 ## Build
 
@@ -74,9 +72,6 @@ be replayed hands-free.
 
 ## Differences from upstream
 
-Each change moves a component toward the hardware's behaviour, so the game's
-code gets the results it was written against.
-
 | Area | Upstream | This fork | Reason |
 | --- | --- | --- | --- |
 | GP/EP DSP | mixbin passthrough | DSP56300 engine runs the game's downloaded programs | The game's effects and final mix are DSP programs; running them produces the console's output |
@@ -84,9 +79,7 @@ code gets the results it was written against.
 | HRTF | off | on, matching xemu | The VP applies per-voice 3D filtering on hardware |
 | Resampling | SRC stubs | vendored libsamplerate | Pitch-shifted voices resample through the same sinc converter as xemu |
 | Release asserts | removed by `-DNDEBUG` | logged as `[APU-ASSERT]` lines | Hardware-state violations stay visible in release builds |
-| IRQL | thread-local value | guest TIB byte `fs:[0x24]` | The game reads IRQL from that byte |
 | DISPATCH exclusion | shared IRQL value | recursive DISPATCH lock, NV2A IRQ-status ack thread | The console has one CPU; DISPATCH code never interleaves on it |
-| x87 precision | results kept at double precision | rounded through `RECOMP_FP_PC` | When the game sets the x87 control word to single precision, results round to a 24-bit mantissa as on the CPU |
 
 ## Runtime switches
 
