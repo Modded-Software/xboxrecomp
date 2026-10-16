@@ -876,6 +876,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
          * fills cannot wedge the voice. */
         {
             static int ssl_underrun[MCPX_HW_MAX_VOICES];
+            static uint64_t ssl_underrun_frames;
             if (segment_offset == 0 || segment_length == 0 ||
                 (segment_length & 0xffff) == 0) {
                 if (ssl_underrun[v] < 400) {
@@ -887,6 +888,13 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                 (unsigned)d->vp.ssl[v].base[ssl_index],
                                 (unsigned)page, (unsigned)count,
                                 (unsigned)d->vp.ssl_base_page);
+                    }
+                    if ((++ssl_underrun_frames % 48000) == 0) {
+                        fprintf(stderr,
+                                "[APU-SSL-STAT] underrun frames=%llu (v=%u seg=%d "
+                                "page=0x%X)\n",
+                                (unsigned long long)ssl_underrun_frames,
+                                (unsigned)v, ssl_seg, (unsigned)page);
                     }
                     ssl_underrun[v]++;
                     memset(samples, 0,
