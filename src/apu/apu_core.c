@@ -93,6 +93,48 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
  * routine never ran and no voice completion ever reached it. */
 static volatile LONG s_irq_line;
 
+/* RECOMP_APU_DIAG bookkeeping for the underrun report: when the line last
+ * rose, when the ISR last ran, and how often delivery was held off or had
+ * nothing to call. */
+static long long s_diag_qpf, s_diag_raise_qpc, s_diag_deliver_qpc;
+static unsigned s_diag_held_off, s_diag_no_target, s_diag_delivered;
+
+static long long apu_diag_qpc(void)
+{
+    LARGE_INTEGER c;
+    if (!s_diag_qpf) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        s_diag_qpf = f.QuadPart;
+    }
+    QueryPerformanceCounter(&c);
+    return c.QuadPart;
+}
+
+static double apu_diag_age_ms(long long then, long long now)
+{
+    if (!then || !s_diag_qpf)
+        return -1.0;
+    return (double)(now - then) * 1000.0 / (double)s_diag_qpf;
+}
+
+extern double xbox_DpcDiagDrainAgeMs(void);
+
+void mcpx_apu_diag_irq_report(MCPXAPUState *d, char *buf, size_t n)
+{
+    long long now = apu_diag_qpc();
+    snprintf(buf, n,
+             "irq_line=%ld ists=0x%X ien=0x%X since_raise=%.1fms "
+             "since_isr=%.1fms isr_runs=%u held_off=%u no_target=%u "
+             "dpc_drain_age=%.1fms",
+             (long)InterlockedCompareExchange(&s_irq_line, 0, 0),
+             (unsigned)d->regs[NV_PAPU_ISTS], (unsigned)d->regs[NV_PAPU_IEN],
+             apu_diag_age_ms(s_diag_raise_qpc, now),
+             apu_diag_age_ms(s_diag_deliver_qpc, now),
+             s_diag_delivered, s_diag_held_off, s_diag_no_target,
+             xbox_DpcDiagDrainAgeMs());
+}
+
 static void update_irq(MCPXAPUState *d)
 {
     if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
@@ -102,7 +144,8 @@ static void update_irq(MCPXAPUState *d)
         ((d->regs[NV_PAPU_ISTS] & ~NV_PAPU_ISTS_GINTSTS) &
          d->regs[NV_PAPU_IEN])) {
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
-        InterlockedExchange(&s_irq_line, 1);
+        if (!InterlockedExchange(&s_irq_line, 1))
+            s_diag_raise_qpc = apu_diag_qpc();
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
         InterlockedExchange(&s_irq_line, 0);
@@ -148,17 +191,25 @@ static void apu_deliver_irq(MCPXAPUState *d)
 
     if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
         return;
-    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50)
+    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50) {
+        s_diag_held_off++;
         return;
+    }
     held_off = 0;
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
-    if (!kint)
+    if (!kint) {
+        s_diag_no_target++;
         return;
+    }
     routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
     context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
     fn = routine ? recomp_lookup(routine) : NULL;
-    if (!fn)
+    if (!fn) {
+        s_diag_no_target++;
         return;
+    }
+    s_diag_deliver_qpc = apu_diag_qpc();
+    s_diag_delivered++;
     if (!tib_ready) {
         uint32_t tib = xbox_AllocThreadTib();
         if (!tib)

@@ -46,6 +46,149 @@
 
 static volatile LONG g_cpu_irql = PASSIVE_LEVEL;
 
+/* The processor at DISPATCH_LEVEL.
+ *
+ * The console has one CPU, so a thread at DISPATCH_LEVEL or above cannot be
+ * preempted by another thread or a DPC: raising IRQL *is* the mutual
+ * exclusion, and the XDK relies on it. DirectSound's lock skips its critical
+ * section at raised IRQL (its DPC must not block), so its DPC and a title
+ * thread inside the lock both assume they are alone. Here guest threads and
+ * the DPC thread run concurrently on host cores and the shared level above is
+ * only a number, so both ran at once: they interleaved the SSL segment-list
+ * methods of one streaming voice (duplicated entries, an entry rewritten
+ * mid-list, a count published for a page never written). The voice
+ * processor then ran into the unwritten page and the stream looped.
+ *
+ * Restore the uniprocessor rule: whichever thread is at or above
+ * DISPATCH_LEVEL -- a guest thread that raised, or a host thread running a
+ * DPC -- owns this lock until it drops below. It is recursive per thread.
+ * Device-level ISRs (level > DISPATCH) preempt DISPATCH on hardware and do not
+ * take it; they keep the existing hold-off in xbox_IrqlBlocksInterrupts.
+ *
+ * A thread that cannot get the lock within DISPATCH_LOCK_TIMEOUT_MS is
+ * reported (with the owner) and continues without it rather than deadlocking
+ * the title; RECOMP_DISPATCH_LOCK=0 turns the lock off for A/B runs. */
+#define DISPATCH_LOCK_TIMEOUT_MS 250
+static CRITICAL_SECTION g_dispatch_cs;
+static INIT_ONCE g_dispatch_once = INIT_ONCE_STATIC_INIT;
+static int g_dispatch_enabled = 1;
+static volatile LONG g_dispatch_owner;          /* host tid, 0 = free */
+static RECOMP_TLS int t_dispatch_held;           /* recursion depth on this thread */
+
+/* Who holds the processor and since when, for the long-hold report. */
+extern RECOMP_TLS uint32_t g_esp;
+extern ptrdiff_t g_xbox_mem_offset;
+static volatile DWORD g_dispatch_since;          /* GetTickCount at acquire */
+static volatile uint32_t g_dispatch_owner_ra;    /* guest return address at acquire */
+static volatile LONG g_dispatch_owner_kind;      /* 0 guest raise, 1 DPC */
+#define DISPATCH_LONG_MS 50
+
+static uint32_t dispatch_guest_ra(void)
+{
+    return g_esp ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
+}
+
+static BOOL CALLBACK dispatch_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    const char *e = getenv("RECOMP_DISPATCH_LOCK");
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_dispatch_cs);
+    g_dispatch_enabled = !(e && e[0] == '0');
+    fprintf(stderr, "  [IRQL] DISPATCH_LEVEL exclusion %s\n",
+            g_dispatch_enabled ? "on" : "OFF (RECOMP_DISPATCH_LOCK=0)");
+    fflush(stderr);
+    return TRUE;
+}
+
+static void dispatch_acquire(int kind)
+{
+    LONG me;
+    DWORD start;
+    int reported = 0;
+    InitOnceExecuteOnce(&g_dispatch_once, dispatch_init, NULL, NULL);
+    if (!g_dispatch_enabled)
+        return;
+    if (t_dispatch_held) {
+        t_dispatch_held++;
+        return;
+    }
+    me = (LONG)GetCurrentThreadId();
+    if (!TryEnterCriticalSection(&g_dispatch_cs)) {
+        start = GetTickCount();
+        for (;;) {
+            if (TryEnterCriticalSection(&g_dispatch_cs))
+                break;
+            if (!reported && GetTickCount() - start >= DISPATCH_LONG_MS) {
+                static volatile LONG nw;
+                reported = 1;
+                if (InterlockedIncrement(&nw) <= 200) {
+                    /* What the owner is likely spinning on: the D3D GPU DPC
+                     * loops until PMC_INTR_0 clears, and only the NV2A ack
+                     * thread clears it -- so report where that thread is. */
+                    extern volatile int g_ack_phase;
+                    volatile uint32_t *pmc = xbox_Nv2aRegisterPointer(0x000100, 4);
+                    volatile uint32_t *crtc = xbox_Nv2aRegisterPointer(0x600100, 4);
+                    fprintf(stderr, "  [DISPATCH-WAIT-NV2A] ack_phase=%d "
+                            "PMC_INTR_0=%08X PCRTC_INTR_0=%08X\n",
+                            g_ack_phase, pmc ? *pmc : 0xDEADu,
+                            crtc ? *crtc : 0xDEADu);
+                    fprintf(stderr, "  [DISPATCH-WAIT] tid %lu (%s, guest ra %08X) "
+                            "blocked %d ms by owner tid %lu (%s, guest ra %08X, "
+                            "held %lu ms)\n",
+                            (unsigned long)me, kind ? "dpc" : "raise",
+                            dispatch_guest_ra(), DISPATCH_LONG_MS,
+                            (unsigned long)g_dispatch_owner,
+                            g_dispatch_owner_kind ? "dpc" : "raise",
+                            g_dispatch_owner_ra,
+                            (unsigned long)(GetTickCount() - g_dispatch_since));
+                    fflush(stderr);
+                }
+            }
+            if (GetTickCount() - start >= DISPATCH_LOCK_TIMEOUT_MS) {
+                static volatile LONG n;
+                if (InterlockedIncrement(&n) <= 50) {
+                    fprintf(stderr, "  [DISPATCH-LOCK] tid %lu waited %d ms for "
+                            "owner tid %lu; continuing without exclusion\n",
+                            (unsigned long)me, DISPATCH_LOCK_TIMEOUT_MS,
+                            (unsigned long)g_dispatch_owner);
+                    fflush(stderr);
+                }
+                return;
+            }
+            SwitchToThread();
+        }
+    }
+    g_dispatch_since = GetTickCount();
+    g_dispatch_owner_ra = dispatch_guest_ra();
+    g_dispatch_owner_kind = kind;
+    InterlockedExchange(&g_dispatch_owner, me);
+    t_dispatch_held = 1;
+}
+
+static void dispatch_release(void)
+{
+    DWORD held;
+    if (!t_dispatch_held)
+        return;
+    if (--t_dispatch_held)
+        return;
+    held = GetTickCount() - g_dispatch_since;
+    if (held >= DISPATCH_LONG_MS) {
+        static volatile LONG nh;
+        if (InterlockedIncrement(&nh) <= 200) {
+            fprintf(stderr, "  [DISPATCH-HOLD] tid %lu (%s) held DISPATCH %lu ms, "
+                    "acquired at guest ra %08X, released at guest ra %08X\n",
+                    (unsigned long)GetCurrentThreadId(),
+                    g_dispatch_owner_kind ? "dpc" : "raise",
+                    (unsigned long)held, g_dispatch_owner_ra,
+                    dispatch_guest_ra());
+            fflush(stderr);
+        }
+    }
+    InterlockedExchange(&g_dispatch_owner, 0);
+    LeaveCriticalSection(&g_dispatch_cs);
+}
+
 /* A host ISR/DPC thread runs the interrupted work at its own device level,
  * which the guest must never observe: on hardware the dispatcher restores the
  * interrupted IRQL before that thread runs again, so no guest thread can read
@@ -59,16 +202,42 @@ static volatile LONG g_cpu_irql = PASSIVE_LEVEL;
 static RECOMP_TLS int t_isr_irql = -1;   /* this ISR/DPC thread's level; -1 = not in one */
 static volatile LONG g_isr_active;       /* host ISRs/DPCs in flight */
 
+/* With the DISPATCH lock on, the guest level is per thread: only the lock
+ * owner can be at DISPATCH or above, so one thread's raise or lower can no
+ * longer overwrite another's (the shared-level hazards described above need
+ * the shared level). Without it, the old shared level is kept as it was. */
+static RECOMP_TLS int t_guest_irql;
+
+static int dispatch_on(void)
+{
+    InitOnceExecuteOnce(&g_dispatch_once, dispatch_init, NULL, NULL);
+    return g_dispatch_enabled;
+}
+
 static KIRQL irql_swap(KIRQL v)
 {
     if (t_isr_irql >= 0) { KIRQL o = (KIRQL)t_isr_irql; t_isr_irql = v; return o; }
+    if (dispatch_on()) {
+        KIRQL o = (KIRQL)t_guest_irql;
+        /* Take the processor before the level says we have it. */
+        if (v >= DISPATCH_LEVEL && o < DISPATCH_LEVEL)
+            dispatch_acquire(0);
+        t_guest_irql = v;
+        InterlockedExchange(&g_cpu_irql, (LONG)v);   /* diagnostics only */
+        if (v < DISPATCH_LEVEL && o >= DISPATCH_LEVEL)
+            dispatch_release();
+        return o;
+    }
     return (KIRQL)InterlockedExchange(&g_cpu_irql, (LONG)v);
 }
 
 static KIRQL irql_now(void)
 {
-    return t_isr_irql >= 0 ? (KIRQL)t_isr_irql
-                           : (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0);
+    if (t_isr_irql >= 0)
+        return (KIRQL)t_isr_irql;
+    if (dispatch_on())
+        return (KIRQL)t_guest_irql;
+    return (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0);
 }
 
 /* The current IRQL, where guest code reads it: KPCR.Irql, fs:[0x24].
@@ -99,6 +268,11 @@ static void irql_publish(void)
  * rather than lost. */
 int xbox_IrqlBlocksInterrupts(void)
 {
+    if (dispatch_on()) {
+        LONG owner = InterlockedCompareExchange(&g_dispatch_owner, 0, 0);
+        return InterlockedCompareExchange(&g_isr_active, 0, 0) > 0
+            || (owner != 0 && owner != (LONG)GetCurrentThreadId());
+    }
     return InterlockedCompareExchange(&g_isr_active, 0, 0) > 0
         || (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0) >= DISPATCH_LEVEL;
 }
@@ -228,10 +402,27 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  *
  * They also run the routine at the level it expects -- DISPATCH_LEVEL for a
  * DPC, the device level for an ISR -- and code checks: see irql_publish. */
+/* Which nested Enter/Leave pairs on this thread took the DISPATCH lock. */
+static RECOMP_TLS unsigned t_isr_lock_bits;
+static RECOMP_TLS int t_isr_depth;
+
 int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = t_isr_irql;
     KIRQL old;
+    /* A DPC runs at DISPATCH_LEVEL: it owns the processor like a guest
+     * thread that raised. A device ISR (above DISPATCH) preempts it on
+     * hardware and does not. */
+    int take = (level == DISPATCH_LEVEL) && dispatch_on();
+    if (take)
+        dispatch_acquire(1);
+    if (t_isr_depth < 32) {
+        if (take)
+            t_isr_lock_bits |= 1u << t_isr_depth;
+        else
+            t_isr_lock_bits &= ~(1u << t_isr_depth);
+    }
+    t_isr_depth++;
     if (saved < 0)
         InterlockedIncrement(&g_isr_active);
     old = saved < 0 ? PASSIVE_LEVEL : (KIRQL)saved;
@@ -252,6 +443,13 @@ void xbox_IrqlLeaveInterrupt(int saved)
     if (cur != (KIRQL)(saved < 0 ? PASSIVE_LEVEL : saved)) {
         irql_track(cur, saved < 0 ? PASSIVE_LEVEL : (KIRQL)saved, IRQL_CALLER());
         irql_publish();
+    }
+    if (t_isr_depth > 0) {
+        t_isr_depth--;
+        if (t_isr_depth < 32 && (t_isr_lock_bits & (1u << t_isr_depth))) {
+            t_isr_lock_bits &= ~(1u << t_isr_depth);
+            dispatch_release();
+        }
     }
 }
 

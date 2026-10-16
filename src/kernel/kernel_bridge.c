@@ -2150,7 +2150,50 @@ static void bridge_KeRemoveQueueDpc(void);   /* defined with the queue */
  * DPC ordering beyond "after the ISR".
  */
 #define XBOX_MAX_PENDING_DPC 64
-typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
+typedef struct { uint32_t dpc, arg1, arg2; long long queued_qpc; } PendingDpc;
+
+/* RECOMP_APU_DIAG=1: how long a queued DPC waits before the timer thread runs
+ * it, and what the timer thread was busy with meanwhile. DirectSound refills
+ * its streaming SSL slots from the DPC its APU ISR queues; if that DPC runs
+ * late the voice processor reaches slots the driver never wrote. */
+static int g_dpc_diag = -1;
+static long long g_dpc_qpf;
+static double g_dpc_last_sw_ms, g_dpc_last_vbl_ms, g_dpc_max_lat_ms;
+static volatile long long g_dpc_last_drain_qpc;
+static unsigned g_dpc_slow, g_dpc_ran;
+
+static int dpc_diag_on(void)
+{
+    if (g_dpc_diag < 0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        g_dpc_qpf = f.QuadPart;
+        g_dpc_diag = getenv("RECOMP_APU_DIAG") != NULL;
+    }
+    return g_dpc_diag;
+}
+
+static long long dpc_qpc(void)
+{
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return c.QuadPart;
+}
+
+static double dpc_ms(long long ticks)
+{
+    return g_dpc_qpf ? (double)ticks * 1000.0 / (double)g_dpc_qpf : 0.0;
+}
+
+/* Milliseconds since the timer thread last drained the DPC queue (-1 if the
+ * diagnostic is off). Read by the APU underrun report. */
+double xbox_DpcDiagDrainAgeMs(void)
+{
+    long long last = g_dpc_last_drain_qpc;
+    if (!dpc_diag_on() || !last)
+        return -1.0;
+    return dpc_ms(dpc_qpc() - last);
+}
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
 
@@ -2208,6 +2251,7 @@ static void bridge_KeInsertQueueDpc(void)
     g_dpc_queue[tail].dpc  = dpc;
     g_dpc_queue[tail].arg1 = arg1;
     g_dpc_queue[tail].arg2 = arg2;
+    g_dpc_queue[tail].queued_qpc = dpc_diag_on() ? dpc_qpc() : 0;
     BRIDGE_MEM8(dpc + 2) = 1;
     g_dpc_tail = next;
     LeaveCriticalSection(&g_dpc_lock);
@@ -2347,8 +2391,54 @@ static void kernel_drain_dpcs(void)
         if (d.dpc)
             BRIDGE_MEM8(d.dpc + 2) = 0;
         LeaveCriticalSection(&g_dpc_lock);
-        if (d.dpc)
+        if (d.dpc && d.queued_qpc && dpc_diag_on()) {
+            double lat = dpc_ms(dpc_qpc() - d.queued_qpc);
+            g_dpc_ran++;
+            if (lat > g_dpc_max_lat_ms)
+                g_dpc_max_lat_ms = lat;
+            if (lat >= 20.0) {
+                g_dpc_slow++;
+                if (g_dpc_slow <= 200 || (g_dpc_slow % 100) == 0) {
+                    fprintf(stderr, "[DPC-LAT] dpc=0x%08X routine=0x%08X "
+                                    "waited=%.1fms sw_tick=%.1fms vblank=%.1fms "
+                                    "slow=%u\n",
+                            d.dpc, BRIDGE_MEM32(d.dpc + 12), lat,
+                            g_dpc_last_sw_ms, g_dpc_last_vbl_ms, g_dpc_slow);
+                    fflush(stderr);
+                }
+            }
+        }
+        if (d.dpc) {
+            long long r0 = dpc_diag_on() ? dpc_qpc() : 0;
             kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+            if (r0) {
+                double run = dpc_ms(dpc_qpc() - r0);
+                if (run >= 20.0) {
+                    static unsigned nr;
+                    if (++nr <= 200 || (nr % 100) == 0) {
+                        fprintf(stderr, "[DPC-RUN] dpc=0x%08X routine=0x%08X "
+                                        "ran=%.1fms n=%u\n",
+                                d.dpc, BRIDGE_MEM32(d.dpc + 12), run, nr);
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
+    }
+    if (dpc_diag_on()) {
+        static long long last_report;
+        long long now = dpc_qpc();
+        g_dpc_last_drain_qpc = now;
+        if (!last_report)
+            last_report = now;
+        if (dpc_ms(now - last_report) >= 1000.0) {
+            fprintf(stderr, "[DPC-STAT] ran=%u slow(>=20ms)=%u max_wait=%.1fms\n",
+                    g_dpc_ran, g_dpc_slow, g_dpc_max_lat_ms);
+            fflush(stderr);
+            g_dpc_ran = 0;
+            g_dpc_max_lat_ms = 0.0;
+            last_report = now;
+        }
     }
 }
 
@@ -2838,8 +2928,26 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             WaitForSingleObject(g_nv2a_wake, 10);
         else
             Sleep(10);
-        kernel_nv2a_software_tick();  /* D3D software methods, at DISPATCH_LEVEL */
-        kernel_vblank_tick();  /* the GPU's frame clock */
+        if (dpc_diag_on()) {
+            long long t0 = dpc_qpc(), t1, t2;
+            kernel_nv2a_software_tick();
+            t1 = dpc_qpc();
+            kernel_vblank_tick();
+            t2 = dpc_qpc();
+            g_dpc_last_sw_ms = dpc_ms(t1 - t0);
+            g_dpc_last_vbl_ms = dpc_ms(t2 - t1);
+            if (g_dpc_last_sw_ms >= 20.0 || g_dpc_last_vbl_ms >= 20.0) {
+                static unsigned n;
+                if (++n <= 200 || (n % 100) == 0) {
+                    fprintf(stderr, "[TIMER-BUSY] sw_tick=%.1fms vblank=%.1fms n=%u\n",
+                            g_dpc_last_sw_ms, g_dpc_last_vbl_ms, n);
+                    fflush(stderr);
+                }
+            }
+        } else {
+            kernel_nv2a_software_tick();  /* D3D software methods, at DISPATCH_LEVEL */
+            kernel_vblank_tick();  /* the GPU's frame clock */
+        }
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 

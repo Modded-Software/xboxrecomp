@@ -1488,8 +1488,42 @@ fence_mirrors_tick();
     return 0;
 }
 
+/*
+ * The NV2A_ACK registers acknowledged on their own thread.
+ *
+ * On hardware an interrupt-status write-1-to-clear takes effect at once. Here
+ * it took effect when the ack thread next reached the top of its loop, which
+ * is after a whole pushbuffer walk (nv2a_pb_run) -- tens to hundreds of ms.
+ * D3D's GPU DPC (CMiniport::Dpc, 0x002C9ED0) writes the PCRTC_INTR_0 ack and
+ * spins until PMC_INTR_0 bit 24 drops, at DISPATCH_LEVEL, so it held the
+ * processor for the length of the walk and starved DirectSound's DISPATCH
+ * sections (dropped dialogue). Every long DISPATCH wait sampled showed the ack
+ * thread in the walk with both bits still pending.
+ *
+ * Same register semantics as before ("nothing pending"); only the latency
+ * changes from one walk to about a millisecond. The main ack thread still
+ * clears them too. RECOMP_NV2A_IRQ_ACK=0 disables this thread for A/B runs.
+ */
+static HANDLE g_nv2a_irq_ack_thread = NULL;
+
+static DWORD WINAPI nv2a_irq_ack_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+            volatile uint32_t *r =
+                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+            if (*r & NV2A_ACK[i].busy_mask)
+                *r &= ~NV2A_ACK[i].busy_mask;
+        }
+        Sleep(1);
+    }
+    return 0;
+}
+
 static void xbox_Nv2aAckStart(void)
 {
+    const char *irq_ack = getenv("RECOMP_NV2A_IRQ_ACK");
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
@@ -1498,6 +1532,15 @@ static void xbox_Nv2aAckStart(void)
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
+    }
+    if (!(irq_ack && irq_ack[0] == '0')) {
+        g_nv2a_irq_ack_thread = CreateThread(NULL, 0, nv2a_irq_ack_thread,
+                                             g_nv2a_memory, 0, NULL);
+        fprintf(stderr, "  NV2A interrupt-status ack thread %s\n",
+                g_nv2a_irq_ack_thread ? "started" : "FAILED to start");
+    } else {
+        fprintf(stderr, "  NV2A interrupt-status ack thread OFF "
+                        "(RECOMP_NV2A_IRQ_ACK=0)\n");
     }
 }
 
@@ -3333,6 +3376,12 @@ void xbox_MemoryLayoutShutdown(void)
         WaitForSingleObject(g_nv2a_ack_thread, 1000);
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
+    }
+    if (g_nv2a_irq_ack_thread) {
+        InterlockedExchange(&g_nv2a_ack_stop, 1);
+        WaitForSingleObject(g_nv2a_irq_ack_thread, 1000);
+        CloseHandle(g_nv2a_irq_ack_thread);
+        g_nv2a_irq_ack_thread = NULL;
     }
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);

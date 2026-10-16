@@ -46,6 +46,13 @@ static const struct {
  * Notify status helper
  * ============================================================ */
 
+/* RECOMP_APU_DIAG: when each voice last raised a notifier, and which one, so
+ * an SSL underrun can be timed against the SSL_DONE that should have made the
+ * driver refill the slot. */
+static long long g_apu_diag_notify_qpc[MCPX_HW_MAX_VOICES];
+static int g_apu_diag_notify_which[MCPX_HW_MAX_VOICES];
+extern void mcpx_apu_diag_irq_report(MCPXAPUState *d, char *buf, size_t n);
+
 static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
                               int status)
 {
@@ -56,6 +63,12 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 
     stb_phys(address_space_memory, notify_offset, (uint8_t)status);
     stb_phys(address_space_memory, notify_offset - 1, 1);
+    if (v < MCPX_HW_MAX_VOICES) {
+        LARGE_INTEGER c;
+        QueryPerformanceCounter(&c);
+        g_apu_diag_notify_qpc[v] = c.QuadPart;
+        g_apu_diag_notify_which[v] = notifier;
+    }
 
     qatomic_or(&d->regs[NV_PAPU_ISTS],
                NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS);
@@ -124,8 +137,31 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * Voice off / lock
  * ============================================================ */
 
-static void voice_off(MCPXAPUState *d, uint16_t v)
+/* RECOMP_APU_VOICE_TRACE=1: one line per voice start/release/pause/stop, with
+ * the source line that stopped it, so a dropped line of dialogue can be told
+ * apart as "never started", "stopped by the title" or "stopped by the VP". */
+static int g_vtrace = -1;
+static int vtrace_on(void)
 {
+    if (g_vtrace < 0)
+        g_vtrace = getenv("RECOMP_APU_VOICE_TRACE") != NULL;
+    return g_vtrace;
+}
+
+static void voice_off_at(MCPXAPUState *d, uint16_t v, int line);
+#define voice_off(d, v) voice_off_at((d), (v), __LINE__)
+
+static void voice_off_at(MCPXAPUState *d, uint16_t v, int line)
+{
+    if (vtrace_on() && v < MCPX_HW_MAX_VOICES) {
+        fprintf(stderr, "[VOICE] t=%lu off v=%u line=%d active=%u ssl_index=%d "
+                        "ssl_seg=%d countA=%u countB=%u\n",
+                (unsigned long)GetTickCount(), (unsigned)v, line,
+                (unsigned)voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE),
+                d->vp.ssl[v].ssl_index, d->vp.ssl[v].ssl_seg,
+                (unsigned)d->vp.ssl[v].count[0], (unsigned)d->vp.ssl[v].count[1]);
+    }
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -275,6 +311,17 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         voice_reset_filters(d, (uint16_t)selected_handle);
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
+        if (vtrace_on() && selected_handle < MCPX_HW_MAX_VOICES) {
+            uint16_t h = (uint16_t)selected_handle;
+            fprintf(stderr, "[VOICE] t=%lu on v=%u fmt=0x%08X vbin=0x%08X "
+                            "vola=0x%08X ea=%u ef=%u countA=%u countB=%u\n",
+                    (unsigned long)GetTickCount(), (unsigned)h,
+                    (unsigned)voice_get_mask(d, h, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF),
+                    (unsigned)voice_get_mask(d, h, NV_PAVS_VOICE_CFG_VBIN, 0xFFFFFFFF),
+                    (unsigned)voice_get_mask(d, h, NV_PAVS_VOICE_TAR_VOLA, 0xFFFFFFFF),
+                    ea_start, ef_start,
+                    (unsigned)d->vp.ssl[h].count[0], (unsigned)d->vp.ssl[h].count[1]);
+        }
 
         if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
         break;
@@ -302,6 +349,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                        NV_PAVS_VOICE_PAR_STATE_EFCUR,
                        NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE);
+        if (vtrace_on())
+            fprintf(stderr, "[VOICE] t=%lu release v=%u\n",
+                    (unsigned long)GetTickCount(), (unsigned)selected_handle);
 
         if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
         break;
@@ -312,6 +362,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case NV1BA0_PIO_VOICE_PAUSE:
+        if (vtrace_on())
+            fprintf(stderr, "[VOICE] t=%lu pause v=%u action=%u\n",
+                    (unsigned long)GetTickCount(),
+                    (unsigned)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE),
+                    (unsigned)((argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0));
         voice_set_mask(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE),
                        NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED,
                        (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0);
@@ -455,6 +510,14 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        if (getenv("RECOMP_APU_SSL_TRACE")) {
+            fprintf(stderr, "[APU-SSLSET] v=%d ssl=A base=0x%X count=%u "
+                            "cur_index=%d cur_seg=%d\n",
+                    current_voice, (unsigned)d->vp.ssl[current_voice].base[ssl],
+                    (unsigned)d->vp.ssl[current_voice].count[ssl],
+                    d->vp.ssl[current_voice].ssl_index,
+                    d->vp.ssl[current_voice].ssl_seg);
+        }
         break;
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
@@ -465,6 +528,14 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        if (getenv("RECOMP_APU_SSL_TRACE")) {
+            fprintf(stderr, "[APU-SSLSET] v=%d ssl=B base=0x%X count=%u "
+                            "cur_index=%d cur_seg=%d\n",
+                    current_voice, (unsigned)d->vp.ssl[current_voice].base[ssl],
+                    (unsigned)d->vp.ssl[current_voice].count[ssl],
+                    d->vp.ssl[current_voice].ssl_index,
+                    d->vp.ssl[current_voice].ssl_seg);
+        }
         break;
     }
 
@@ -472,6 +543,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         assert((argument & 0x3f) == 0);
         assert(argument < (MCPX_HW_MAX_SSL_PRDS * NV_PSGE_SIZE));
         d->vp.ssl_base_page = argument;
+        if (getenv("RECOMP_APU_SSL_TRACE")) {
+            fprintf(stderr, "[APU-SSLCUR] base_page=0x%X\n", (unsigned)argument);
+        }
         break;
     }
 
@@ -532,13 +606,16 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                 }
                 if (ssl_trace) {
                     static int ssl_wr_count = 0;
-                    if (ssl_wr_count < 600) {
+                    if (ssl_wr_count < 6000) {
                         fprintf(stderr,
-                                "[APU-SSLW] page=0x%X method=0x%X off=0x%X addr=0x%X "
-                                "val=0x%X\n",
-                                (unsigned)d->vp.ssl_base_page, (unsigned)method,
-                                (unsigned)(method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET),
-                                (unsigned)addr, (unsigned)argument);
+                                "[APU-SSLW] base_page=0x%X entry_page=0x%X %s "
+                                "method=0x%X addr=0x%X val=0x%X\n",
+                                (unsigned)d->vp.ssl_base_page,
+                                (unsigned)(d->vp.ssl_base_page +
+                                    (method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET) / 8),
+                                ((method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET) & 4)
+                                    ? "len" : "off",
+                                (unsigned)method, (unsigned)addr, (unsigned)argument);
                         ssl_wr_count++;
                     }
                 }
@@ -879,7 +956,12 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
          * zero PRD is treated as unproduced. */
         {
             static int ssl_underrun[MCPX_HW_MAX_VOICES];
+            static long long ssl_underrun_start[MCPX_HW_MAX_VOICES];
             static uint64_t ssl_underrun_frames;
+            static int diag = -1;
+            LARGE_INTEGER qf, qc;
+            if (diag < 0)
+                diag = getenv("RECOMP_APU_DIAG") != NULL;
             if (segment_offset == 0 || segment_length == 0 ||
                 (segment_length & 0xffff) == 0) {
                 if (ssl_underrun[v] < 400) {
@@ -893,6 +975,24 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                 (unsigned)page, (unsigned)count,
                                 (unsigned)d->vp.ssl_base_page,
                                 (unsigned)segment_offset, (unsigned)segment_length);
+                        if (diag) {
+                            char irq[256];
+                            double since_notify = -1.0;
+                            QueryPerformanceFrequency(&qf);
+                            QueryPerformanceCounter(&qc);
+                            ssl_underrun_start[v] = qc.QuadPart;
+                            if (g_apu_diag_notify_qpc[v])
+                                since_notify = (double)(qc.QuadPart -
+                                    g_apu_diag_notify_qpc[v]) * 1000.0 /
+                                    (double)qf.QuadPart;
+                            mcpx_apu_diag_irq_report(d, irq, sizeof(irq));
+                            fprintf(stderr,
+                                    "[APU-SSL-DIAG] v=%u last_notify=%d "
+                                    "since_notify=%.1fms %s\n",
+                                    (unsigned)v, g_apu_diag_notify_which[v],
+                                    since_notify, irq);
+                        }
+                        fflush(stderr);
                     }
                     if ((++ssl_underrun_frames % 48000) == 0) {
                         fprintf(stderr,
@@ -913,8 +1013,22 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     d->vp.ssl[v].ssl_index = 0;
                     voice_off(d, (uint16_t)v);
                 }
+                if (diag) {
+                    fprintf(stderr, "[APU-SSL-GIVEUP] v=%u never filled after "
+                                    "%d frames\n", (unsigned)v, ssl_underrun[v]);
+                    fflush(stderr);
+                }
                 ssl_underrun[v] = 0;
                 return -1;
+            }
+            if (diag && ssl_underrun[v] > 0 && ssl_underrun_start[v]) {
+                QueryPerformanceFrequency(&qf);
+                QueryPerformanceCounter(&qc);
+                fprintf(stderr, "[APU-SSL-FILLED] v=%u after %d frames / %.1fms\n",
+                        (unsigned)v, ssl_underrun[v],
+                        (double)(qc.QuadPart - ssl_underrun_start[v]) * 1000.0 /
+                        (double)qf.QuadPart);
+                fflush(stderr);
             }
             ssl_underrun[v] = 0;
         }
