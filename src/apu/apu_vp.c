@@ -880,8 +880,25 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         {
             static int ssl_underrun[MCPX_HW_MAX_VOICES];
             static uint64_t ssl_underrun_frames;
-            if (segment_offset == 0 || segment_length == 0 ||
-                (segment_length & 0xffff) == 0) {
+            /* A slot is only safe to decode once the driver has finished
+             * writing BOTH the offset and the length word.  Reading it earlier
+             * can catch a half-written descriptor: a valid offset with the
+             * previous lap's length/format, decoded as the wrong sample count
+             * or container -- heard as periodic corruption on streamed voices.
+             * xemu asserts cs/spb/stereo match the voice config but builds with
+             * NDEBUG, so the assert never guards anything; check it here. */
+            uint32_t s_len = segment_length;
+            unsigned v_cs = container_size_index;
+            unsigned g_cs = (s_len >> 16) & 3;
+            unsigned g_spb = (s_len >> 18) & 0x1f;
+            unsigned g_s = (s_len >> 23) & 1;
+            bool not_produced =
+                segment_offset == 0 || segment_length == 0 ||
+                (s_len & 0xffff) == 0 ||
+                g_cs != v_cs ||
+                (g_spb + 1) != samples_per_block ||
+                g_s != (stereo ? 1u : 0u);
+            if (not_produced) {
                 if (ssl_underrun[v] == 0) {
                     fprintf(stderr,
                             "[APU-SSL-UNDERRUN] v=%u ssl=%d seg=%d base=0x%X "
