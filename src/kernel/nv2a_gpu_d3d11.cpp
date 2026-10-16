@@ -1716,8 +1716,15 @@ extern "C" uint32_t nv2a_gpu_flip(const void *presented, size_t bytes, uint32_t 
     s_texture_validate_serial++;
     for (auto &surface : surfaces)
         if (!surface.dirty) surface.needs_refresh = true;
-    for (auto &surface : depth_surfaces)
-        if (!surface.dirty) surface.needs_refresh = true;
+    /* Depth is GPU-only for this title: publication is off
+     * (RECOMP_DEPTH_PUBLISH=0), so guest RAM never holds the rendered
+     * depth-stencil. Refreshing it from RAM would overwrite the live depth
+     * with a stale snapshot -- the background kept the old depth while the
+     * camera moved. A presenter that samples the depth (ReShade) must see the
+     * GPU's copy, so only invalidate depth when it is actually published. */
+    if (publish_depth())
+        for (auto &surface : depth_surfaces)
+            if (!surface.dirty) surface.needs_refresh = true;
     return show;
 }
 
@@ -3321,4 +3328,9 @@ extern "C" int nv2a_gpu_available(void)
         g_xbox_path_hook = nv2a_cloak_path_hook;
     }
     return device != nullptr;
+}
+
+extern "C" void *nv2a_gpu_device(void)
+{
+    return nv2a_gpu_available() ? device.Get() : nullptr;
 }

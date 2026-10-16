@@ -76,4 +76,28 @@ void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 int  xbox_FramebufferDumpBmp(const char *path);
 
+/* The framebuffer dimensions the window reads (the title's render resolution).
+ * An external presenter needs these to size its swap chain and interpret a
+ * flip's pitch (bytes-per-pixel = pitch / width); the window's client rect can
+ * differ from the rendered frame. Returns 0 when no window exists yet. */
+int  xbox_FramebufferWindowSize(uint32_t *width, uint32_t *height);
+
+/* Optional per-flip present hook. When installed, the pushbuffer executor calls
+ * this callback with each finished frame, *in addition to* the built-in GDI
+ * framebuffer window (which is suspended, below), so an alternative presenter
+ * (e.g. a D3D11/DXGI swap chain feeding ReShade) can own presentation. fb_va is
+ * a guest VA: resolve it with xbox_GetMemoryOffset(); pitch is bytes per row.
+ * The callback runs synchronously at the flip, so the frame is stable to read.
+ * Installing a hook also calls xbox_FramebufferWindowSuspend(1); passing a NULL
+ * hook restores the default GDI path. */
+typedef void (*xbox_present_hook_t)(uint32_t fb_va, uint32_t pitch, void *user);
+void xbox_SetPresentHook(xbox_present_hook_t hook, void *user);
+
+/* Stop (on=1) or resume (on=0) the built-in GDI blit in fb_thread while an
+ * external presenter owns the window. Message pumping, input, recording/replay,
+ * the F12 dump and the window-title FPS counter all keep running; only the
+ * StretchDIBits call is skipped, so a D3D11 presenter does not fight GDI for
+ * the same HWND. No-op on non-Windows. */
+void xbox_FramebufferWindowSuspend(int on);
+
 #endif /* BURNOUT3_VIDEO_PLAYER_H */

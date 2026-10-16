@@ -37,6 +37,9 @@ int xbox_FramebufferDumpBmp(const char *path);
 extern int xbox_GammaRampGet(uint8_t *out);
 
 static volatile LONG s_fb_running;
+/* Set while an external presenter (xbox_SetPresentHook) owns the window: the
+ * window thread keeps pumping messages but skips its StretchDIBits blit. */
+static volatile LONG s_fb_suspend;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
@@ -96,6 +99,13 @@ static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
 static DECLSPEC_ALIGN(8) volatile LONG64 s_present_frame;
 
+/* See video_player.h. Called by xbox_SetPresentHook (nv2a_pb_exec.c) when an
+ * external presenter is installed or removed. */
+void xbox_FramebufferWindowSuspend(int on)
+{
+    InterlockedExchange(&s_fb_suspend, on ? 1 : 0);
+}
+
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
     /* RECOMP_FB_VA pins the window to one guest address instead of following
@@ -107,6 +117,18 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
     s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
     if (pitch)
         s_fb_pitch = pitch;
+}
+
+/* See video_player.h. */
+int xbox_FramebufferWindowSize(uint32_t *width, uint32_t *height)
+{
+    if (!s_fb_running)
+        return 0;
+    if (width)
+        *width = s_fb_width;
+    if (height)
+        *height = s_fb_height;
+    return 1;
 }
 
 /* Called by the pushbuffer executor when the title flips. */
@@ -1049,7 +1071,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             }
         }
         fb_gamma_refresh();
-        if (s_present_idx >= 0 && s_rgb) {
+        /* An external presenter owns the window: keep pumping and updating the
+         * stats, but do not blit over its swap chain. */
+        if (!InterlockedCompareExchange(&s_fb_suspend, 0, 0) &&
+            s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
@@ -1063,7 +1088,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                               s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
                 last_drawn = idx;
             }
-        } else if (s_fb_va && s_fb_pitch && s_rgb) {
+        } else if (!InterlockedCompareExchange(&s_fb_suspend, 0, 0) &&
+                   s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
@@ -1115,6 +1141,13 @@ void xbox_FramebufferWindowStart(void)
 #else
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+void xbox_FramebufferWindowSuspend(int on) { (void)on; }
+int xbox_FramebufferWindowSize(uint32_t *width, uint32_t *height)
+{
+    if (width) *width = 0;
+    if (height) *height = 0;
+    return 0;
+}
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 int xbox_FramebufferMouseDelta(int *dx, int *dy) { if (dx) *dx = 0; if (dy) *dy = 0; return 0; }

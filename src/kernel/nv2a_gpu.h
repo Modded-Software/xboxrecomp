@@ -9,6 +9,11 @@ extern "C" {
 #endif
 
 int nv2a_gpu_available(void);
+/* The native ID3D11Device the emulator renders with (as void*; NULL until the
+ * device exists). An external presenter can borrow it so it shares the
+ * immediate context/queue with the emulator's draws -- required for a
+ * post-processing injector such as ReShade to see the scene's depth buffer. */
+void *nv2a_gpu_device(void);
 int nv2a_gpu_compile(void);
 void nv2a_gpu_sync(void);
 void nv2a_gpu_wait(void);

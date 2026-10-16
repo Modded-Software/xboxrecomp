@@ -37,9 +37,24 @@
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
 #include "../d3d/nv2a_shader_cpu.h"
+#include "../video/video_player.h"   /* xbox_present_hook_t / xbox_SetPresentHook */
 #ifdef _WIN32
 #include "nv2a_gpu.h"
 #endif
+
+/* Optional alternative presenter. NULL keeps the built-in GDI framebuffer
+ * window; a hook (see video_player.h) presents each finished frame too. */
+static xbox_present_hook_t g_present_hook;
+static void *g_present_user;
+
+void xbox_SetPresentHook(xbox_present_hook_t hook, void *user)
+{
+    g_present_hook = hook;
+    g_present_user = user;
+    /* An external presenter owns the window while installed: suspend the
+     * built-in GDI blit so it cannot draw over the swap chain. */
+    xbox_FramebufferWindowSuspend(hook != NULL);
+}
 
 void nv2a_pb_exec_flush(void)
 {
@@ -4294,7 +4309,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 }
                 present_pvideo_overlay(show);
                 xbox_FramebufferWindowSet(dma_resolve(show), s_gpu.pitch);
+                /* Keep publishing the finished frame (window-title FPS counter,
+                 * F12 dump); the GDI blit itself is suspended when a hook is
+                 * installed. The hook then presents the same frame through its
+                 * own swap chain (e.g. for ReShade). */
                 xbox_FramebufferWindowPresent(dma_resolve(show), s_gpu.pitch);
+                if (g_present_hook)
+                    g_present_hook(dma_resolve(show), s_gpu.pitch, g_present_user);
             } else {
                 nv2a_pb_exec_flush();
             }
