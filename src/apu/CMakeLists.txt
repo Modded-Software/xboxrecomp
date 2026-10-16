@@ -2,8 +2,10 @@
 # Extracted from xemu (https://github.com/xemu-project/xemu)
 #
 # Voice Processor (VP): ADPCM/PCM decode, sample mixing, envelopes, filters
-# Global Processor (GP): Stub - effects bypass
-# Encode Processor (EP): Stub - direct mixbin passthrough
+# Global Processor (GP): DSP56300 engine - global effects (xemu's gp_ep program)
+# Encode Processor (EP): DSP56300 engine - encode / mixdown
+# The GP/EP engine (dsp/) runs the guest-downloaded programs and is on by
+# default; RECOMP_APU_DSP=0 selects the legacy passthrough stub instead.
 
 set(SAMPLERATE_SOURCES
     third_party/samplerate/samplerate.c

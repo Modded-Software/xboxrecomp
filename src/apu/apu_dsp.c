@@ -6,11 +6,12 @@
  *  - The real GP/EP DSP56300 pipeline, ported verbatim from xemu under
  *    dsp/. VP mixbins are written into the GP mix buffer, the GP and EP
  *    programs run, and the EP output fifo is sunk into the monitor frame
- *    buffer. Selected with RECOMP_APU_DSP=1.
+ *    buffer. This is the default; RECOMP_APU_DSP=0 opts out.
  *
- *  - A passthrough stub (default). VP mixbins are mixed straight down to
- *    the monitor buffer. DirectSound command doorbells are acknowledged by
- *    RECOMP_APU_DSP_ACK rather than by a running DSP program.
+ *  - A passthrough stub (RECOMP_APU_DSP=0). VP mixbins are mixed straight
+ *    down to the monitor buffer. DirectSound command doorbells are
+ *    acknowledged by RECOMP_APU_DSP_ACK rather than by a running DSP
+ *    program; it is a fallback for bring-up, not the shipping path.
  *
  * Copyright (c) 2012 espes
  * Copyright (c) 2019-2025 Matt Borgerson

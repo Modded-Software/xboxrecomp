@@ -3,8 +3,13 @@
 Hardware emulation of the Xbox's MCPX APU (Audio Processing Unit), extracted from [xemu](https://github.com/xemu-project/xemu). The APU is a custom chip with three processors:
 
 - **VP (Voice Processor)** — 256 hardware voices, ADPCM/PCM decode, pitch shifting, envelopes, HRTF 3D audio
-- **GP (Global Processor)** — DSP for global effects (reverb, chorus). Currently **stubbed** — effects bypass.
-- **EP (Encode Processor)** — DSP for AC3/DTS encoding. Currently **stubbed** — passthrough.
+- **GP (Global Processor)** — DSP56300 engine (`dsp/`) running the guest-downloaded global-effects program (reverb, chorus, mixdown)
+- **EP (Encode Processor)** — DSP56300 engine running the guest-downloaded encode/mixdown program
+
+The GP and EP are emulated, not stubbed: `apu_dsp.c` executes the programs the
+title downloads, which is what produces the title's actual mix and completes
+DirectSound's command doorbell. This is the default (`RECOMP_APU_DSP=1`); the
+legacy passthrough stub remains as a fallback behind `RECOMP_APU_DSP=0`.
 
 Audio output uses Windows XAudio2, with `waveOut` as a fallback, at 48kHz
 stereo 16-bit.
@@ -53,10 +58,15 @@ peaks, retaining short-lived effects until the next report. Routed peaks are
 per-source contributions, not the final combined DSP output.
 `RECOMP_APU_TRACE=1` traces MMIO. Nonzero samples alone do not establish
 correct DMA mapping, effects fidelity or a complete soundtrack.
-GP/EP remain passthrough stubs; AC97-ready and DSP-ack diagnostic overrides are
-not DSP56300 emulation.
+The GP/EP DSP56300 engine is emulated by default; with `RECOMP_APU_DSP=0` the
+passthrough stub returns, and the AC97-ready and DSP-ack overrides are
+diagnostics for that fallback, not emulation.
 
-### Diagnostic DSP Command Completion
+### Diagnostic DSP Command Completion (passthrough stub only)
+
+With the DSP56300 engine on (the default) the GP program itself writes the
+doorbell completion, and none of this applies. The section describes the
+fallback, where `RECOMP_APU_DSP_ACK` fabricates the completion instead.
 
 `RECOMP_APU_DSP_ACK` accepts comma-separated aligned physical addresses,
 `gp:<byte offset>` or `ep:<byte offset>`. The processor-relative forms resolve
@@ -85,15 +95,21 @@ Audible source output alone does not establish complete audio compatibility.
 
 | File | LOC | Purpose |
 |------|-----|---------|
-| `apu.h` | 70 | **Public API** — init, shutdown, MMIO, mixer voices |
-| `apu_state.h` | 525 | APU state struct (VP, GP, EP, DSP core, 256 voices) |
-| `apu_regs.h` | 366 | MCPX APU register definitions and field masks |
-| `apu_core.c` | 762 | MMIO handlers, frame thread, waveOut output, test tone |
-| `apu_vp.c` | 1,247 | Voice Processor — decode, resample, mix, envelopes, HRTF |
-| `apu_dsp.c` | 90 | GP/EP stubs (mixbin 0/1 passthrough) |
-| `apu_mmio_hook.c` | 253 | VEH x86-64 instruction decoder for 0xFE800000+ MMIO |
-| `apu_shim.h` | 431 | QEMU compatibility (threads, atomics, clocks → Win32) |
-| `apu_debug.h` | 104 | Debug logging macros |
+| `apu.h` | 85 | **Public API** — init, shutdown, MMIO, mixer voices |
+| `apu_state.h` | 504 | APU state struct (VP, GP, EP, DSP core, 256 voices) |
+| `apu_regs.h` | 368 | MCPX APU register definitions and field masks |
+| `apu_core.c` | 1,297 | MMIO handlers, frame thread, XAudio2/waveOut output, DMA routing |
+| `apu_vp.c` | 1,663 | Voice Processor — decode, resample, mix, envelopes, HRTF |
+| `apu_dsp.c` | 830 | GP/EP engine driver + passthrough-stub fallback |
+| `dsp/dsp.c` | 241 | DSP56300 subsystem (GP/EP program load, run, fifo sink) |
+| `dsp/dsp_cpu.c` | 1,391 | DSP56300 interpreter core |
+| `dsp/dsp_dma.c` | 369 | DSP56300 scatter/gather DMA |
+| `apu_xaudio2.c` | 229 | XAudio2 output with bounded backpressure |
+| `apu_assert.c` | 42 | Non-fatal `[APU-ASSERT]` logger for xemu invariants |
+| `apu_wav.c` | 208 | `RECOMP_APU_WAV` PCM capture |
+| `apu_mmio_hook.c` | 182 | VEH x86-64 instruction decoder for 0xFE800000+ MMIO |
+| `apu_shim.h` | 403 | QEMU compatibility (threads, atomics, clocks → Win32) |
+| `apu_debug.h` | 126 | Debug logging macros |
 | `fpconv.h` | 70 | IEEE 754 float/int conversion utilities |
 
 ## Quick Start
@@ -150,9 +166,9 @@ mcpx_apu_shutdown(apu);
          ▼           ▼           ▼
    ┌──────────┐ ┌─────────┐ ┌─────────┐
    │    VP    │ │   GP    │ │   EP    │
-   │256 voices│ │  (stub) │ │  (stub) │
-   │ ADPCM/  │ │  effects│ │  encode │
-   │  PCM    │ │  bypass │ │  bypass │
+   │256 voices│ │ DSP56300│ │ DSP56300│
+   │ ADPCM/  │ │  engine │ │  engine │
+   │  PCM    │ │ (dsp/)  │ │ (dsp/)  │
    └────┬─────┘ └────┬────┘ └────┬────┘
         │             │           │
         └──────┬──────┘───────────┘

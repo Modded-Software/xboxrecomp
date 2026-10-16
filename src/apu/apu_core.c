@@ -936,7 +936,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     /* Init VP (voice processor) */
     mcpx_apu_vp_init(d);
 
-    /* Init DSP (GP/EP - stubbed) */
+    /* Init DSP (GP/EP - DSP56300 engine; passthrough if RECOMP_APU_DSP=0) */
     mcpx_apu_dsp_init(d);
 
     /* Init software mixer for DirectSound bridge */

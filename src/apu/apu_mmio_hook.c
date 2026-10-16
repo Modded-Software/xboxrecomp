@@ -98,10 +98,10 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
     bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
 
-    /* What the title actually asks the APU for. The DSPs are stubbed here, so
-     * a title that waits on one waits forever, and the only way to work out
-     * what it is waiting for is to see the register traffic that precedes the
-     * wait. */
+    /* What the title actually asks the APU for. With the DSP56300 engine off
+     * (RECOMP_APU_DSP=0) a title that waits on a DSP command waits forever,
+     * and the only way to work out what it is waiting for is to see the
+     * register traffic that precedes the wait. */
     if (apu_env_on("RECOMP_APU_TRACE")) {
         static unsigned n;
         if (n++ < 400) {
