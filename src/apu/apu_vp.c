@@ -864,16 +864,19 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 #endif
         /* An unproduced slot: offset 0, or a length with no samples.  The VP
          * frame clock is 48 kHz wall-clock (EP_FRAME_US), while the guest can
-         * lag badly under GPU load, so the VP catches up with the DirectSound
+         * lag under GPU load, so the VP catches up with the DirectSound
          * streaming ring and reaches a scatter-gather slot the driver has not
-         * written yet.  On hardware the driver always stays ahead, so xemu
-         * only asserts here.  Decoding it reads physical offset 0 (kernel
-         * bytes) as ADPCM and plays it loud and wrong -- the "mangled / slow,
-         * reverbed" sound effects, and a voice that hit the slot hard reads as
-         * dropped.  Treat it as a ring underrun: hold the voice on this slot
-         * and emit silence; the driver refills it and playback resumes exactly
-         * where it stopped.  Give up after ~1 s so a slot the driver never
-         * fills cannot wedge the voice. */
+         * written yet.  On hardware the driver always stays ahead, so xemu only
+         * asserts here; under -DNDEBUG we used to memcpy physical offset 0
+         * (kernel bytes) and decode it as ADPCM -- loud and wrong.  Treat it as
+         * a ring underrun: hold the voice on this slot, emit silence, and resume
+         * when the driver fills it.  Give up after ~1 s so a slot the driver
+         * never fills cannot wedge the voice.
+         *
+         * NOTE: the DirectSound driver here may also write PRDs straight into
+         * memory rather than through the 0x600 methods (the FMV stream does),
+         * so a "not produced yet" test cannot rely on observing writes; only the
+         * zero PRD is treated as unproduced. */
         {
             static int ssl_underrun[MCPX_HW_MAX_VOICES];
             static uint64_t ssl_underrun_frames;
@@ -883,11 +886,13 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                     if (ssl_underrun[v] == 0) {
                         fprintf(stderr,
                                 "[APU-SSL-UNDERRUN] v=%u ssl=%d seg=%d base=0x%X "
-                                "page=0x%X count=%u ssl_base_page=0x%X\n",
+                                "page=0x%X count=%u ssl_base_page=0x%X "
+                                "off=0x%X len=0x%X\n",
                                 (unsigned)v, ssl_index, ssl_seg,
                                 (unsigned)d->vp.ssl[v].base[ssl_index],
                                 (unsigned)page, (unsigned)count,
-                                (unsigned)d->vp.ssl_base_page);
+                                (unsigned)d->vp.ssl_base_page,
+                                (unsigned)segment_offset, (unsigned)segment_length);
                     }
                     if ((++ssl_underrun_frames % 48000) == 0) {
                         fprintf(stderr,
@@ -913,6 +918,30 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             }
             ssl_underrun[v] = 0;
         }
+#ifdef RECOMP_APU_ASSERT_LOG
+        /* One-shot coherence check on a real streamed buffer: the VP reads
+         * through mcpx_apu_phys(), which maps physical addresses below the
+         * contiguous arena into the 0x80000000 window, while the guest may have
+         * written the audio there through the ordinary alias.  If the two views
+         * disagree the VP decodes stale/zero bytes -- "random buffer
+         * corruption / garbled" streamed audio. */
+        if (getenv("RECOMP_APU_SSL_TRACE")) {
+            static int ssl_mem_checked[MCPX_HW_MAX_VOICES];
+            if (!ssl_mem_checked[v] && segment_offset) {
+                extern uint32_t xbox_ContiguousAllocatedBytes(void);
+                uint32_t off = (uint32_t)segment_offset & 0x0FFFFFFFu;
+                uint32_t w = *(uint32_t *)(g_apu_ram_ptr + 0x80000000u + off);
+                uint32_t o = *(uint32_t *)(g_apu_ram_ptr + off);
+                fprintf(stderr,
+                        "[APU-SSL-MEMCMP] v=%u seg_off=0x%X contig=0x%X "
+                        "window=0x%X ordinary=0x%X %s\n",
+                        (unsigned)v, (unsigned)off,
+                        (unsigned)xbox_ContiguousAllocatedBytes(), w, o,
+                        (w == o) ? "coherent" : "MISMATCH");
+                ssl_mem_checked[v] = 1;
+            }
+        }
+#endif
         seg_len = (segment_length >> 0) & 0xffff;
         seg_cs = (segment_length >> 16) & 3;
         seg_spb = (segment_length >> 18) & 0x1f;
