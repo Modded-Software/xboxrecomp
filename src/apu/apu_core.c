@@ -23,6 +23,7 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
+#include <time.h>
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 
 /* ============================================================
@@ -624,12 +625,34 @@ static void throttle(MCPXAPUState *d)
         d->next_frame_time_us = now_us;
     }
 
+    /* The paced period is EP_FRAME_US = 5333 us, but qemu_cond_timedwait()
+     * only accepts whole milliseconds.  Truncating to 5 ms made every window
+     * fire up to ~1 ms early, so the VP fed samples several percent fast and
+     * slowly drifted ahead of the DirectSound producer -- it then read an
+     * SSL scatter-gather slot the driver had not written yet and underran the
+     * streaming ring (heard as skipping/decoding artifacts on streamed FMV
+     * and dialogue voices).  Sleep the bulk unlocked and spin the final
+     * sub-millisecond so the window lands on its microsecond deadline. */
     while (!d->pause_requested) {
         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-        int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
-        if (remaining_ms > 0) {
-            qemu_cond_timedwait(&d->cond, &d->lock, (int)remaining_ms);
+        int64_t remaining_us = d->next_frame_time_us - now_us;
+        if (remaining_us <= 0)
+            break;
+        if (remaining_us > 1000) {
+            struct timespec ts = {
+                .tv_sec = 0,
+                .tv_nsec = (long)(remaining_us - 500) * 1000,
+            };
+            qemu_mutex_unlock(&d->lock);
+            nanosleep(&ts, NULL);
+            qemu_mutex_lock(&d->lock);
         } else {
+            qemu_mutex_unlock(&d->lock);
+            while (qemu_clock_get_us(QEMU_CLOCK_REALTIME)
+                       < d->next_frame_time_us && !d->pause_requested) {
+                /* spin the last <1 ms for microsecond-accurate pacing */
+            }
+            qemu_mutex_lock(&d->lock);
             break;
         }
     }
