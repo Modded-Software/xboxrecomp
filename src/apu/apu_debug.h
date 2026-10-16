@@ -110,7 +110,14 @@ extern "C" {
 
 bool mcpx_apu_diagnostics_enabled(void);
 
-static inline bool mcpx_apu_debug_is_muted(uint16_t v) { (void)v; return false; }
+/* Set by RECOMP_APU_VOICE_MUTE (comma/space separated voice indices) and
+ * RECOMP_APU_VOICE_SOLO (a single voice index), read at APU init. */
+extern uint64_t g_dbg_muted_voices[4];
+
+static inline bool mcpx_apu_debug_is_muted(uint16_t v)
+{
+    return ((g_dbg_muted_voices[v >> 6] >> (v & 63)) & 1) != 0;
+}
 
 #ifdef __cplusplus
 }

@@ -328,7 +328,7 @@ static struct {
 } g_config = {
     .audio = {
         .volume_limit = 1.0f,
-        .hrtf = false,
+        .hrtf = true,
         .vp = { .num_workers = 1 },
     },
 };

@@ -516,6 +516,38 @@ static void apu_mix_stats(int16_t (*buf)[2], int n)
     }
 }
 
+/* RECOMP_APU_VOICE_LEVELS: once a second, the peak per VP mixbin, so the 3D
+ * crosstalk bins (6-9), I3DL2 (10) and effect sends (11-30) can be told apart
+ * from the speaker bins (0-5). */
+static float s_bin_peak[NUM_MIXBINS];
+static int64_t s_bin_last_ms;
+
+void mcpx_apu_bin_energy_probe(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_APU_VOICE_LEVELS") != NULL;
+    if (!on) return;
+    for (int b = 0; b < NUM_MIXBINS; b++) {
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float a = fabsf(mixbins[b][i]);
+            if (a > s_bin_peak[b]) s_bin_peak[b] = a;
+        }
+    }
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (s_bin_last_ms == 0) s_bin_last_ms = now;
+    if (now - s_bin_last_ms < 1000) return;
+    s_bin_last_ms = now;
+    char line[NUM_MIXBINS * 14 + 32];
+    int off = snprintf(line, sizeof(line), "[APU-MIXBIN]");
+    for (int b = 0; b < NUM_MIXBINS; b++) {
+        if (s_bin_peak[b] > 1e-4f)
+            off += snprintf(line + off, sizeof(line) - off, " %d:%.3f",
+                            b, s_bin_peak[b]);
+        s_bin_peak[b] = 0.0f;
+    }
+    fprintf(stderr, "%s\n", line);
+}
+
 static void apu_declick(int16_t (*buf)[2], int n)
 {
     if (g_declick_enabled < 0) {
@@ -716,7 +748,9 @@ static void se_frame(MCPXAPUState *d)
     memset(mixbins, 0, sizeof(mixbins));
 
     mcpx_apu_vp_frame(d, mixbins);
+    mcpx_apu_bin_energy_probe(mixbins);
     mcpx_apu_dsp_frame(d, mixbins);
+    mcpx_apu_voice_levels_report(d);
     mcpx_apu_monitor_frame(d);
 
     d->ep_frame_div++;
@@ -859,6 +893,28 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     g_apu_ram_ptr = ram_ptr;
     g_state = d;
     d->ram_ptr = ram_ptr;
+
+    /* Per-voice investigation knobs (read once):
+     * RECOMP_APU_VOICE_SOLO=<v>  - hear only voice v
+     * RECOMP_APU_VOICE_MUTE=a,b  - silence the listed voices */
+    {
+        const char *solo = getenv("RECOMP_APU_VOICE_SOLO");
+        if (solo) g_dbg_voice_monitor = atoi(solo);
+        const char *mute = getenv("RECOMP_APU_VOICE_MUTE");
+        if (mute) {
+            const char *p = mute;
+            while (*p) {
+                if (*p >= '0' && *p <= '9') {
+                    int v = 0;
+                    while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+                    if (v >= 0 && v < MCPX_HW_MAX_VOICES)
+                        g_dbg_muted_voices[v >> 6] |= 1ULL << (v & 63);
+                } else {
+                    p++;
+                }
+            }
+        }
+    }
 
     d->set_irq = false;
     d->exiting = false;

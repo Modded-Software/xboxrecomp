@@ -95,6 +95,87 @@ static bool voice_should_mute(uint16_t v)
     return m || mcpx_apu_debug_is_muted(v);
 }
 
+/* RECOMP_APU_HRTF=1/0 forces the per-voice HRTF filter on/off; unset follows
+ * g_config.audio.hrtf (now on, matching xemu). */
+static int apu_hrtf_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_HRTF");
+        on = (e && *e) ? (atoi(e) != 0) : (g_config.audio.hrtf ? 1 : 0);
+    }
+    return on;
+}
+
+/* The VP divides a 3D voice's first four bins (the XTLK/HRTF path) by
+ * 2^hrtf_headroom instead of 2^submix_headroom[bin] - this matches xemu's
+ * vp.c unconditionally (see "FIXME: Not sure if submix/voice headroom factor
+ * in for HRTF"). RECOMP_APU_HRTF_HEADROOM=0 makes those bins fall back to the
+ * per-bin submix headroom instead, for A/B when the 3D voices seem too hot. */
+static int apu_use_hrtf_headroom(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_HRTF_HEADROOM");
+        on = (e && *e) ? (atoi(e) != 0) : 1;
+    }
+    return on;
+}
+
+/* RECOMP_APU_VOICE_LEVELS=1: once a second, one line per voice that produced
+ * audio or starved since the last report. Distinguishes a line that is "mixed
+ * but too quiet" (nonzero source, low mix) from one "producing nothing" (no
+ * source, starved) from one that was simply turned off (absent). Peaks are
+ * linear (1.0 = full scale). */
+static int g_voice_levels = -1;
+static int s_lvl_cfg_logged;
+static int64_t s_lvl_last_ms;
+static int voice_levels_on(void)
+{
+    if (g_voice_levels < 0)
+        g_voice_levels = getenv("RECOMP_APU_VOICE_LEVELS") != NULL;
+    return g_voice_levels;
+}
+
+void mcpx_apu_voice_levels_report(MCPXAPUState *d)
+{
+    if (!voice_levels_on()) return;
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (now - s_lvl_last_ms < 1000) return;
+    s_lvl_last_ms = now;
+    if (!s_lvl_cfg_logged) {
+        s_lvl_cfg_logged = 1;
+        fprintf(stderr,
+                "[APU-VP-CFG] hrtf=%d hrtf_submix=%u,%u,%u,%u hrtf_headroom=%u hrtf_headroom_3d=%d\n",
+                apu_hrtf_enabled(), d->vp.hrtf_submix[0], d->vp.hrtf_submix[1],
+                d->vp.hrtf_submix[2], d->vp.hrtf_submix[3], d->vp.hrtf_headroom,
+                apu_use_hrtf_headroom());
+        for (int b = 0; b < NUM_MIXBINS; b++) {
+            if (d->vp.submix_headroom[b])
+                fprintf(stderr, "[APU-VP-CFG] submix_headroom[%d]=%u\n",
+                        b, (unsigned)d->vp.submix_headroom[b]);
+        }
+    }
+    for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        struct McpxApuDebugVoice *dbg = &g_dbg.vp.v[v];
+        if (dbg->source_peak_since_report < 1e-4f &&
+            dbg->mixed_peak_since_report < 1e-4f &&
+            dbg->starved_reads == 0)
+            continue;
+        fprintf(stderr,
+                "[APU-VOICE-LVL] v=%d%s act=%d str=%d loop=%d ea=%.3f "
+                "src=%.4f mix=%.4f starve=%llu vol=%04X,%04X bin=%u,%u\n",
+                v, (v < MCPX_HW_MAX_3D_VOICES) ? "*3d" : "",
+                dbg->active, dbg->stream, dbg->loop, dbg->amplitude_envelope,
+                dbg->source_peak_since_report, dbg->mixed_peak_since_report,
+                (unsigned long long)dbg->starved_reads,
+                dbg->vol[0], dbg->vol[1], dbg->bin[0], dbg->bin[1]);
+        dbg->source_peak_since_report = 0.0f;
+        dbg->mixed_peak_since_report = 0.0f;
+        dbg->starved_reads = 0;
+    }
+}
+
 /* ============================================================
  * Utility functions
  * ============================================================ */
@@ -1278,6 +1359,12 @@ static void voice_process(MCPXAPUState *d,
     dbg->active = true;
     dbg->stereo = stereo;
     dbg->paused = paused;
+    if (voice_levels_on()) {
+        dbg->stream = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                     NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0;
+        dbg->loop = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                   NV_PAVS_VOICE_CFG_FMT_LOOP) != 0;
+    }
 
     if (paused) return;
 
@@ -1336,6 +1423,7 @@ static void voice_process(MCPXAPUState *d,
             int count = voice_resample(d, v, &samples[sample_count],
                                        NUM_SAMPLES_PER_FRAME - sample_count, rate);
             if (count < 0) break;
+            if (count == 0 && voice_levels_on()) dbg->starved_reads++;
             /* An active voice that keeps producing nothing is an underrun,
              * not a reason to spin. Asking it again at once cannot change the
              * answer, and this loop holds d->lock: Burnout 3's vehicle select
@@ -1348,6 +1436,16 @@ static void voice_process(MCPXAPUState *d,
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
     if (!active) return;
+
+    float lvl_src_peak = 0.0f;
+    if (voice_levels_on()) {
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float a0 = fabsf(samples[i][0]);
+            float a1 = fabsf(samples[i][1]);
+            if (a0 > lvl_src_peak) lvl_src_peak = a0;
+            if (a1 > lvl_src_peak) lvl_src_peak = a1;
+        }
+    }
 
     /* Get volume bins */
     int bin[8];
@@ -1417,7 +1515,7 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /* HRTF processing for 3D voices */
-    if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
+    if (v < MCPX_HW_MAX_3D_VOICES && apu_hrtf_enabled()) {
         uint16_t hrtf_handle =
             (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
@@ -1427,18 +1525,35 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /* Mix into bins */
+    float lvl_mix_peak = 0.0f;
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
-        if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4)) {
+        if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4) && apu_use_hrtf_headroom()) {
             hr = (float)(1 << d->vp.hrtf_headroom);
         } else {
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
         g *= attenuate(vol[b]) / hr;
+        if (voice_levels_on()) {
+            float ag = fabsf(g);
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float s = fabsf(samples[i][b % channels]) * ag;
+                if (s > lvl_mix_peak) lvl_mix_peak = s;
+            }
+        }
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             mixbins[bin[b]][i] += g * samples[i][b % channels];
         }
+    }
+
+    if (voice_levels_on()) {
+        dbg->amplitude_envelope = ea_value;
+        dbg->source_peak = lvl_src_peak;
+        if (lvl_src_peak > dbg->source_peak_since_report)
+            dbg->source_peak_since_report = lvl_src_peak;
+        if (lvl_mix_peak > dbg->mixed_peak_since_report)
+            dbg->mixed_peak_since_report = lvl_mix_peak;
     }
 
     /* VP monitor mix */
@@ -1469,6 +1584,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+
+    if (voice_levels_on()) {
+        for (int v = 0; v < MCPX_HW_MAX_VOICES; v++)
+            g_dbg.vp.v[v].active = false;
+    }
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
