@@ -2,14 +2,14 @@
 
 Hardware emulation of the Xbox's MCPX APU (Audio Processing Unit), extracted from [xemu](https://github.com/xemu-project/xemu). The APU is a custom chip with three processors:
 
-- **VP (Voice Processor)** — 256 hardware voices, ADPCM/PCM decode, pitch shifting, envelopes, HRTF 3D audio
-- **GP (Global Processor)** — DSP56300 engine (`dsp/`) running the guest-downloaded global-effects program (reverb, chorus, mixdown)
-- **EP (Encode Processor)** — DSP56300 engine running the guest-downloaded encode/mixdown program
+- **VP (Voice Processor)**, 256 hardware voices, ADPCM/PCM decode, pitch shifting, envelopes, HRTF 3D audio
+- **GP (Global Processor)**, DSP56300 engine (`dsp/`) running the guest-downloaded global-effects program (reverb, chorus, mixdown)
+- **EP (Encode Processor)**, DSP56300 engine running the guest-downloaded encode/mixdown program
 
-The GP and EP are emulated, not stubbed: `apu_dsp.c` executes the programs the
-title downloads, which is what produces the title's actual mix and completes
-DirectSound's command doorbell. This is the default (`RECOMP_APU_DSP=1`); the
-legacy passthrough stub remains as a fallback behind `RECOMP_APU_DSP=0`.
+The GP and EP run the DSP56300 engine: `apu_dsp.c` executes the programs the
+title downloads, which produces the title's mix and completes DirectSound's
+command doorbell. The engine is the default (`RECOMP_APU_DSP=1`);
+`RECOMP_APU_DSP=0` selects a mixbin passthrough for comparison.
 
 Audio output uses Windows XAudio2, with `waveOut` as a fallback, at 48kHz
 stereo 16-bit.
@@ -58,9 +58,9 @@ peaks, retaining short-lived effects until the next report. Routed peaks are
 per-source contributions, not the final combined DSP output.
 `RECOMP_APU_TRACE=1` traces MMIO. Nonzero samples alone do not establish
 correct DMA mapping, effects fidelity or a complete soundtrack.
-The GP/EP DSP56300 engine is emulated by default; with `RECOMP_APU_DSP=0` the
-passthrough stub returns, and the AC97-ready and DSP-ack overrides are
-diagnostics for that fallback, not emulation.
+The GP/EP DSP56300 engine runs by default; `RECOMP_APU_DSP=0` selects the
+passthrough. The AC97-ready and DSP-ack overrides are diagnostics for the
+passthrough path.
 
 ### Diagnostic DSP Command Completion (passthrough stub only)
 
