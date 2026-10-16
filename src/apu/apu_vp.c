@@ -525,6 +525,24 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                           + (d->vp.ssl_base_page * 8)
                           + (method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET);
             stl_le_phys(address_space_memory, addr, argument);
+            {
+                static int ssl_trace = -1;
+                if (ssl_trace < 0) {
+                    ssl_trace = getenv("RECOMP_APU_SSL_TRACE") ? 1 : 0;
+                }
+                if (ssl_trace) {
+                    static int ssl_wr_count = 0;
+                    if (ssl_wr_count < 600) {
+                        fprintf(stderr,
+                                "[APU-SSLW] page=0x%X method=0x%X off=0x%X addr=0x%X "
+                                "val=0x%X\n",
+                                (unsigned)d->vp.ssl_base_page, (unsigned)method,
+                                (unsigned)(method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET),
+                                (unsigned)addr, (unsigned)argument);
+                        ssl_wr_count++;
+                    }
+                }
+            }
         } else if (method >= NV1BA0_PIO_SET_SUBMIX_HEADROOM &&
                    method <= NV1BA0_PIO_SET_SUBMIX_HEADROOM + 4 * (NUM_MIXBINS - 1)) {
             assert((method & 3) == 0);
@@ -810,25 +828,83 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         segment_offset = ldl_le_phys(address_space_memory, addr);
         segment_length = ldl_le_phys(address_space_memory, addr + 4);
 #ifdef RECOMP_APU_ASSERT_LOG
-        if (segment_offset == 0 || segment_length == 0) {
-            static int ssl_dbg_count = 0;
-            if (ssl_dbg_count < 12) {
+        static int ssl_dbg_count = 0;
+        if ((segment_offset == 0 || segment_length == 0) && ssl_dbg_count < 12) {
+            fprintf(stderr,
+                    "[APU-SSL] zero PRD v=%u ssl=%d seg=%d base=0x%X count=%u "
+                    "page=0x%X ssl_base_page=0x%X VPSSLADDR=0x%X prd_addr=0x%X "
+                    "off=0x%X len=0x%X sgeaddr=0x%X\n",
+                    (unsigned)v, ssl_index, ssl_seg,
+                    (unsigned)d->vp.ssl[v].base[ssl_index], (unsigned)count,
+                    (unsigned)page, (unsigned)d->vp.ssl_base_page,
+                    (unsigned)d->regs[NV_PAPU_VPSSLADDR], (unsigned)addr,
+                    (unsigned)segment_offset, (unsigned)segment_length,
+                    (unsigned)d->regs[NV_PAPU_VPSGEADDR]);
+            if (getenv("RECOMP_APU_SSL_TRACE")) {
+                extern uint32_t xbox_ContiguousAllocatedBytes(void);
+                hwaddr vp = d->regs[NV_PAPU_VPSSLADDR];
+                int base = (int)d->vp.ssl[v].base[ssl_index];
                 fprintf(stderr,
-                        "[APU-SSL] zero PRD v=%u ssl=%d seg=%d base=0x%X count=%u "
-                        "page=0x%X ssl_base_page=0x%X VPSSLADDR=0x%X prd_addr=0x%X "
-                        "off=0x%X len=0x%X sgeaddr=0x%X\n",
-                        (unsigned)v, ssl_index, ssl_seg,
-                        (unsigned)d->vp.ssl[v].base[ssl_index], (unsigned)count,
-                        (unsigned)page, (unsigned)d->vp.ssl_base_page,
-                        (unsigned)d->regs[NV_PAPU_VPSSLADDR], (unsigned)addr,
-                        (unsigned)segment_offset, (unsigned)segment_length,
-                        (unsigned)d->regs[NV_PAPU_VPSGEADDR]);
-                ssl_dbg_count++;
+                        "[APU-SSL-SCAN] v=%u ssl=%d base=0x%X count=%u "
+                        "VPSSLADDR=0x%X contig_alloc=0x%X ssl_base_page=0x%X\n",
+                        (unsigned)v, ssl_index, (unsigned)base, (unsigned)count,
+                        (unsigned)vp, (unsigned)xbox_ContiguousAllocatedBytes(),
+                        (unsigned)d->vp.ssl_base_page);
+                for (int pg = 0; pg < (int)count && pg < 32; pg++) {
+                    hwaddr a = vp + (hwaddr)(base + pg) * 8;
+                    uint32_t o = ldl_le_phys(address_space_memory, a);
+                    uint32_t l = ldl_le_phys(address_space_memory, a + 4);
+                    fprintf(stderr,
+                            "[APU-SSL-SCAN]  pg=%2d page=0x%X off=0x%X len=0x%X\n",
+                            pg, (unsigned)(base + pg), (unsigned)o, (unsigned)l);
+                }
             }
+            ssl_dbg_count++;
         }
 #endif
-        assert(segment_offset != 0);
-        assert(segment_length != 0);
+        /* An unproduced slot: offset 0, or a length with no samples.  The VP
+         * frame clock is 48 kHz wall-clock (EP_FRAME_US), while the guest can
+         * lag badly under GPU load, so the VP catches up with the DirectSound
+         * streaming ring and reaches a scatter-gather slot the driver has not
+         * written yet.  On hardware the driver always stays ahead, so xemu
+         * only asserts here.  Decoding it reads physical offset 0 (kernel
+         * bytes) as ADPCM and plays it loud and wrong -- the "mangled / slow,
+         * reverbed" sound effects, and a voice that hit the slot hard reads as
+         * dropped.  Treat it as a ring underrun: hold the voice on this slot
+         * and emit silence; the driver refills it and playback resumes exactly
+         * where it stopped.  Give up after ~1 s so a slot the driver never
+         * fills cannot wedge the voice. */
+        {
+            static int ssl_underrun[MCPX_HW_MAX_VOICES];
+            if (segment_offset == 0 || segment_length == 0 ||
+                (segment_length & 0xffff) == 0) {
+                if (ssl_underrun[v] < 400) {
+                    if (ssl_underrun[v] == 0) {
+                        fprintf(stderr,
+                                "[APU-SSL-UNDERRUN] v=%u ssl=%d seg=%d base=0x%X "
+                                "page=0x%X count=%u ssl_base_page=0x%X\n",
+                                (unsigned)v, ssl_index, ssl_seg,
+                                (unsigned)d->vp.ssl[v].base[ssl_index],
+                                (unsigned)page, (unsigned)count,
+                                (unsigned)d->vp.ssl_base_page);
+                    }
+                    ssl_underrun[v]++;
+                    memset(samples, 0,
+                           (size_t)num_samples_requested * 2 * sizeof(float));
+                    return num_samples_requested;
+                }
+                voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
+                               NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
+                d->vp.ssl[v].ssl_seg = 0;
+                if (!persist) {
+                    d->vp.ssl[v].ssl_index = 0;
+                    voice_off(d, (uint16_t)v);
+                }
+                ssl_underrun[v] = 0;
+                return -1;
+            }
+            ssl_underrun[v] = 0;
+        }
         seg_len = (segment_length >> 0) & 0xffff;
         seg_cs = (segment_length >> 16) & 3;
         seg_spb = (segment_length >> 18) & 0x1f;
