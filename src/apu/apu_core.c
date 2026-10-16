@@ -416,8 +416,63 @@ static void apu_wav_capture(const int16_t (*buf)[2], int n, int mix)
 #define DECLICK_RAMP   32
 static int g_declick_prev[2];
 
+/* Diagnostics for the two ways the mix can be mangled: hard clipping when the
+ * software-mixer voices and the DSP mixdown sum past full scale, and the
+ * de-click ramp flattening a legitimate transient (it cannot tell a cut from a
+ * sharp sound-effect attack). Reported under RECOMP_APU_DIAG so a hands-on
+ * session yields numbers instead of an impression. The de-click can be turned
+ * off entirely with RECOMP_APU_DECLICK=0 to A/B it. */
+static int g_declick_enabled = -1;
+static uint64_t g_declick_events, g_declick_frames;
+static uint64_t g_mix_windows, g_mix_frames;
+static uint64_t g_mix_clip_pos, g_mix_clip_neg;
+static int g_mix_peak;
+static int64_t g_mix_stat_last_ms;
+
+static void apu_mix_stats(int16_t (*buf)[2], int n)
+{
+    for (int i = 0; i < n; i++) {
+        for (int ch = 0; ch < 2; ch++) {
+            int v = buf[i][ch];
+            int a = v < 0 ? -v : v;
+            if (a > g_mix_peak) g_mix_peak = a;
+            if (v >= 32767) g_mix_clip_pos++;
+            else if (v <= -32768) g_mix_clip_neg++;
+        }
+    }
+    g_mix_windows++;
+    g_mix_frames += n;
+
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (g_mix_stat_last_ms == 0) g_mix_stat_last_ms = now;
+    if (now - g_mix_stat_last_ms >= 1000) {
+        double pct = g_mix_frames ? 100.0 * (double)(g_mix_clip_pos + g_mix_clip_neg) /
+                                    (double)(g_mix_frames * 2) : 0.0;
+        fprintf(stderr,
+                "[APU-MIXSTAT] peak=%d clip=%.3f%% (+%llu/-%llu of %llu samples) "
+                "declick_events=%llu declick_frames=%llu declick=%s\n",
+                g_mix_peak, pct,
+                (unsigned long long)g_mix_clip_pos, (unsigned long long)g_mix_clip_neg,
+                (unsigned long long)(g_mix_frames * 2),
+                (unsigned long long)g_declick_events,
+                (unsigned long long)g_declick_frames,
+                g_declick_enabled ? "on" : "off");
+        g_mix_stat_last_ms = now;
+        g_mix_peak = 0;
+        g_mix_clip_pos = g_mix_clip_neg = 0;
+        g_mix_windows = g_mix_frames = 0;
+        g_declick_events = g_declick_frames = 0;
+    }
+}
+
 static void apu_declick(int16_t (*buf)[2], int n)
 {
+    if (g_declick_enabled < 0) {
+        const char *e = getenv("RECOMP_APU_DECLICK");
+        g_declick_enabled = !(e && e[0] == '0');
+    }
+    if (!g_declick_enabled) return;
+
     for (int ch = 0; ch < 2; ch++) {
         int prev = g_declick_prev[ch];
         int i = 0;
@@ -428,6 +483,8 @@ static void apu_declick(int16_t (*buf)[2], int n)
                 if (end > n) end = n;
                 int target = buf[end - 1][ch];
                 int span = end - i;
+                g_declick_events++;
+                g_declick_frames += span;
                 for (int j = i; j < end; j++) {
                     buf[j][ch] = (int16_t)(prev +
                         (int)((long)(target - prev) * (j - i + 1) / span));
@@ -476,10 +533,23 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
 
         apu_declick((int16_t (*)[2])d->monitor.frame_buf, num_samples);
 
+        if (getenv("RECOMP_APU_DIAG"))
+            apu_mix_stats((int16_t (*)[2])d->monitor.frame_buf, num_samples);
+
         apu_wav_capture((const int16_t (*)[2])d->monitor.frame_buf,
                         num_samples, 1);
 
+        /* xa2_submit_samples() back-pressures by sleeping up to tens of ms when
+         * the host queue is momentarily full (it used to drop the whole window
+         * instead). The frame thread holds d->lock for its entire loop, and
+         * every guest VOICE_ON/OFF/RELEASE needs that same lock, so sleeping in
+         * here stalls the title for as long as the wait lasts -- heard as a
+         * 0-2 s freeze exactly when a fresh sound bank loads and the audio
+         * queue backs up. Drop the lock around the submit, as throttle() does,
+         * so the wait can never block the guest. */
+        qemu_mutex_unlock(&d->lock);
         xa2_submit_samples((const int16_t *)d->monitor.frame_buf, num_samples);
+        qemu_mutex_lock(&d->lock);
         return;
     }
 

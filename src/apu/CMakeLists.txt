@@ -23,6 +23,7 @@ add_library(xbox_apu STATIC
     dsp/dsp_dma.c
     apu_mmio_hook.c
     apu_xaudio2.c
+    apu_assert.c
     ${SAMPLERATE_SOURCES}
 )
 
@@ -32,6 +33,19 @@ target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(xbox_apu PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../nv2a
 )
+
+# Restore visibility of the invariant checks that Release's -DNDEBUG strips
+# from the xemu-derived VP/DSP code. assert_shim/assert.h shadows <assert.h>
+# for this target and redefines assert() as a throttled, non-fatal logger
+# ([APU-ASSERT] file:line), so a DSP protocol violation is diagnosable instead
+# of silently corrupting audio. The shim dir must precede the system includes;
+# it does not change behaviour. See assert_shim/assert.h and apu_assert.c.
+if(NOT MSVC)
+    target_compile_definitions(xbox_apu PRIVATE RECOMP_APU_ASSERT_LOG)
+    target_include_directories(xbox_apu PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/assert_shim
+    )
+endif()
 
 if(MSVC)
     target_compile_options(xbox_apu PRIVATE

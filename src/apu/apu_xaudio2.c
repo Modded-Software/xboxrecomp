@@ -40,6 +40,7 @@ static uint64_t                g_xa2_empty_queue_events;
 static DWORD                   g_xa2_last_report;
 static int                     g_xa2_started;
 static int                     g_xa2_diagnostic;
+static uint64_t                g_xa2_dropped_windows;
 
 int xa2_init(void)
 {
@@ -146,7 +147,30 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     }
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
+    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) {
+        /* Backpressure, not a silent drop. Returning 0 here discards a whole
+         * 256-frame window, which is heard as exactly the "cut off, then
+         * reload" gap this file's other comments promise never to make; it
+         * shows up as drop-outs whenever the host momentarily cannot keep the
+         * 187.5 Hz cadence. Wait (bounded) for the device to retire a buffer,
+         * then submit into the slot it just freed. */
+        int spins = 0;
+        while (spins < 50) {
+            Sleep(1);
+            spins++;
+            IXAudio2SourceVoice_GetState(g_xa2_source, &state,
+                                         XAUDIO2_VOICE_NOSAMPLESPLAYED);
+            if ((int)state.BuffersQueued < XA2_NUM_BUFS) break;
+        }
+        if ((int)state.BuffersQueued >= XA2_NUM_BUFS) {
+            g_xa2_dropped_windows++;
+            if (g_xa2_diagnostic)
+                fprintf(stderr, "[XA2] queue still full after %d ms; dropped "
+                                "window %llu (audio behind real time)\n",
+                        spins, (unsigned long long)g_xa2_dropped_windows);
+            return 0;
+        }
+    }
     if (!state.BuffersQueued) g_xa2_empty_queue_events++;
     /* Leave the source running once started: a transiently empty queue makes
      * XAudio2 emit silence, whereas stopping and re-prefilling it produced an
@@ -156,9 +180,10 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         XAUDIO2_PERFORMANCE_DATA performance;
         g_xa2_last_report = GetTickCount();
         IXAudio2_GetPerformanceData(g_xa2, &performance);
-        fprintf(stderr, "[XA2] queued=%u packets=%d empty_queue_events=%llu engine_glitches=%u\n",
+        fprintf(stderr, "[XA2] queued=%u packets=%d empty_queue_events=%llu dropped_windows=%llu engine_glitches=%u\n",
                 state.BuffersQueued, g_xa2_frames_written,
                 (unsigned long long)g_xa2_empty_queue_events,
+                (unsigned long long)g_xa2_dropped_windows,
                 performance.GlitchesSinceEngineStarted);
     }
 

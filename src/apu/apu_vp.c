@@ -809,6 +809,24 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
         segment_offset = ldl_le_phys(address_space_memory, addr);
         segment_length = ldl_le_phys(address_space_memory, addr + 4);
+#ifdef RECOMP_APU_ASSERT_LOG
+        if (segment_offset == 0 || segment_length == 0) {
+            static int ssl_dbg_count = 0;
+            if (ssl_dbg_count < 12) {
+                fprintf(stderr,
+                        "[APU-SSL] zero PRD v=%u ssl=%d seg=%d base=0x%X count=%u "
+                        "page=0x%X ssl_base_page=0x%X VPSSLADDR=0x%X prd_addr=0x%X "
+                        "off=0x%X len=0x%X sgeaddr=0x%X\n",
+                        (unsigned)v, ssl_index, ssl_seg,
+                        (unsigned)d->vp.ssl[v].base[ssl_index], (unsigned)count,
+                        (unsigned)page, (unsigned)d->vp.ssl_base_page,
+                        (unsigned)d->regs[NV_PAPU_VPSSLADDR], (unsigned)addr,
+                        (unsigned)segment_offset, (unsigned)segment_length,
+                        (unsigned)d->regs[NV_PAPU_VPSGEADDR]);
+                ssl_dbg_count++;
+            }
+        }
+#endif
         assert(segment_offset != 0);
         assert(segment_length != 0);
         seg_len = (segment_length >> 0) & 0xffff;

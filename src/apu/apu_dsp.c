@@ -718,9 +718,19 @@ static void dsp_frame_engine(MCPXAPUState *d,
 
 static void dsp_init_engine(MCPXAPUState *d)
 {
+    /* The DSP RAM starts zeroed (dsp_init's calloc), which is what xemu's
+     * reference does. Filling it with 0xCACACACA is a debug aid that catches
+     * uninitialised DSP reads, but a title that reads GP/EP RAM before its
+     * bootrom program writes it then plays that poison as loud noise -- the
+     * reference yields silence there instead. Default OFF; set
+     * RECOMP_APU_DSP_POISON=1 to bring the pattern back for debugging. */
+    const char *poison_env = getenv("RECOMP_APU_DSP_POISON");
+    bool poison = poison_env && *poison_env && atoi(poison_env) != 0;
+    uint32_t fill = poison ? 0xCACACACA : 0u;
+
     d->gp.dsp = dsp_init(d, gp_scratch_rw, gp_fifo_rw);
     for (int i = 0; i < DSP_PRAM_SIZE; i++) {
-        d->gp.dsp->core.pram[i] = 0xCACACACA;
+        d->gp.dsp->core.pram[i] = fill;
     }
     memset(d->gp.dsp->core.pram_opcache, 0,
            sizeof(d->gp.dsp->core.pram_opcache));
@@ -731,22 +741,23 @@ static void dsp_init_engine(MCPXAPUState *d)
 
     d->ep.dsp = dsp_init(d, ep_scratch_rw, ep_fifo_rw);
     for (int i = 0; i < DSP_PRAM_SIZE; i++) {
-        d->ep.dsp->core.pram[i] = 0xCACACACA;
+        d->ep.dsp->core.pram[i] = fill;
     }
     memset(d->ep.dsp->core.pram_opcache, 0,
            sizeof(d->ep.dsp->core.pram_opcache));
     for (int i = 0; i < DSP_XRAM_SIZE; i++) {
-        d->ep.dsp->core.xram[i] = 0xCACACACA;
+        d->ep.dsp->core.xram[i] = fill;
     }
     for (int i = 0; i < DSP_YRAM_SIZE; i++) {
-        d->ep.dsp->core.yram[i] = 0xCACACACA;
+        d->ep.dsp->core.yram[i] = fill;
     }
     d->ep.dsp->is_gp = false;
     d->ep.dsp->core.is_gp = false;
     d->ep.dsp->core.is_idle = false;
     d->ep.dsp->core.cycle_count = 0;
 
-    fprintf(stderr, "[APU] DSP GP/EP initialized (DSP56300 engine, RECOMP_APU_DSP=1)\n");
+    fprintf(stderr, "[APU] DSP GP/EP initialized (DSP56300 engine, RECOMP_APU_DSP=1%s)\n",
+            poison ? ", RAM poison ON" : "");
 }
 
 /* ============================================================
