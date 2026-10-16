@@ -862,59 +862,59 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             ssl_dbg_count++;
         }
 #endif
-        /* An unproduced slot: offset 0, or a length with no samples.  The VP
-         * frame clock is 48 kHz wall-clock (EP_FRAME_US), while the guest can
-         * lag under GPU load, so the VP catches up with the DirectSound
-         * streaming ring and reaches a scatter-gather slot the driver has not
-         * written yet.  On hardware the driver always stays ahead, so xemu only
-         * asserts here; under -DNDEBUG we used to memcpy physical offset 0
-         * (kernel bytes) and decode it as ADPCM -- loud and wrong.  Treat it as
-         * a ring underrun: hold the voice on this slot, emit silence, and resume
-         * when the driver fills it.  Give up after ~1 s so a slot the driver
-         * never fills cannot wedge the voice.
+        /* An unproduced scatter-gather slot: offset 0, or a length with no
+         * samples.  The VP frame clock is 48 kHz wall-clock (EP_FRAME_US),
+         * while the guest's DirectSound feeder can lag under load, so the VP
+         * reaches a slot the driver has not written yet.  On hardware the
+         * driver always stays ahead, so xemu only asserts here; under -NDEBUG
+         * we used to memcpy physical offset 0 (kernel bytes) and decode it as
+         * ADPCM -- loud and wrong.
          *
-         * NOTE: the DirectSound driver here may also write PRDs straight into
-         * memory rather than through the 0x600 methods (the FMV stream does),
-         * so a "not produced yet" test cannot rely on observing writes; only the
-         * zero PRD is treated as unproduced. */
+         * Do not decode the stale bytes, and do NOT stall the pipeline on the
+         * slot.  The SSL_DONE notifier that tells the driver to refill the
+         * list only fires once the whole list is consumed, so holding here
+         * wedges the ring: the driver never refills, and the title re-presents
+         * the same buffer -- heard as a looping/echoing FMV or dialogue sample.
+         * Instead emit silence for this segment and advance past it so the
+         * list completes and the driver is unblocked. */
         {
             static int ssl_underrun[MCPX_HW_MAX_VOICES];
             static uint64_t ssl_underrun_frames;
             if (segment_offset == 0 || segment_length == 0 ||
                 (segment_length & 0xffff) == 0) {
-                if (ssl_underrun[v] < 400) {
-                    if (ssl_underrun[v] == 0) {
-                        fprintf(stderr,
-                                "[APU-SSL-UNDERRUN] v=%u ssl=%d seg=%d base=0x%X "
-                                "page=0x%X count=%u ssl_base_page=0x%X "
-                                "off=0x%X len=0x%X\n",
-                                (unsigned)v, ssl_index, ssl_seg,
-                                (unsigned)d->vp.ssl[v].base[ssl_index],
-                                (unsigned)page, (unsigned)count,
-                                (unsigned)d->vp.ssl_base_page,
-                                (unsigned)segment_offset, (unsigned)segment_length);
-                    }
-                    if ((++ssl_underrun_frames % 48000) == 0) {
-                        fprintf(stderr,
-                                "[APU-SSL-STAT] underrun frames=%llu (v=%u seg=%d "
-                                "page=0x%X)\n",
-                                (unsigned long long)ssl_underrun_frames,
-                                (unsigned)v, ssl_seg, (unsigned)page);
-                    }
-                    ssl_underrun[v]++;
-                    memset(samples, 0,
-                           (size_t)num_samples_requested * 2 * sizeof(float));
-                    return num_samples_requested;
+                if (ssl_underrun[v] == 0) {
+                    fprintf(stderr,
+                            "[APU-SSL-UNDERRUN] v=%u ssl=%d seg=%d base=0x%X "
+                            "page=0x%X count=%u ssl_base_page=0x%X "
+                            "off=0x%X len=0x%X\n",
+                            (unsigned)v, ssl_index, ssl_seg,
+                            (unsigned)d->vp.ssl[v].base[ssl_index],
+                            (unsigned)page, (unsigned)count,
+                            (unsigned)d->vp.ssl_base_page,
+                            (unsigned)segment_offset, (unsigned)segment_length);
+                }
+                ssl_underrun[v]++;
+                ssl_underrun_frames++;
+                if ((ssl_underrun_frames % 48000) == 0) {
+                    fprintf(stderr,
+                            "[APU-SSL-STAT] underrun frames=%llu (v=%u seg=%d "
+                            "page=0x%X)\n",
+                            (unsigned long long)ssl_underrun_frames,
+                            (unsigned)v, ssl_seg, (unsigned)page);
+                }
+                memset(samples, 0,
+                       (size_t)num_samples_requested * 2 * sizeof(float));
+                d->vp.ssl[v].ssl_seg += 1;
+                if (d->vp.ssl[v].ssl_seg >= d->vp.ssl[v].count[ssl_index]) {
+                    d->vp.ssl[v].ssl_index = (ssl_index + 1) % 2;
+                    d->vp.ssl[v].ssl_seg = 0;
+                    set_notify_status(d, (uint16_t)v,
+                                      MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
+                                      NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
                 }
                 voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                                NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
-                d->vp.ssl[v].ssl_seg = 0;
-                if (!persist) {
-                    d->vp.ssl[v].ssl_index = 0;
-                    voice_off(d, (uint16_t)v);
-                }
-                ssl_underrun[v] = 0;
-                return -1;
+                return num_samples_requested;
             }
             ssl_underrun[v] = 0;
         }
