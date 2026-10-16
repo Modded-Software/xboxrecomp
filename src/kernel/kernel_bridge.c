@@ -3736,8 +3736,16 @@ static void bridge_NtReadFile(void)
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
-     * identical from inside the title -- the first bytes settle it. */
+     * identical from inside the title -- the first bytes settle it.
+     *
+     * Opt-in: a title streaming a pack file issues thousands of these, and a
+     * synchronous fprintf+fflush per read on the guest's I/O path throttles the
+     * whole VM (heard as audio skipping/lag).  Enabled with RECOMP_FILE_TRACE=1. */
     {
+        static int file_trace = -1;
+        if (file_trace < 0)
+            file_trace = getenv("RECOMP_FILE_TRACE") ? 1 : 0;
+        if (file_trace) {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
         /* The offset matters as much as the length. A title streaming a pack
@@ -3759,6 +3767,7 @@ static void bridge_NtReadFile(void)
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         fflush(stderr);
+        }
     }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
