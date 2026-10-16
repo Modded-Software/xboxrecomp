@@ -57,3 +57,48 @@ Beyond the four pillars, each game needs:
 - **Game-specific workarounds** — vtable guards for corrupted pointers, state machine patches, etc.
 
 These go in the game-specific repo, not in the generic xboxrecomp toolkit.
+
+## POSIX hosts (macOS, Linux)
+
+The template's `main.c` is Win32: a vectored handler that calls
+`xbox_VehMmioFault` and a `WinMain`. A POSIX build needs the same two pieces
+in its own `main()`:
+
+```c
+#include <signal.h>
+#include <ucontext.h>
+#include "kernel/xbox_memory_layout.h"   /* xbox_PosixMmioFault */
+#include "video/video_player.h"          /* xbox_HostWindowMain */
+
+/* Trapped hardware registers (APU, AC'97, USB OHCI) fault here. Return when
+ * the access was serviced: the program counter has been advanced past it. */
+static void on_fault(int sig, siginfo_t *si, void *uc)
+{
+    if (xbox_PosixMmioFault(uc, (uintptr_t)si->si_addr))
+        return;
+    signal(sig, SIG_DFL);                /* a real crash: report and die */
+}
+
+static int boot_and_run(void)
+{
+    /* xbox_MemoryLayoutInit, kernel init, the guest entry point, ...,
+     * as in the template's WinMain. */
+    return 0;
+}
+
+int main(void)
+{
+    struct sigaction sa = { 0 };
+    sa.sa_sigaction = on_fault;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);        /* macOS reports a protected page so */
+    /* With RECOMP_FB_WINDOW set this opens the framebuffer window on the
+     * main thread (where macOS requires it) and runs boot_and_run on a second
+     * one; otherwise it just calls boot_and_run. */
+    return xbox_HostWindowMain(boot_and_run);
+}
+```
+
+`xbox_PosixMmioFault` decodes the faulting instruction on arm64 hosts only;
+on x86-64 POSIX it always returns 0, and the traps are not armed there.

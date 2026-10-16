@@ -305,6 +305,54 @@ int main(int argc, char **argv)
         unsetenv("RECOMP_TRAP_NULL");
     }
 
+    /*
+     * 6. The toolkit region follows the image.
+     *
+     * The kernel data exports, the fake TLS, the main stack and the heap
+     * used to sit at fixed VAs from 0x00700000. A title whose .data/BSS ran
+     * past that had its globals under the stack and the heap. A small image
+     * keeps the old addresses; a large one (the synthetic section is grown
+     * to end at 0x009B68C0, as BSS) moves all of it above the image.
+     */
+    {
+        BOOL small = xbox_MemoryLayoutInit(xbe, n);
+        check(small && g_xbox_region_base == XBOX_REGION_MIN,
+              "a small image keeps the region at 0x00700000", NULL);
+        if (small) xbox_MemoryLayoutShutdown();
+
+        unsigned char *big = malloc(n);
+        if (big && n >= 0x40C) {
+            memcpy(big, xbe, n);
+            uint32_t va, vsize = 0;
+            memcpy(&va, big + 0x404, 4);                 /* first section VA */
+            uint32_t end = 0x009B68C0u;
+            vsize = end - va;
+            memcpy(big + 0x408, &vsize, 4);              /* virtual size */
+
+            BOOL ok6 = xbox_MemoryLayoutInit(big, n);
+            check(ok6, "init succeeds with an image ending at 0x009B68C0", NULL);
+            if (ok6) {
+                char d[128];
+                snprintf(d, sizeof d, "image_hi 0x%08X region 0x%08X stack 0x%08X heap 0x%08X",
+                         g_xbox_image_hi, g_xbox_region_base,
+                         g_xbox_stack_base, (uint32_t)XBOX_HEAP_BASE);
+                check(g_xbox_image_hi == end, "image_hi covers the grown section", d);
+                check(g_xbox_region_base >= g_xbox_image_hi,
+                      "the toolkit region sits above the image", d);
+                check(XBOX_KERNEL_DATA_BASE >= g_xbox_image_hi,
+                      "the kernel data exports sit above the image", d);
+                check(g_xbox_stack_base >= g_xbox_image_hi,
+                      "the main stack sits above the image", d);
+                check(XBOX_HEAP_BASE >= g_xbox_image_hi,
+                      "the heap sits above the image", d);
+                uint32_t blk = xbox_HeapAlloc(0x1000, 0x1000);
+                check(blk >= g_xbox_image_hi, "a heap block lands above the image", d);
+                xbox_MemoryLayoutShutdown();
+            }
+        }
+        free(big);
+    }
+
     printf("\n%d failure(s)\n", failures);
     free(xbe);
     return failures ? 1 : 0;

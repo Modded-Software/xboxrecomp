@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xboxrecomp VERSION 0.9.0 LANGUAGES C)
+project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
 
 if(WIN32)
     enable_language(CXX)
@@ -63,8 +63,7 @@ add_subdirectory(src/video)
 # ── Umbrella target ───────────────────────────────────────────
 
 # Convenience target that links all runtime libraries
-add_library(xboxrecomp INTERFACE)
-target_link_libraries(xboxrecomp INTERFACE
+set(XBOXRECOMP_LIBS
     xbox_kernel
     xbox_d3d8
     xbox_dsound
@@ -74,4 +73,14 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_nv2a
     xbox_video
 )
+add_library(xboxrecomp INTERFACE)
+if(UNIX AND NOT APPLE)
+    # The archives call each other both ways (the APU reaches the kernel's
+    # memory map, the kernel raises the APU's interrupt). GNU ld scans each
+    # archive once, so it needs the group; MSVC and ld64 rescan on their own.
+    target_link_libraries(xboxrecomp INTERFACE
+        -Wl,--start-group ${XBOXRECOMP_LIBS} -Wl,--end-group)
+else()
+    target_link_libraries(xboxrecomp INTERFACE ${XBOXRECOMP_LIBS})
+endif()
 

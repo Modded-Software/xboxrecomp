@@ -74,6 +74,8 @@ void xbox_FramebufferMouseCapture(int on);
 
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+/* Rows per displayed row: 2 for a 2x2 anti-aliased surface, else 1. */
+void xbox_FramebufferWindowSetAA(uint32_t sy);
 int  xbox_FramebufferDumpBmp(const char *path);
 
 /* The framebuffer dimensions the window reads (the title's render resolution).
@@ -99,5 +101,15 @@ void xbox_SetPresentHook(xbox_present_hook_t hook, void *user);
  * StretchDIBits call is skipped, so a D3D11 presenter does not fight GDI for
  * the same HWND. No-op on non-Windows. */
 void xbox_FramebufferWindowSuspend(int on);
+
+#if !defined(_WIN32)
+/* POSIX hosts: the framebuffer window needs the process main thread (AppKit
+ * on macOS), so a title that wants it calls this from main() with its boot
+ * sequence. With RECOMP_FB_WINDOW set it opens the window, runs guest_main on
+ * a pthread and pumps events until guest_main returns (its value is returned)
+ * or the window is closed (the process exits). Otherwise, or headless, it
+ * just calls guest_main. */
+int  xbox_HostWindowMain(int (*guest_main)(void));
+#endif
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */

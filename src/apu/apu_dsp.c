@@ -818,3 +818,13 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         dsp_frame_stub(d, mixbins);
     }
 }
+
+/* Called after the frame thread is joined, from mcpx_apu_shutdown. Safe to
+ * call twice. */
+void mcpx_apu_dsp_finalize(MCPXAPUState *d)
+{
+    free(d->gp.dsp);
+    free(d->ep.dsp);
+    d->gp.dsp = NULL;
+    d->ep.dsp = NULL;
+}

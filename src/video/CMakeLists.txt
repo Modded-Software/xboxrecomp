@@ -8,7 +8,15 @@ target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
-target_link_libraries(xbox_video PUBLIC xbox_d3d8)
+# xbox_input: the windows record keys in its key table (keyboard.c).
+target_link_libraries(xbox_video PUBLIC xbox_d3d8 xbox_input)
 if(WIN32)
     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32)
+else()
+    # The framebuffer window on POSIX hosts: SDL2, on the process main thread
+    # (fb_present_sdl.c), which then also pumps the events the game
+    # controllers are read from.
+    find_package(SDL2 REQUIRED)
+    target_sources(xbox_video PRIVATE fb_present_sdl.c)
+    target_link_libraries(xbox_video PUBLIC SDL2::SDL2)
 endif()

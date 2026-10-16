@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "kernel_missing.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
 #include <stdlib.h>
@@ -684,6 +685,9 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
     DebugBreak();
 #endif
 
+    /* ExitProcess skips atexit. Guest code calls this, never from inside
+     * the report's lock, so the summary's list write may take it. */
+    xbox_missing_summary("bugcheck");
     ExitProcess(BugCheckCode);
 }
 
@@ -703,6 +707,9 @@ VOID __stdcall xbox_KeBugCheckEx(
     DebugBreak();
 #endif
 
+    /* ExitProcess skips atexit. Guest code calls this, never from inside
+     * the report's lock, so the summary's list write may take it. */
+    xbox_missing_summary("bugcheck");
     ExitProcess(BugCheckCode);
 }
 
@@ -1339,5 +1346,79 @@ uint64_t xbox_ReadTimeStampCounter(void)
         uint64_t rem  = ticks % (uint64_t)freq.QuadPart;
         return secs * XBOX_TSC_HZ
              + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart;
+    }
+}
+
+/* =========================================================================
+ * x86 port I/O
+ *
+ * The lifter turns `in`/`out` into these. The MCPX decodes I/O space: its
+ * ACPI/PM block sits at 0x8000 and SMBus at 0xC000, and the kernel exports
+ * cover SMBus, so a title touches ports directly only for the odd pin.
+ *
+ * 0x80C0 is the first GPIO register of the ACPI block. Bit 5 is the field pin
+ * of the video encoder: D3D's vblank ISR stores !bit5 in [device+0x1DF8], and
+ * D3DDevice_GetDisplayFieldStatus reports D3DFIELD_ODD while that is set.
+ * Interlaced output alternates fields every vblank, so the pin follows the
+ * parity of the vblank count. A constant answer says "odd field" for ever,
+ * and the XDK's XMV player only starts its clock on an even one: Burnout 3's
+ * EA intro waited on its loading screen indefinitely.
+ *
+ * The count is xbox_VblankCount, the one vblank count, bumped once per tick
+ * by the timer thread. Two regimes follow from it:
+ *  - tick-driven (RECOMP_VBLANK=1, once the first vblank is counted): the pin
+ *    is the count's parity and holds still between vblanks, however often
+ *    it is read;
+ *  - no tick (before the first vblank, or the whole run with RECOMP_VBLANK
+ *    off): the count is 0, so the pin toggles on every read instead. A
+ *    reader waiting for either field still sees it; nothing is implied
+ *    about vblank delivery.
+ *
+ * Every other port reads 0 and is logged on first use, once per port.
+ * ========================================================================= */
+static int port_first_use(uint32_t port, int is_out)
+{
+    static uint32_t seen[32];
+    static volatile LONG nseen;
+    uint32_t key = (port & 0xFFFFu) | (is_out ? 0x10000u : 0u);
+    LONG i, n = nseen;
+
+    for (i = 0; i < n && i < 32; i++)
+        if (seen[i] == key)
+            return 0;
+    i = InterlockedIncrement(&nseen) - 1;
+    if (i < 32)
+        seen[i] = key;
+    return i < 32;
+}
+
+uint32_t xbox_PortIn(uint32_t port, int width)
+{
+    uint32_t v = 0;
+
+    port &= 0xFFFFu;
+    if (port == 0x80C0u) {
+        static volatile LONG reads;
+        uint32_t n = xbox_VblankCount();
+        if (!n)
+            n = (uint32_t)InterlockedIncrement(&reads);
+        v = (n & 1u) << 5;
+        return v;
+    }
+    if (port_first_use(port, 0)) {
+        fprintf(stderr, "  [PORT] in%c 0x%04X -> 0 (not modelled)\n",
+                width == 1 ? 'b' : width == 2 ? 'w' : 'd', port);
+        fflush(stderr);
+    }
+    return v;
+}
+
+void xbox_PortOut(uint32_t port, uint32_t value, int width)
+{
+    port &= 0xFFFFu;
+    if (port_first_use(port, 1)) {
+        fprintf(stderr, "  [PORT] out%c 0x%04X = 0x%X (ignored)\n",
+                width == 1 ? 'b' : width == 2 ? 'w' : 'd', port, value);
+        fflush(stderr);
     }
 }

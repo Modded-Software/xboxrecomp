@@ -152,7 +152,7 @@ RECOMP_TLS uint32_t g_seh_ebp, g_ebp;
 RECOMP_TLS int g_df;   /* EFLAGS.DF: the direction the string ops walk */
 RECOMP_TLS uint32_t g_eflags;   /* EFLAGS as a register, for pushfd/popfd */
 RECOMP_TLS double g_fp_stack[8]; RECOMP_TLS int g_fp_top;
-RECOMP_TLS uint16_t g_fp_control_word = 0x027F; RECOMP_TLS int g_fp_cmp; RECOMP_TLS uint16_t g_fp_cc = 0x4000;
+RECOMP_TLS uint16_t g_fp_control_word = 0x027F; RECOMP_TLS uint32_t g_mxcsr = 0x1F80; RECOMP_TLS int g_fp_cmp; RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 RECOMP_TLS RecompXmm g_xmm0,g_xmm1,g_xmm2,g_xmm3,g_xmm4,g_xmm5,g_xmm6,g_xmm7;
 RECOMP_TLS RecompMmx g_mm0,g_mm1,g_mm2,g_mm3,g_mm4,g_mm5,g_mm6,g_mm7;
 volatile uint32_t g_icall_trace[16]; volatile uint32_t g_icall_trace_idx;
@@ -202,7 +202,7 @@ static unsigned char l_xmm[128];
 
 _LIFTED_PROLOGUE = {
     "gpr": """    g_eax = g_in_a; g_ecx = g_in_b; g_edx = 0;""",
-    "fpu": """    g_fp_top = 0; g_fp_control_word = 0x027Fu; g_fp_cmp = 0; g_fp_cc = 0x4000;
+    "fpu": """    g_fp_top = 0; g_fp_control_word = 0x027Fu; g_mxcsr = 0x1F80u; g_fp_cmp = 0; g_fp_cc = 0x4000;
 @FPMACROS@
     memset(g_fp_stack, 0, sizeof(g_fp_stack));
     g_eax = (uint32_t)(uintptr_t)g_scratch; g_ecx = 0; g_edx = 0;""",
@@ -340,6 +340,7 @@ def harness_source(prepared, why_of, tol_of):
         out.append(f"""static void lif_{name}(void) {{
     uint32_t ebp = 0; int _cf = 0; int _flags = 0;
     uint32_t _fa = 0, _fb = 0; int32_t _fas = 0, _fbs = 0;
+    double _fca = 0, _fcb = 0;
     (void)ebp; (void)_cf; (void)_flags;
     (void)_fa; (void)_fb; (void)_fas; (void)_fbs;
 {_LIFTED_PROLOGUE[kind]}

@@ -2340,6 +2340,13 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+static volatile LONG g_vblank_total;
+
+uint32_t xbox_VblankCount(void)
+{
+    return (uint32_t)g_vblank_total;
+}
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
@@ -2355,6 +2362,7 @@ static void kernel_vblank_tick(void)
     if (now < next_ms)
         return;
     next_ms = now + 16;                       /* ~60 Hz */
+    InterlockedIncrement(&g_vblank_total);
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;

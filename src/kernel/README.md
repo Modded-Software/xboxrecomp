@@ -37,12 +37,19 @@ Xbox VA Range          Purpose                  Size
 0x00011000-0x002BBFFF  .text (code)             2.73 MB
 0x0036B7C0-0x003B2363  .rdata (constants)       283 KB
 0x003B2360-0x0076FFFF  .data (globals + BSS)    3.8 MB
-0x00700000-0x0073FFFF  RW data copy             256 KB
-0x00740000-0x0077FFFF  Kernel data exports      256 KB
-0x00760000-0x0076FFFF  TLS area                 64 KB
-0x00780000-0x00F7FFFF  Stack (8 MB, grows down) 8 MB
-0x00F80000-0x03FFFFFF  Heap (bump allocator)    ~49 MB
+R+0x00000              RW data copy             256 KB
+R+0x40000              Kernel data exports      128 KB
+R+0x60000              TLS area                 64 KB
+R+0x80000              Stack (8 MB, grows down) 8 MB
+R+0x880000-0x03FFFFFF  Heap (bump allocator)    rest of RAM
 ```
+
+`R` is the toolkit region base, `g_xbox_region_base`: the first 64 KB
+boundary above the highest loaded section, and never below `0x00700000`.
+An image that ends below `0x00700000` gets the addresses above
+(`R = 0x00700000`, kernel data at `0x00740000`). A larger image moves the
+whole region above it. The stack shrinks, down to 1 MB, when a full 8 MB
+would leave less than 16 MB of heap.
 
 ### Why CreateFileMapping?
 
@@ -130,7 +137,7 @@ xbox_kernel_bridge_init();  // Write thunk entries into Xbox memory, set up kern
 Some kernel ordinals are data exports (not functions). We allocate a kernel data area:
 
 ```c
-#define XBOX_KERNEL_DATA_BASE  0x00740000
+#define XBOX_KERNEL_DATA_BASE  (g_xbox_region_base + XBOX_REGION_KDATA_OFF)  /* 0x00740000 for a small image */
 
 // Offsets within the data area
 #define KDATA_HARDWARE_INFO     0x000  // XBOX_HARDWARE_INFO struct
@@ -160,6 +167,14 @@ Z:\cache.dat                 → <save_dir>\cache\cache.dat
 // Call early — before game tries to open files
 xbox_path_init("Burnout 3 Takedown", "saves");
 ```
+
+`save_dir` defaults to `$XDG_DATA_HOME/xboxrecomp` (POSIX) or
+`%LOCALAPPDATA%\xboxrecomp` (Windows). The title's own saves,
+`\Device\Harddisk0\Partition1\UDATA` and `...\TDATA` (where XAPI maps U: and T:),
+go to `<save_dir>/UDATA` and `<save_dir>/TDATA`. `RECOMP_SAVE_DIR=<dir>` moves
+just those two under `<dir>` (created if missing; absolute, and under Wine a
+DOS path such as `Z:\home\me\run\save`), so a scripted run can start from an
+empty save without touching the rest of the save dir.
 
 ## Threading
 

@@ -31,6 +31,13 @@
 
 uint8_t *g_apu_ram_ptr = NULL;
 
+/* A named switch is on when it is set and not "0". */
+int apu_env_on(const char *name)
+{
+    const char *e = getenv(name);
+    return e && *e && *e != '0';
+}
+
 MCPXAPUState *g_state = NULL;
 
 /* Forward declarations for software mixer */

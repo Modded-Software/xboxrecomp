@@ -283,6 +283,11 @@ typedef struct MCPXAPUVoiceFilter {
     int resample_count, resample_offset;
     bool resample_current_valid, resample_source_ended;
     SRC_STATE *resampler;
+    /* Linear-interpolation resampler state (voice_resample): the two source
+     * samples the output sits between, the output's position in [0,1)
+     * between them, and whether they have been fetched yet. */
+    float rs_last[2], rs_next[2], rs_pos;
+    int   rs_have;
     sv_filter svf[2];
     HrtfFilter hrtf;
 } MCPXAPUVoiceFilter;
@@ -385,11 +390,19 @@ struct MCPXAPUState {
 
     uint32_t regs[0x20000];
 
+/* The sequencer's sample counter (what XGSCNT reads back). Resets when
+     * the title writes XGSCNT; advances 48 kHz while the sequencer runs. */
+    uint64_t sample_count;
+
     uint32_t ep_frame_div;
     int sleep_acc_us;
     int frame_count;
     int64_t frame_count_time_ms;
     int64_t next_frame_time_us;
+    int pace_q_seen;            /* device queue at the last pacing decision */
+    int64_t pace_drain_us;      /* when that queue last fell or sat below high */
+    bool pace_stalled;          /* device stopped consuming: host-clock pacing,
+                                 * periods dropped (mcpx_apu_pace_step) */
 
     struct {
         struct {
@@ -426,9 +439,44 @@ void mcpx_apu_vp_reset(MCPXAPUState *d);
 /* DSP functions */
 void mcpx_apu_dsp_init(MCPXAPUState *d);
 void mcpx_apu_dsp_ack_frame(MCPXAPUState *d);
+void mcpx_apu_dsp_finalize(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d);
+void mcpx_apu_dsp_gprst_write(uint32_t val);
+
+/* Monitor (host output): call after each 32-sample frame; on the last frame
+ * of an EP period it adds the software mixer and test tone to frame_buf and
+ * hands those 256 samples to the device. */
+void mcpx_apu_monitor_frame(MCPXAPUState *d);
+
+/* Frame-thread pacing at an EP-period boundary: 0 = render the next period
+ * now, else microseconds to wait before asking again. See apu_core.c. */
+int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
+/* The period pace_step admitted was rendered: spend its credit. A pass that
+ * renders nothing (front end trapped) spends none. */
+void mcpx_apu_pace_rendered(MCPXAPUState *d);
+
+/* Host starvation accounting (RECOMP_AUDIO_HOST; see apu_core.c). The
+ * deficit is the wall clock since the baseline, in samples, less what the
+ * device consumed; ref is the part of it already accounted for, as
+ * reported loss or as jitter and clock drift. Only a device that ran dry
+ * (its queue seen empty: an underrun) can have inserted silence, so a rise
+ * with no dry spell behind it is the device's clock, never loss. */
+typedef struct {
+    int64_t  t0_us;             /* baseline wall time */
+    uint64_t played0;           /* device samples consumed at the baseline */
+    int64_t  deficit;           /* at the last step, samples */
+    double   ref;               /* deficit accounted for, samples */
+    int64_t  ref_us;            /* last step */
+    int      dry;               /* ran dry since the last report */
+} ApuStarve;
+void apu_starve_rebase(ApuStarve *s, int64_t now_us, uint64_t played);
+/* One submit: the samples of silence the device inserted since the last
+ * report, once they exceed `jitter` (one device buffer), else 0. `dry`: the
+ * device ran dry since the previous step. */
+int64_t apu_starve_step(ApuStarve *s, int64_t now_us, uint64_t played,
+                        int jitter, int dry);
 
 /* GP/EP MMIO handlers (sub-regions at +0x30000 and +0x50000).
  * addr is relative to the sub-region base. Caller holds d->lock. */
@@ -445,3 +493,12 @@ extern uint64_t g_dbg_muted_voices[4];
 
 /* RECOMP_APU_VOICE_LEVELS: per-voice level report (apu_vp.c) */
 void mcpx_apu_voice_levels_report(MCPXAPUState *d);
+
+/* RECOMP_APU_TRACE: idle-voice traps against the frames that ran. Traps are
+ * counted under the APU lock, the rest by the frame thread. */
+typedef struct {
+    unsigned traps;             /* front-end traps latched (fe_method) */
+    unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
+    unsigned fe_trapped_frames; /* frames that found FECTL trapped */
+} ApuIrqStats;
+extern ApuIrqStats apu_irq_stats;

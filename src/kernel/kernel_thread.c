@@ -426,6 +426,10 @@ int xbox_worker_stack_alloc(void)
 {
     int i;
     for (i = 0; i < XBOX_WORKER_STACK_COUNT; i++) {
+        /* Slices carve the main stack region, which shrinks for large images
+         * (xbox_memory_layout.h): hand out only the ones that fit in it. */
+        if ((uint32_t)(i + 1) * XBOX_WORKER_STACK_SIZE > XBOX_STACK_SIZE)
+            break;
         if (InterlockedCompareExchange(&g_worker_stack_used[i], 1, 0) == 0)
             return i;
     }

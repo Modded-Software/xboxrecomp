@@ -29,6 +29,7 @@
 #   define NV_PAPU_ISTS_FETINTSTS                             (1 << 4)
 #   define NV_PAPU_ISTS_FENINTSTS                             (1 << 5)
 #   define NV_PAPU_ISTS_FEVINTSTS                             (1 << 6)
+#   define NV_PAPU_ISTS_SSLINTSTS                             (1 << 3)
 #define NV_PAPU_IEN                                      0x00001004
 #define NV_PAPU_FECTL                                    0x00001100
 #   define NV_PAPU_FECTL_FEMETHMODE                         0x000000E0
@@ -54,6 +55,7 @@
 #define NV_PAPU_SECTL                                    0x00002000
 #   define NV_PAPU_SECTL_XCNTMODE                           0x00000018
 #       define NV_PAPU_SECTL_XCNTMODE_OFF                       0
+#define NV_PAPU_SSL                                      0x00002008
 #define NV_PAPU_XGSCNT                                   0x0000200C
 #define NV_PAPU_VPVADDR                                  0x0000202C
 #define NV_PAPU_VPSGEADDR                                0x00002030

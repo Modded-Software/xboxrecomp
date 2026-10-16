@@ -48,7 +48,11 @@ static inline int64_t qemu_clock_get_us(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (int64_t)(count.QuadPart * 1000000LL / freq.QuadPart);
+    /* Split, not count * 1e6 / freq: on POSIX the counter is CLOCK_MONOTONIC
+     * in nanoseconds (freq 1e9), and the product overflows int64 after about
+     * 2.5 hours of host uptime and the clock jumps. */
+    return (int64_t)(count.QuadPart / freq.QuadPart) * 1000000LL +
+           (int64_t)(count.QuadPart % freq.QuadPart) * 1000000LL / freq.QuadPart;
 }
 #endif
 
@@ -96,6 +100,8 @@ static inline void qemu_thread_join(QemuThread *t) {
 extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
 /* Where a physical address the title handed the APU lives. See apu_core.c. */
 uint8_t *mcpx_apu_phys(uint64_t addr);
+/* Which case of mcpx_apu_phys resolved an address, for trace lines. */
+const char *mcpx_apu_phys_class(uint64_t addr);
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {

@@ -115,6 +115,9 @@ enum {
 #ifndef STATUS_ACCESS_DENIED
 #define STATUS_ACCESS_DENIED            ((NTSTATUS)0xC0000022L)
 #endif
+#ifndef STATUS_OBJECT_NAME_INVALID
+#define STATUS_OBJECT_NAME_INVALID      ((NTSTATUS)0xC0000033L)
+#endif
 #ifndef STATUS_OBJECT_NAME_NOT_FOUND
 #define STATUS_OBJECT_NAME_NOT_FOUND    ((NTSTATUS)0xC0000034L)
 #endif
@@ -573,6 +576,25 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
  * do not. */
 extern void (*g_xbox_path_hook)(const char *xbox_path);
 
+/*
+ * Which tree a guest path lands in, from the same rule that translates it
+ * (after the title's own drive links). Prints nothing and creates nothing,
+ * so the missing-file report can ask without side effects. A name that is
+ * not absolute (relative to a RootDirectory handle) is UNKNOWN: no rule
+ * translates it.
+ */
+enum {
+    XBOX_TREE_UNKNOWN = 0,
+    XBOX_TREE_GAME,     /* the game files directory: D:, CdRom0, E:, C:, Y: */
+    XBOX_TREE_HDD,      /* the HDD root: T:, U:, Z:, the cache partitions   */
+    XBOX_TREE_USER,     /* the UDATA/TDATA saves                            */
+    XBOX_TREE_DEVICE,   /* a bare device: CdRom0, a PartitionN image        */
+};
+int xbox_path_tree(const char *xbox_path);
+
+/* 1 when the directory holding host_path exists (kernel_file.c, per backend). */
+int xbox_host_parent_exists(const xbox_host_char *host_path);
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */
@@ -679,9 +701,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     PLARGE_INTEGER ByteOffset);
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
-#ifdef _WIN32
 void xbox_dir_context_drop(HANDLE FileHandle);
-#endif
 
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes);
 
@@ -696,6 +716,13 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass);
+
+/* NtSetInformationFile(FileRenameInformation), with the guest's
+ * FILE_RENAME_INFORMATION already unpacked: its FileName is a guest pointer,
+ * so only the bridge can read it. NewName->RootDirectory is a host HANDLE or
+ * NULL; a bare name with no root renames within the file's own directory. */
+NTSTATUS __stdcall xbox_RenameFileByHandle(
+    HANDLE FileHandle, PXBOX_OBJECT_ATTRIBUTES NewName, BOOLEAN ReplaceIfExists);
 
 NTSTATUS __stdcall xbox_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock);
 
@@ -1135,6 +1162,11 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
 #define XBOX_LOG_XBOX    "XBOX"
 #define XBOX_LOG_THUNK   "THUNK"
 #define XBOX_LOG_PATH    "PATH"
+
+/* Vblanks the runtime has raised since start (0 while RECOMP_VBLANK is off).
+ * Interlaced output shows one field per vblank, so its low bit is the field
+ * parity that the field pin (port 0x80C0) reports. */
+uint32_t xbox_VblankCount(void);
 
 #ifdef __cplusplus
 }

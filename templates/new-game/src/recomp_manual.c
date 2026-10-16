@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>   /* ptrdiff_t */
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 

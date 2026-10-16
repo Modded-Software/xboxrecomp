@@ -69,9 +69,10 @@ int main(void)
     }
     g_xbox_mem_offset = (ptrdiff_t)mem;
 
-    /* One import, in the form an XBE stores it: 0x80000000 | ordinal. */
+    /* Two imports, in the form an XBE stores them: 0x80000000 | ordinal. */
     *(uint32_t *)(mem + THUNK_VA) = 0x80000000u | 173u;
-    xbox_kernel_set_thunk_address(THUNK_VA, 1);
+    *(uint32_t *)(mem + THUNK_VA + 4) = 0x80000000u | 197u;
+    xbox_kernel_set_thunk_address(THUNK_VA, 2);
     xbox_kernel_bridge_init();
 
     /* bridge_init rewrites the entry in place to a synthetic VA. */
@@ -101,6 +102,44 @@ int main(void)
                  g_esp, STACK_VA + 8);
         check(g_esp == STACK_VA + 8,
               "ordinal 173 pops its stdcall argument", detail);
+    }
+
+    /* Ordinal 197, NtDuplicateObject(Source, &Target, Options), on the
+     * guest's pseudo-handles. They are 32-bit -1 (current process) and -2
+     * (current thread); widened without sign extension they are no handle
+     * at all, and the duplicate fails (Windows) or faults (POSIX shim). A
+     * title duplicating NtCurrentThread() to keep a handle to itself is the
+     * case that found this. */
+    fn = recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA + 4));
+    check(fn != NULL, "ordinal 197 resolves to a bridge entry point", NULL);
+    if (fn) {
+        static const struct { uint32_t src; const char *what; } pseudo[] = {
+            { 0xFFFFFFFEu, "NtDuplicateObject(NtCurrentThread()) succeeds" },
+            { 0xFFFFFFFFu, "NtDuplicateObject(NtCurrentProcess()) succeeds" },
+        };
+        const uint32_t TARGET_VA = 0x30000;
+        for (size_t k = 0; k < sizeof pseudo / sizeof pseudo[0]; k++) {
+            uint32_t *sp = (uint32_t *)(mem + STACK_VA);
+            sp[0] = 0xBEEF0002u;      /* guest return address */
+            sp[1] = pseudo[k].src;    /* SourceHandle */
+            sp[2] = TARGET_VA;        /* TargetHandle (out) */
+            sp[3] = 0x2u;             /* DUPLICATE_SAME_ACCESS */
+            *(uint32_t *)(mem + TARGET_VA) = 0;
+            g_esp = STACK_VA;
+            g_eax = 0xDEADBEEFu;
+            fn();
+
+            char detail[128];
+            snprintf(detail, sizeof detail,
+                     "status 0x%08X, target 0x%08X", g_eax,
+                     *(uint32_t *)(mem + TARGET_VA));
+            check(g_eax == 0 && *(uint32_t *)(mem + TARGET_VA) != 0,
+                  pseudo[k].what, detail);
+            snprintf(detail, sizeof detail, "esp is 0x%08X, expected 0x%08X",
+                     g_esp, STACK_VA + 16);
+            check(g_esp == STACK_VA + 16,
+                  "ordinal 197 pops its three stdcall arguments", detail);
+        }
     }
 
     VirtualFree(mem, 0, MEM_RELEASE);

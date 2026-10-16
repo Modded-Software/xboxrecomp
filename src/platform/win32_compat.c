@@ -377,6 +377,18 @@ const char *w32_handle_path(HANDLE h)
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
+void w32_handle_set_path(HANDLE h, const char *host_path)
+{
+    w32_object *o = (w32_object *)h;
+    char *old;
+
+    if (!o || o->kind != K_FILE)
+        return;
+    old = o->file_path;
+    o->file_path = host_path ? strdup(host_path) : NULL;
+    free(old);
+}
+
 BOOL CloseHandle(HANDLE h)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
@@ -786,13 +798,22 @@ DWORD ResumeThread(HANDLE h)
 
 DWORD SuspendThread(HANDLE h)
 {
-    /* True mid-run suspension is not supported on POSIX; only the
-     * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
+    /* POSIX cannot stop another thread at an arbitrary point, so suspending
+     * one only counts, for ResumeThread. A thread suspending *itself* is a
+     * different matter: it is at a known point, and it parks on the same gate
+     * CREATE_SUSPENDED uses until a ResumeThread brings the count to zero.
+     * Worker pools idle that way; returning at once turned one title's pool
+     * into a suspend/check spin of millions of calls a second. */
+    if (h == PSEUDO_CURRENT_THREAD) h = GetCurrentThread();
     w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD) return (DWORD)-1;
+    if (!o || o == (w32_object *)PSEUDO_CURRENT_THREAD || o->kind != K_THREAD)
+        return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
+    if (o == t_self_obj)
+        while (o->suspend_count > 0)
+            pthread_cond_wait(&o->gate, &o->lock);
     pthread_mutex_unlock(&o->lock);
     return prev;
 }
@@ -1581,6 +1602,22 @@ int view_lookup(const void *addr, void **base_out, size_t *len_out)
     return found;
 }
 
+/* Start of the lowest registered view above addr, or 0 when there is none.
+ * VirtualQuery's answer for memory the shim does not own: the free run it
+ * reports ends where the next mapping it knows of begins. */
+static uintptr_t view_next_above(const void *addr)
+{
+    uintptr_t next = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        uintptr_t lo = (uintptr_t)s_views[i].addr;
+        if (lo > (uintptr_t)addr && (!next || lo < next))
+            next = lo;
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    return next;
+}
+
 size_t view_take(const void *addr)
 {
     size_t len = 0;
@@ -1597,10 +1634,12 @@ static int anon_map_fd(const char *name)
 {
 #if defined(__APPLE__)
     static volatile LONG map_counter = 0;
+    /* The pid keeps two instances apart: with a bare counter, both open
+     * "/xbox_map_1" and the second O_EXCL loses. macOS caps the name at 31. */
     char shm_name[32];
     LONG seq = InterlockedIncrement(&map_counter);
     const char *base = name ? name : "xbox_map";
-    snprintf(shm_name, sizeof(shm_name), "/%s_%ld", base, seq);
+    snprintf(shm_name, sizeof(shm_name), "/%.12s_%d_%ld", base, (int)getpid(), (long)seq);
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
@@ -1647,6 +1686,7 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
     int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
     int flags  = MAP_SHARED;
+    int placeholder = 0;
 
     /* Win32 MapViewOfFileEx *fails* when the requested address is unavailable.
      * Plain MAP_FIXED does the opposite: it silently unmaps whatever is there
@@ -1665,6 +1705,7 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
             SetLastError(ERROR_INVALID_ADDRESS);
             return NULL;
         }
+        placeholder = 1;
         flags |= MAP_FIXED;
 #else
         flags |= MAP_FIXED;
@@ -1672,7 +1713,14 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     }
 
     void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
-    if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    if (p == MAP_FAILED) {
+        /* A failed MAP_FIXED leaves the placeholder where it was. Nothing has
+         * registered it, so UnmapViewOfFile could never free it, and every
+         * later attempt at this address would be refused as occupied. */
+        if (placeholder) munmap(baseAddr, len);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     if (baseAddr && p != baseAddr) {
         /* MAP_FIXED_NOREPLACE hands back a different address instead of
          * failing on some kernels; treat that as the refusal it means. */
@@ -1728,10 +1776,21 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
     size_t len  = 0;
 
     if (!view_lookup(address, &base, &len)) {
-        /* Not ours. Report it free rather than inventing a committed page. */
+        /* Not ours. Report it free rather than inventing a committed page,
+         * up to the next mapping the shim knows of (or the end of the address
+         * space). Win32 callers walk free memory region by region; a size of
+         * 0 never moved them on (guest_vmem's free-run scan spun forever).
+         * Mappings made outside the shim are invisible here, so a caller that
+         * then reserves at a fixed address can still be refused. */
+        uintptr_t next = view_next_above(address);
+        uintptr_t a    = (uintptr_t)address;
         buffer->BaseAddress    = (PVOID)address;
         buffer->AllocationBase = NULL;
-        buffer->RegionSize     = 0;
+        /* At address 0 the span to the top is UINTPTR_MAX + 1, which wraps
+         * to 0; report UINTPTR_MAX so the walk still moves on. */
+        buffer->RegionSize     = next ? next - a
+                               : a    ? UINTPTR_MAX - a + 1
+                                      : UINTPTR_MAX;
         buffer->State          = MEM_FREE;
         buffer->Protect        = PAGE_NOACCESS;
         buffer->Type           = 0;

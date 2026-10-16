@@ -8,6 +8,7 @@
  */
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
+#include "../platform/mmio_decode_a64.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
@@ -16,6 +17,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+
+/* Where the registers can be trapped. They are answered by faulting on the
+ * aperture and decoding the instruction that touched it: the x86-64 decoder
+ * under a Win32 VEH, or the A64 decoder under a POSIX SIGBUS/SIGSEGV
+ * handler. A host with neither leaves the model off (see xbox_OhciInit). */
+#if defined(_WIN32)
+#  define OHCI_TRAP_WIN32 1
+#elif defined(__aarch64__)
+#  define OHCI_TRAP_POSIX_A64 1
+#endif
 
 /* The runtime maps guest memory at a fixed host offset. */
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -1281,13 +1292,26 @@ void xbox_OhciInit(void)
         if ((unsigned)s_npads > s_ndp)
             s_ndp = (unsigned)s_npads;      /* a port for every pad */
     }
+#if !defined(OHCI_TRAP_WIN32) && !defined(OHCI_TRAP_POSIX_A64)
+    /* No decoder for this host's instructions, so a trapped access could not
+     * be answered. Leave the aperture as plain memory -- the title then sees
+     * no controller, exactly as with RECOMP_USB unset -- and say so. */
+    s_enabled = 0;
+    fprintf(stderr, "  OHCI: no trapped-MMIO decoder for this host; "
+                    "USB controllers disabled\n");
+    fflush(stderr);
+    return;
+#endif
+
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
 
-#if defined(_WIN32)
     /* The registers have to fault to be answered. The MCPX aperture is mapped
      * as plain committed memory, so both blocks are made inaccessible here and
-     * the title's VEH routes the faults back to xbox_OhciHandleMmio.
+     * the title's fault handler (a VEH on Windows, a SIGBUS/SIGSEGV handler on
+     * POSIX) routes the faults back to xbox_OhciHandleMmio. On a host whose
+     * page is larger than a block (16 KB on macOS arm64) the protection covers
+     * the whole page; nothing else lives in it.
      *
      * A failed protect switches the model off rather than leaving it half on:
      * a controller whose registers read as zero out of RAM is exactly the
@@ -1308,25 +1332,23 @@ void xbox_OhciInit(void)
                                 &old_protect)) {
                 s_enabled = 0;
                 fprintf(stderr, "  OHCI: cannot trap 0x%08X (error %lu); "
-                                "disabled\n", s_hc[i].base, GetLastError());
+                                "disabled\n", s_hc[i].base,
+                                (unsigned long)GetLastError());
                 return;
             }
         }
     }
-#endif
 
     fprintf(stderr, "  OHCI: two controllers at 0x%08X and 0x%08X, "
                     "%d ports each, one device on HC0 port 1\n",
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
 
-#if defined(_WIN32)
     {
         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
             CloseHandle(th);
     }
-#endif
 }
 
 static OhciController *hc_for(uint32_t va)
@@ -1346,16 +1368,55 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
     return hc_for(xbox_va) != NULL;
 }
 
+#if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_WIN32)
+/* Both decoders hand over 8-byte accesses whole (ldr/str x or a d register
+ * on A64, a REX.W mov on x86-64); the registers are 32-bit, so an 8-byte
+ * access is two of them. */
+static uint64_t ohci_read_split(void *dev, uint32_t off, int size)
+{
+    if (size == 8)
+        return ohci_read(dev, off, 4) | (ohci_read(dev, off + 4, 4) << 32);
+    return ohci_read(dev, off, size);
+}
+
+static void ohci_write_split(void *dev, uint32_t off, uint64_t val, int size)
+{
+    if (size == 8) {
+        ohci_write(dev, off, (uint32_t)val, 4);
+        ohci_write(dev, off + 4, val >> 32, 4);
+        return;
+    }
+    ohci_write(dev, off, val, size);
+}
+#endif
+
 int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
 {
-#if defined(_WIN32)
+#if defined(OHCI_TRAP_POSIX_A64)
+    ucontext_t *uc = (ucontext_t *)ctx;
+    OhciController *hc = hc_for(xbox_va);
+    int ok;
+
+    if (!hc)
+        return 0;
+    ok = mmio_emulate_a64(uc, xbox_va - hc->base, hc,
+                          ohci_read_split, ohci_write_split);
+    /* stdio in a signal handler, deliberately: see apu_mmio_hook.c. */
+    if (!ok && hc->decode_fail++ < 20) {
+        fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: insn %08X\n",
+                hc->index, xbox_va - hc->base,
+                *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc));
+        fflush(stderr);
+    }
+    return ok;
+#elif defined(OHCI_TRAP_WIN32)
     OhciController *hc = hc_for(xbox_va);
     int ok;
 
     if (!hc)
         return 0;
     ok = mmio_emulate((PCONTEXT)ctx, xbox_va - hc->base, hc,
-                      ohci_read, ohci_write);
+                      ohci_read_split, ohci_write_split);
     if (!ok && hc->decode_fail++ < 20) {
         const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
         fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: "

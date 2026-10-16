@@ -166,6 +166,27 @@ int main(void)
               "probing before it writes is always told yes");
     }
 
+    /* 3b. A free address reports how far the free run goes: up to the next
+     * mapping the shim made, so a Win32-style walk over free memory moves on
+     * (it used to be RegionSize 0, and guest_vmem's scan spun forever). */
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T want = 64 * 1024;
+        LPVOID p = VirtualAlloc(NULL, want, MEM_COMMIT | MEM_RESERVE,
+                                PAGE_READWRITE);
+        check(p != NULL, "VirtualAlloc returns a pointer (free-run check)", NULL);
+        if (p) {
+            uint8_t *below = (uint8_t *)p - 0x10000;
+            memset(&mbi, 0, sizeof mbi);
+            VirtualQuery(below, &mbi, sizeof mbi);
+            check(mbi.State == MEM_FREE && mbi.RegionSize != 0
+                      && (uintptr_t)below + mbi.RegionSize <= (uintptr_t)p,
+                  "VirtualQuery sizes a free run, ending at the next mapping",
+                  "RegionSize 0 for free memory: a region walk never advances");
+            VirtualFree(p, 0, MEM_RELEASE);
+        }
+    }
+
     /*
      * 6. MmGetPhysicalAddress must translate.
      *

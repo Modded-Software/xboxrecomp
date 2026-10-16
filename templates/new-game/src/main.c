@@ -70,6 +70,7 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
 extern RECOMP_TLS double g_fp_stack[8];
 extern RECOMP_TLS int g_fp_top;
 extern RECOMP_TLS uint16_t g_fp_control_word;
+extern RECOMP_TLS uint32_t g_mxcsr;
 extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
@@ -210,7 +211,8 @@ static void print_guest_context(void *rip)
  * false` and nothing assigned g_apu_state. So with RECOMP_AC97_READY set the
  * APU's registers were unmapped to be trapped, and every trap was then
  * declined and surfaced as an access violation on the first register
- * DirectSound touched.
+ * DirectSound touched. The VEH below now reaches apu_hook_handle_mmio
+ * through the toolkit's xbox_VehMmioFault.
  *
  * Declared rather than included so this does not depend on src/apu being on
  * the include path. */
@@ -242,25 +244,15 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             return EXCEPTION_CONTINUE_SEARCH;
         }
 
-        /* APU registers -> the emulated APU.
+        /* Trapped hardware registers (APU, USB OHCI) -> their models.
          *
          * The other half of RECOMP_AC97_READY: reporting the codec ready is
          * what lets DirectSoundCreate past its first gate, and from there it
          * drives the APU directly, so the registers have to fault to be seen.
          * "Handled" means the access was decoded and the instruction stepped
          * over, so execution resumes instead of unwinding. */
-        {
-            uint32_t xbox_va =
-                (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
-
-            if (xbox_va >= APU_TRAP_BASE && xbox_va < APU_TRAP_END
-                    && apu_hook_handle_mmio(
-                           ep->ContextRecord, fault_addr, xbox_va,
-                           ep->ExceptionRecord->ExceptionInformation[0]
-                               ? 1 : 0)) {
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
-        }
+        if (xbox_VehMmioFault(ep))
+            return EXCEPTION_CONTINUE_EXECUTION;
 
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
             (unsigned long long)ep->ContextRecord->Rip,

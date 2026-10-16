@@ -347,6 +347,55 @@ usually moves the stall rather than fixing it. Find the probe that failed.
 
 **Fix**: ensure all ICALL failure paths clean up the stack. Use `RECOMP_ICALL_SAFE` for stdcall callsites. Monitor `g_esp` trend.
 
+## Audio Diagnostics
+
+All off unless set; with none of them set the APU runs exactly as before.
+The switches (`RECOMP_AUDIO_HOST`, `RECOMP_APU_TRACE`, `RECOMP_APU_RING`)
+are on for any value but empty or one starting with `0`, so `=0` turns
+them off.
+
+- `RECOMP_AUDIO_WAV=<path>` writes exactly what the APU hands the host
+  device (48 kHz s16 stereo) to a WAV whose header stays valid however the
+  run ends. `RECOMP_AUDIO_WAV_SECS=N` caps it. Compare that with what you
+  hear: a fault in the file is in the APU, a fault only in the speaker is
+  the host. The file is what was submitted, not what the device played:
+  when a period arrives late the device plays its own silence and the file
+  has no gap there. A clean WAV does not show continuous output; the
+  counters below do.
+- `RECOMP_AUDIO_HOST=1` covers the second case: it sets the device's
+  consumed-sample count against the wall clock and prints
+  `[AUDIO-HOST] starve wav=<sample> ms=<length>` wherever the device ran
+  out, indexed into the WAV. Small losses add up: twenty 5 ms gaps report
+  the same 100 ms as one 100 ms gap, in a few lines once each passes a
+  device buffer (the jitter allowed for). A loss counts only once the
+  device has run dry (an underrun), so a device clock slower than the
+  wall clock is not reported as silence. After a dry spell the accounted
+  part creeps up at most 200 ppm, so on a clock further off than that
+  (SDL's dummy driver) each dry spell can over-report by about a buffer,
+  and a single loss under one buffer is absorbed and never reported. A
+  pause the frame thread announces (the device drains) is not counted. The once-a-second summary
+  gives `wav=` (samples submitted), `played=` (samples the device
+  consumed), `starved_ms` (the silence it inserted, as reported so far)
+  with `pending_ms` (not yet reported), `refused=` (submits the backend
+  turned away: in the WAV, never played, each also logged), and front-end
+  trap spells over 20 ms.
+- `RECOMP_APU_TRACE=1` (which also prints the first register accesses)
+  adds the host lines above, `[APU-VSTAT]` once a second for each voice
+  that played (format, source address and how it resolved, envelope,
+  volumes, RMS and zero-crossing rate: about 0.5 is white noise, music sits
+  near 0.1-0.2), `[APU] voice N pos=` every 60 frames, and `[APU-IRQ]`
+  every 5 s (front-end traps, VP frames, trapped frames, underruns).
+- `RECOMP_APU_SOLO=<voice>` mixes only that voice.
+  `RECOMP_APU_VOICE_DUMP=<voice>|all` writes a voice's fetched samples as
+  raw s16 stereo to `RECOMP_APU_VOICE_DUMP_FILE` (default `voice_dump.raw`;
+  with `all`, `<file>.<voice>.raw` per voice).
+- `RECOMP_APU_RING=1` watches looping PCM buffers that a title refills
+  ahead of the play cursor (streamed music decoded on the CPU). When the
+  writer falls behind, the VP replays the previous lap: no silence, only a
+  stutter. `[APU-RING] stale` names each block that played exactly as it
+  did one lap before in a buffer known to change; a once-a-second line
+  gives the writer's lead over the cursor.
+
 ## Reports RECOMP_ABI_CHECK Always Gives
 
 With `RECOMP_ABI_CHECK` on (see

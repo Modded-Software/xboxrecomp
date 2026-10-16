@@ -65,6 +65,24 @@ static int run(const uint8_t *code, size_t len, CONTEXT *ctx)
     return r;
 }
 
+/* run() with the device answering `next_read` to the read. */
+static int run_rd(const uint8_t *code, size_t len, CONTEXT *ctx,
+                  uint64_t next_read)
+{
+    int r;
+    memset(&dev, 0, sizeof dev);
+    dev.next_read = next_read;
+    ctx->Rip = (DWORD64)(uintptr_t)code;
+    r = mmio_emulate(ctx, 0x54, NULL, t_read, t_write);
+    if (r && ctx->Rip - (DWORD64)(uintptr_t)code != len) {
+        printf("FAIL: Rip advanced %llu, instruction is %llu bytes\n",
+               (unsigned long long)(ctx->Rip - (DWORD64)(uintptr_t)code),
+               (unsigned long long)len);
+        failures++;
+    }
+    return r;
+}
+
 int main(void)
 {
     CONTEXT ctx;
@@ -181,9 +199,154 @@ int main(void)
     { const uint8_t c3[] = { 0x89, 0x0C, 0x18 };
       CHECK("SIB handled", run(c3, sizeof c3, &ctx)); }
 
+    /* --- The ALU and TEST-immediate forms --- */
+
+    /* test dword [rsi+rax+0xFE1FF0], 0x00100000 -- F7 84 06 F0 1F FE 00 00 10
+     * 00: ModRM, SIB, disp32 and imm32 in one, the exact instruction DirectSound
+     * died on at APU offset 0x2000. 11 bytes; a length short by the SIB or the
+     * disp leaves Rip inside it. A clear bit must set ZF, a set one clear it. */
+    { const uint8_t c[] = { 0xF7, 0x84, 0x06, 0xF0, 0x1F, 0xFE, 0x00,
+                            0x00, 0x00, 0x10, 0x00 };
+      CHECK("test m32,imm32 handled", run_rd(c, sizeof c, &ctx, 0));
+      CHECK("test bit clear -> ZF", (ctx.EFlags & 0x40) != 0);
+      CHECK("test only reads", dev.reads == 1 && dev.writes == 0);
+      CHECK_U64("test m32 size", dev.size, 4);
+      run_rd(c, sizeof c, &ctx, 0x00100000);
+      CHECK("test bit set -> !ZF", (ctx.EFlags & 0x40) == 0); }
+
+    /* test byte [rax], 0x80 -- F6 00 80: SF from bit 7 of a byte. */
+    { const uint8_t c[] = { 0xF6, 0x00, 0x80 };
+      CHECK("test m8,imm8 handled", run_rd(c, sizeof c, &ctx, 0xFF));
+      CHECK("test m8 sign -> SF", (ctx.EFlags & 0x80) != 0);
+      CHECK_U64("test m8 size", dev.size, 1); }
+
+    /* test word [rax], 0x8000 -- 66 F7 00 00 80: imm16, not imm32. */
+    { const uint8_t c[] = { 0x66, 0xF7, 0x00, 0x00, 0x80 };
+      CHECK("test m16,imm16 handled", run_rd(c, sizeof c, &ctx, 0x8000));
+      CHECK_U64("test m16 size", dev.size, 2); }
+
+    /* or dword [rax], 0xFFFFFFF0 -- 83 08 F0: imm8 sign-extends. */
+    { const uint8_t c[] = { 0x83, 0x08, 0xF0 };
+      CHECK("or m32,imm8 handled", run_rd(c, sizeof c, &ctx, 0x5));
+      CHECK_U64("imm8 sign-extends", dev.val, 0xFFFFFFF5);
+      CHECK("or imm reads then writes", dev.reads == 1 && dev.writes == 1); }
+
+    /* and dword [rax+0x10], 0xFFFF00FF -- 81 60 10 FF 00 FF FF */
+    { const uint8_t c[] = { 0x81, 0x60, 0x10, 0xFF, 0x00, 0xFF, 0xFF };
+      CHECK("and m32,imm32 handled", run_rd(c, sizeof c, &ctx, 0x12345678));
+      CHECK_U64("and imm32 value", dev.val, 0x12340078); }
+
+    /* add word [rax], 0x0102 -- 66 81 00 02 01: imm16 under 66. */
+    { const uint8_t c[] = { 0x66, 0x81, 0x00, 0x02, 0x01 };
+      CHECK("add m16,imm16 handled", run_rd(c, sizeof c, &ctx, 0xFFFF));
+      CHECK_U64("add m16 wraps", dev.val, 0x0101);
+      CHECK("add m16 carry -> CF", (ctx.EFlags & 0x01) != 0); }
+
+    /* sub byte [rax], 1 -- 80 28 01 */
+    { const uint8_t c[] = { 0x80, 0x28, 0x01 };
+      CHECK("sub m8,imm8 handled", run_rd(c, sizeof c, &ctx, 0x00));
+      CHECK_U64("sub m8 borrow value", dev.val, 0xFF);
+      CHECK("sub m8 borrow -> CF", (ctx.EFlags & 0x01) != 0); }
+
+    /* cmp dword [rax], 3 -- 83 38 03: reads, never writes, flags only. */
+    { const uint8_t c[] = { 0x83, 0x38, 0x03 };
+      CHECK("cmp m32,imm8 handled", run_rd(c, sizeof c, &ctx, 3));
+      CHECK("cmp equal -> ZF", (ctx.EFlags & 0x40) != 0);
+      CHECK("cmp never writes", dev.reads == 1 && dev.writes == 0);
+      run_rd(c, sizeof c, &ctx, 0x80000000);
+      CHECK("cmp INT_MIN-3 -> OF", (ctx.EFlags & 0x800) != 0);
+      CHECK("cmp INT_MIN-3 -> !SF", (ctx.EFlags & 0x80) == 0); }
+
+    /* add ecx, [rax] -- 03 08. Register destination: one read, no write,
+     * and a 32-bit result clears bits 63:32. */
+    { const uint8_t c[] = { 0x03, 0x08 };
+      ctx.Rcx = 0xFFFFFFFF00000001ULL;
+      CHECK("add r32,m32 handled", run_rd(c, sizeof c, &ctx, 0x10));
+      CHECK_U64("add r32 result zero-extends", ctx.Rcx, 0x11);
+      CHECK("add r,m never writes", dev.reads == 1 && dev.writes == 0); }
+
+    /* and edx, [rax+rcx] -- 23 14 08: a USB driver masks a status register
+     * into a register this way. SIB, register destination, no write. */
+    { const uint8_t c[] = { 0x23, 0x14, 0x08 };
+      ctx.Rdx = 0xFFFFFFFF000000F0ULL;
+      CHECK("and r32,m32 handled", run_rd(c, sizeof c, &ctx, 0x30));
+      CHECK_U64("and r32 result zero-extends", ctx.Rdx, 0x30);
+      CHECK("and r,m never writes", dev.reads == 1 && dev.writes == 0);
+      run_rd(c, sizeof c, &ctx, 0x0F);
+      CHECK("and r,m zero -> ZF", (ctx.EFlags & 0x40) != 0); }
+
+    /* cmp ecx, [rax] -- 3B 08: leaves the register alone. */
+    { const uint8_t c[] = { 0x3B, 0x08 };
+      ctx.Rcx = 0x5;
+      CHECK("cmp r32,m32 handled", run_rd(c, sizeof c, &ctx, 0x7));
+      CHECK_U64("cmp r,m keeps register", ctx.Rcx, 0x5);
+      CHECK("cmp 5-7 -> CF", (ctx.EFlags & 0x01) != 0); }
+
+    /* xor ah, [rax] -- 32 20. Byte register 4 without REX is AH. */
+    { const uint8_t c[] = { 0x32, 0x20 };
+      ctx.Rax = 0x1122334455AA66CCULL; ctx.Rsp = 0x7777;
+      CHECK("xor ah,m8 handled", run_rd(c, sizeof c, &ctx, 0xFF));
+      CHECK_U64("xor lands in AH", ctx.Rax, 0x1122334455AA99CCULL);
+      CHECK_U64("xor leaves SPL alone", ctx.Rsp, 0x7777);
+      ctx.Rax = 0; }
+
+    /* xor spl, [rax] -- 40 32 20. With REX, byte register 4 is SPL. */
+    { const uint8_t c[] = { 0x40, 0x32, 0x20 };
+      ctx.Rsp = 0x7700;
+      CHECK("xor spl,m8 handled", run_rd(c, sizeof c, &ctx, 0x0F));
+      CHECK_U64("REX byte reg 4 is SPL", ctx.Rsp, 0x770F); }
+
+    /* mov [rax], bh -- 88 38: writes BH, not DIL. */
+    { const uint8_t c[] = { 0x88, 0x38 };
+      ctx.Rbx = 0xAB00; ctx.Rdi = 0xCD;
+      CHECK("mov m8,bh handled", run(c, sizeof c, &ctx));
+      CHECK_U64("mov m8 from BH", dev.val, 0xAB); }
+
+    /* add [rax], ecx / sub [rax], ecx / xor [rax], ecx -- 01 08, 29 08,
+     * 31 08: read-modify-write, the device sees the combined value. */
+    { const uint8_t c[] = { 0x01, 0x08 };
+      ctx.Rcx = 0x10;
+      run_rd(c, sizeof c, &ctx, 0x22);
+      CHECK_U64("add m,r value", dev.val, 0x32);
+      CHECK("add m,r reads then writes", dev.reads == 1 && dev.writes == 1); }
+    { const uint8_t c[] = { 0x29, 0x08 };
+      ctx.Rcx = 0x10;
+      CHECK("sub m,r handled", run_rd(c, sizeof c, &ctx, 0x10));
+      CHECK_U64("sub m,r value", dev.val, 0);
+      CHECK("sub to zero -> ZF", (ctx.EFlags & 0x40) != 0); }
+    { const uint8_t c[] = { 0x31, 0x08 };
+      ctx.Rcx = 0xFF;
+      CHECK("xor m,r handled", run_rd(c, sizeof c, &ctx, 0x0F));
+      CHECK_U64("xor m,r value", dev.val, 0xF0); }
+
+    /* mov word [rax], 0x1234 -- 66 C7 00 34 12: imm16 under 66, so the
+     * instruction is 5 bytes, not 7. */
+    { const uint8_t c[] = { 0x66, 0xC7, 0x00, 0x34, 0x12 };
+      CHECK("mov m16,imm16 handled", run(c, sizeof c, &ctx));
+      CHECK_U64("mov m16 imm value", dev.val, 0x1234);
+      CHECK_U64("mov m16 size", dev.size, 2); }
+
+    /* A 32-bit write sends 32 bits: mov [rax], ecx with junk in bits 63:32. */
+    { const uint8_t c[] = { 0x89, 0x08 };
+      ctx.Rcx = 0xFFFFFFFF12345678ULL;
+      run(c, sizeof c, &ctx);
+      CHECK_U64("mov m32 sends low half", dev.val, 0x12345678); }
+
+    /* What must still be refused: ADC and SBB (the carry is not modelled),
+     * and the F7 forms other than TEST. */
+    { const uint8_t adc[] = { 0x83, 0x10, 0x01 };
+      const uint8_t sbb[] = { 0x19, 0x08 };
+      const uint8_t neg[] = { 0xF7, 0x18 };
+      ctx.Rip = (DWORD64)(uintptr_t)adc;
+      CHECK("adc refused", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write) == 0);
+      ctx.Rip = (DWORD64)(uintptr_t)sbb;
+      CHECK("sbb refused", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write) == 0);
+      ctx.Rip = (DWORD64)(uintptr_t)neg;
+      CHECK("neg refused", mmio_emulate(&ctx, 0x54, NULL, t_read, t_write) == 0); }
+
     /* And the one that must fail. An unknown opcode reported as handled steps
      * over an instruction nobody decoded. */
-    { const uint8_t c[] = { 0xF7, 0x00, 0x01, 0x00, 0x00, 0x00 };  /* test imm32 */
+    { const uint8_t c[] = { 0xF7, 0x10 };                     /* not dword [rax] */
       memset(&dev, 0, sizeof dev);
       ctx.Rip = (DWORD64)(uintptr_t)c;
       CHECK("unknown opcode refused",

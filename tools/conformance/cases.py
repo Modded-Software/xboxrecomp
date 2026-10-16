@@ -87,6 +87,28 @@ _SSE = [
 ]
 
 CASES = [
+    Case("comisd_register_lane", "double register compare uses the 64-bit lane",
+         ["movsd xmm0, qword ptr [eax]", "movsd xmm1, qword ptr [eax+16]",
+          "comisd xmm0, xmm1", "setb al", "movzx eax, al"], _FP_NAN, kind="fpu"),
+    Case("ucomisd_register_lane", "double register compare uses the 64-bit lane",
+         ["movsd xmm0, qword ptr [eax]", "movsd xmm1, qword ptr [eax+16]",
+          "ucomisd xmm0, xmm1", "setb al", "movzx eax, al"], _FP_NAN, kind="fpu"),
+    Case("cmp_setp", "parity reader after a known flag producer",
+         ['cmp eax, ecx', 'setp al', 'movzx eax, al'], _PAIRS),
+    Case("cmp_setnp", "parity reader after a known flag producer",
+         ['cmp eax, ecx', 'setnp al', 'movzx eax, al'], _PAIRS),
+    Case("cmp_cmovp", "parity reader after a known flag producer",
+         ['cmp eax, ecx', 'cmovp eax, ecx'], _PAIRS),
+    Case("cmp_cmovnp", "parity reader after a known flag producer",
+         ['cmp eax, ecx', 'cmovnp eax, ecx'], _PAIRS),
+    Case("test_setp", "parity reader after a known flag producer",
+         ['test eax, ecx', 'setp al', 'movzx eax, al'], _PAIRS),
+    Case("test_setnp", "parity reader after a known flag producer",
+         ['test eax, ecx', 'setnp al', 'movzx eax, al'], _PAIRS),
+    Case("test_cmovp", "parity reader after a known flag producer",
+         ['test eax, ecx', 'cmovp eax, ecx'], _PAIRS),
+    Case("test_cmovnp", "parity reader after a known flag producer",
+         ['test eax, ecx', 'cmovnp eax, ecx'], _PAIRS),
     # -- signed compare width (the RECOMP_SIGNED vs SXV decision) -------------
     Case("setl_i8", "cmp at byte width, then jl's condition",
          ["cmp al, cl", "setl al", "movzx eax, al"], _PAIRS),
@@ -471,6 +493,17 @@ CASES = [
     # model reported "equal", so `fucompp; fnstsw ax; test ah,44h; jp` -- how
     # this era's CRT asks "is this a NaN" -- answered no every time. Found by
     # running Crimson Skies' own float classification against itself.
+    Case("fpu_fprem_completion", "FPREM clears FXAM's C2 after complete reduction",
+         ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fxam",
+          "fprem", "fnstsw ax", "and eax, 0400h"],
+         [(7.5, 3.0), (-7.5, 3.0), (7.5, -3.0), (0.0, 3.0),
+          (100.0, 7.0), (2.5, 2.0)], "fpu"),
+    Case("fpu_fprem1_completion", "FPREM1 clears C2 and rounds the quotient to nearest",
+         ["fld qword ptr [eax+16]", "fld qword ptr [eax]", "fxam",
+          "fprem1", "fnstsw ax", "and eax, 0400h"],
+         [(7.5, 3.0), (-7.5, 3.0), (7.5, -3.0), (0.0, 3.0),
+          (100.0, 7.0), (2.5, 2.0)], "fpu"),
+
     Case("fpu_nan_unordered",
          "comparing a value with itself is the isnan idiom; NaN is unordered",
          ["fld qword ptr [eax]", "fld qword ptr [eax]", "fucompp",

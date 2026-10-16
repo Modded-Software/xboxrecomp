@@ -22,7 +22,8 @@ both places rather than only one.
 
 ## What it guarantees
 
-Four checks, all on ordinal 173, `MmGetPhysicalAddress`.
+Checks on ordinal 173, `MmGetPhysicalAddress`, and ordinal 197,
+`NtDuplicateObject`.
 
 **A thunk entry resolves to a bridge entry point.** Given an import in the
 form an XBE stores it (`0x80000000 | ordinal`), `xbox_kernel_bridge_init()`
@@ -40,6 +41,14 @@ a physical address with bit 31 set.
 past the return address and the four bytes of argument. A wrong
 `stdcall_args_for_ordinal` entry corrupts the caller's frame some distance
 from the call, with nothing naming the ordinal.
+
+**Ordinal 197 duplicates the guest's pseudo-handles.** `NtCurrentThread()`
+and `NtCurrentProcess()` are the 32-bit values -2 and -1. A by-value handle
+token that is not a table token must be sign-extended for these two: widened
+with zero extension they are not the host's pseudo-handles, so Windows fails
+the duplicate and the POSIX shim dereferences the value as an object and
+faults. Each call must succeed, write a target token, and pop 12 bytes of
+arguments.
 
 ## Why this is a separate project
 
