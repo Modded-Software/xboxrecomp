@@ -749,6 +749,15 @@ static void dump_texture_bmp(uint32_t seq);
 #define TEX_DUMP_SEQ_BASE 1000u
 #define TEX_DUMP_SEQ_MAX  40u
 
+/* The dumpers below are off unless asked for, checked once: these sit on the
+ * per-batch and per-new-texture paths, and a getenv per batch is exactly the
+ * kind of cost the surrounding code was rewritten to remove. */
+static int dump_enabled(const char *var)
+{
+    const char *v = getenv(var);
+    return v && *v && *v != '0';
+}
+
 static void note_texture_use(void)
 {
     int i;
@@ -769,6 +778,12 @@ static void note_texture_use(void)
         s_tex_use[s_tex_use_count].height  = s_gpu.tex.height;
         s_tex_use[s_tex_use_count].batches = 1;
         s_tex_use_count++;
+        /* RECOMP_TEX_DUMP=<prefix>: one BMP per distinct texture, through the
+         * sampler, so the file shows what the rasteriser sees. Capped at
+         * PB_EXEC_MAX_TEXTURES files by the table, and TEX_DUMP_SEQ_MAX below
+         * is the repeat-dump budget (not used yet). */
+        if (dump_enabled("RECOMP_TEX_DUMP"))
+            dump_texture_bmp((uint32_t)s_tex_use_count);
     }
 }
 
@@ -3130,6 +3145,15 @@ static void raster_batch(void)
     if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
 #endif
+
+    /* RECOMP_FB_DUMP=<prefix>: capture the surface after a draw, so the file
+     * is what the rasteriser produced rather than what was presented. Bounded
+     * to FB_DUMP_AFTER_DRAW captures: this is a bring-up tool, and an
+     * unbounded one at 1080p writes ~6 MB per frame. */
+    if (s_drawn_dumps < FB_DUMP_AFTER_DRAW && dump_enabled("RECOMP_FB_DUMP")) {
+        s_drawn_dumps++;
+        dump_surface_bmp();
+    }
 }
 
 /* What a batch actually contains. Before anything can be rasterised, the
