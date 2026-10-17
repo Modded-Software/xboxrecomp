@@ -15,6 +15,8 @@
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "guest_vmem.h"
+#include "recomp_prof.h"
+#include "crash_dump.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1796,12 +1798,26 @@ static int peek_readable(uint32_t va)
  *
  * Off unless RECOMP_WATCH is set. Costs a page fault per write to that page,
  * so it is a bring-up tool and says so.
+ *
+ * Several at once: RECOMP_WATCH is a comma-separated list of up to
+ * XBOX_WATCH_MAX targets, each in the RECOMP_PEEK grammar ("0x2D2148",
+ * "[[0x4BBC38]]+0x40"). Targets sharing a page share its trap; a write to the
+ * page reports every target on it whose value changed. In an instrumented
+ * build (PROF=1) the report also carries the guest shadow stack, which is the
+ * real call chain rather than the scanned guess.
  */
-static uint32_t g_watch_va;
-static void    *g_watch_page;
-static uint32_t g_watch_last;
+#define XBOX_WATCH_MAX 8
+typedef struct {
+    uint32_t root, off;     /* the spec: [..root..]+off */
+    unsigned derefs;
+    uint32_t va;            /* resolved target */
+    uint32_t last;
+    void    *page;          /* host page holding it; NULL until armed */
+} xbox_watch;
+static xbox_watch g_watch[XBOX_WATCH_MAX];
+static volatile LONG g_watch_count;     /* slots in use (specs parsed/armed) */
 static void    *g_watch_veh;
-static RECOMP_TLS int s_watch_stepping;
+static RECOMP_TLS void *s_watch_step_page;
 
 /* A plausible guest code address: inside the image's executable sections,
  * as recorded from the section headers at load. */
@@ -1810,17 +1826,18 @@ static int watch_is_code(uint32_t va)
     return va >= g_xbox_code_lo && va < g_xbox_code_hi;
 }
 
-static void watch_report(void)
+static void watch_report_one(xbox_watch *w)
 {
     const uint8_t *mem = (const uint8_t *)g_memory_offset;
-    uint32_t now = *(const uint32_t *)(mem + g_watch_va);
+    uint32_t now = *(const uint32_t *)(mem + w->va);
     uint32_t esp = g_esp, i, shown = 0;
 
-    if (now == g_watch_last)
+    if (now == w->last)
         return;
     fprintf(stderr, "[WATCH] [%08X] %08X -> %08X  (esp=%08X)\n",
-            g_watch_va, g_watch_last, now, esp);
-    g_watch_last = now;
+            w->va, w->last, now, esp);
+    w->last = now;
+    recomp_prof_print_stack(stderr, "         ");
 
     /* Return addresses the recompiled code pushed, innermost first. Values
      * that merely look like code get printed too -- the chain is a lead, not
@@ -1858,14 +1875,18 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     DWORD old;
+    LONG n = g_watch_count, i;
 
-    if (!g_watch_page)
-        return EXCEPTION_CONTINUE_SEARCH;
+    if (n > XBOX_WATCH_MAX)
+        n = XBOX_WATCH_MAX;
 
-    if (code == EXCEPTION_SINGLE_STEP && s_watch_stepping) {
-        s_watch_stepping = 0;
-        watch_report();
-        VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old);
+    if (code == EXCEPTION_SINGLE_STEP && s_watch_step_page) {
+        void *page = s_watch_step_page;
+        s_watch_step_page = NULL;
+        for (i = 0; i < n; i++)
+            if (g_watch[i].page == page)
+                watch_report_one(&g_watch[i]);
+        VirtualProtect(page, 4096, PAGE_READONLY, &old);
         ep->ContextRecord->EFlags &= ~0x100u;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -1874,13 +1895,16 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
             && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
         uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
 
-        if (fault >= (uintptr_t)g_watch_page
-                && fault < (uintptr_t)g_watch_page + 4096) {
-            if (!VirtualProtect(g_watch_page, 4096, PAGE_READWRITE, &old))
-                return EXCEPTION_CONTINUE_SEARCH;
-            s_watch_stepping = 1;
-            ep->ContextRecord->EFlags |= 0x100u;
-            return EXCEPTION_CONTINUE_EXECUTION;
+        for (i = 0; i < n; i++) {
+            void *page = g_watch[i].page;
+            if (page && fault >= (uintptr_t)page
+                    && fault < (uintptr_t)page + 4096) {
+                if (!VirtualProtect(page, 4096, PAGE_READWRITE, &old))
+                    return EXCEPTION_CONTINUE_SEARCH;
+                s_watch_step_page = page;
+                ep->ContextRecord->EFlags |= 0x100u;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -1893,49 +1917,55 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
  * always reachable from a static one. Without this the only way to watch such
  * a field is to learn its address from one run and hope the allocator repeats
  * it, which it does not. */
-static unsigned g_watch_derefs;
-static uint32_t g_watch_root;
-static uint32_t g_watch_off;
-
-static int watch_resolve(uint32_t *out)
+static int watch_resolve(const xbox_watch *w, uint32_t *out)
 {
     const uint8_t *mem = (const uint8_t *)g_memory_offset;
-    uint32_t a = g_watch_root;
+    uint32_t a = w->root;
     unsigned k;
 
-    for (k = 0; k < g_watch_derefs; k++) {
+    for (k = 0; k < w->derefs; k++) {
         if (!peek_readable(a))
             return 0;
         a = *(const uint32_t *)(mem + a);
         if (!a)
             return 0;
     }
-    a += g_watch_off;
+    a += w->off;
     if (!peek_readable(a))
         return 0;
     *out = a;
     return 1;
 }
 
-static int watch_arm(uint32_t va);
+static int watch_arm(xbox_watch *w, uint32_t va);
 
-/* Poll until the chain resolves, then arm. Twenty milliseconds, because the
- * object appears once during bring-up and never again -- this thread exists
- * for a few seconds and then does nothing for the rest of the run. */
+/* Poll until every chain resolves, then arm each. Twenty milliseconds,
+ * because the objects appear once during bring-up and never again -- this
+ * thread exists for a few seconds and then does nothing for the rest of the
+ * run. */
 static DWORD WINAPI watch_resolver(LPVOID unused)
 {
     unsigned tries;
+    LONG n = g_watch_count, i, pending = n;
 
     (void)unused;
-    for (tries = 0; tries < 15000u && !g_watch_page; tries++) {
-        uint32_t va;
-        if (watch_resolve(&va) && watch_arm(va))
-            return 0;
-        Sleep(20);
+    for (tries = 0; tries < 15000u && pending; tries++) {
+        pending = 0;
+        for (i = 0; i < n; i++) {
+            uint32_t va;
+            xbox_watch *w = &g_watch[i];
+            if (w->page || !w->derefs)
+                continue;
+            if (!(watch_resolve(w, &va) && watch_arm(w, va)))
+                pending++;
+        }
+        if (pending)
+            Sleep(20);
     }
-    if (!g_watch_page)
-        fprintf(stderr, "  WATCH: %u-deep chain from 0x%08X never resolved\n",
-                g_watch_derefs, g_watch_root);
+    for (i = 0; i < n; i++)
+        if (!g_watch[i].page && g_watch[i].derefs)
+            fprintf(stderr, "  WATCH: %u-deep chain from 0x%08X never "
+                    "resolved\n", g_watch[i].derefs, g_watch[i].root);
     return 0;
 }
 
@@ -1944,65 +1974,97 @@ void xbox_WatchInit(void)
     const char *spec = getenv("RECOMP_WATCH");
     const char *q;
     char *endp;
+    int chains = 0;
+    LONG i, n;
 
-    if (!spec || !*spec || g_memory_base == NULL || g_watch_page)
+    if (!spec || !*spec || g_memory_base == NULL || g_watch_count)
         return;
 
-    for (q = spec; *q == '['; q++)
-        g_watch_derefs++;
-    g_watch_root = (uint32_t)strtoul(q, &endp, 0);
-    while (*endp == ']')
-        endp++;
-    if (*endp == '+')
-        g_watch_off = (uint32_t)strtoul(endp + 1, NULL, 0);
-
-    if (g_watch_derefs) {
-        fprintf(stderr, "  WATCH: resolving %u-deep chain from 0x%08X "
-                        "+0x%X\n", g_watch_derefs, g_watch_root, g_watch_off);
-        CloseHandle(CreateThread(NULL, 0, watch_resolver, NULL, 0, NULL));
-        return;
+    /* Parse every target first, so the resolver sees the full set. */
+    for (q = spec; *q && g_watch_count < XBOX_WATCH_MAX; ) {
+        xbox_watch *w = &g_watch[g_watch_count];
+        memset(w, 0, sizeof *w);
+        while (*q == ' ' || *q == ',')
+            q++;
+        if (!*q)
+            break;
+        for (; *q == '['; q++)
+            w->derefs++;
+        w->root = (uint32_t)strtoul(q, &endp, 0);
+        if (endp == q) {
+            fprintf(stderr, "  WATCH: cannot parse \"%s\"; stopping\n", q);
+            break;
+        }
+        while (*endp == ']')
+            endp++;
+        if (*endp == '+')
+            w->off = (uint32_t)strtoul(endp + 1, &endp, 0);
+        q = endp;
+        chains += w->derefs != 0;
+        g_watch_count++;
     }
-    watch_arm(g_watch_root + g_watch_off);
+    if (*q && g_watch_count >= XBOX_WATCH_MAX)
+        fprintf(stderr, "  WATCH: more than %d targets; the rest are "
+                        "ignored\n", XBOX_WATCH_MAX);
+
+    n = g_watch_count;
+    for (i = 0; i < n; i++) {
+        xbox_watch *w = &g_watch[i];
+        if (w->derefs)
+            fprintf(stderr, "  WATCH: resolving %u-deep chain from 0x%08X "
+                            "+0x%X\n", w->derefs, w->root, w->off);
+        else
+            watch_arm(w, w->root + w->off);
+    }
+    if (chains)
+        CloseHandle(CreateThread(NULL, 0, watch_resolver, NULL, 0, NULL));
 }
 
-/* Diagnostic: arm the RECOMP_WATCH write trap on a guest dword whose address
- * is only known at runtime (heap object reached via the recompiled code).
- * No-op if already armed. */
+/* Diagnostic: arm a write trap on a guest dword whose address is only known
+ * at runtime (heap object reached via the recompiled code). Takes a free
+ * slot; no-op if that VA is already watched or every slot is used. */
 void xbox_WatchArmVa(uint32_t va)
 {
-    if (!g_watch_page)
-        watch_arm(va);
+    LONG i, n = g_watch_count;
+
+    for (i = 0; i < n && i < XBOX_WATCH_MAX; i++)
+        if (g_watch[i].page && g_watch[i].va == va)
+            return;
+    i = InterlockedIncrement(&g_watch_count) - 1;
+    if (i >= XBOX_WATCH_MAX) {
+        InterlockedDecrement(&g_watch_count);
+        fprintf(stderr, "  WATCH: no free slot for 0x%08X\n", va);
+        return;
+    }
+    memset(&g_watch[i], 0, sizeof g_watch[i]);
+    g_watch[i].root = va;
+    watch_arm(&g_watch[i], va);
 }
 
-static int watch_arm(uint32_t va)
+static int watch_arm(xbox_watch *w, uint32_t va)
 {
     DWORD old;
+    void *page;
 
-    g_watch_va = va;
-    if (!peek_readable(g_watch_va)) {
+    w->va = va;
+    if (!peek_readable(va)) {
         fprintf(stderr, "  WATCH: 0x%08X is not in a mapped window; "
-                        "not armed\n", g_watch_va);
+                        "not armed\n", va);
         return 0;
     }
-    g_watch_last = *(const uint32_t *)((const uint8_t *)g_memory_offset
-                                       + g_watch_va);
+    w->last = *(const uint32_t *)((const uint8_t *)g_memory_offset + va);
     /* The page holding the guest dword, in host terms. */
-    g_watch_page = (void *)(((uintptr_t)((const uint8_t *)g_memory_offset
-                                         + g_watch_va)) & ~(uintptr_t)4095);
-    g_watch_veh = AddVectoredExceptionHandler(1, watch_veh);
-    if (!g_watch_veh
-            || !VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old)) {
-        if (g_watch_veh) {
-            RemoveVectoredExceptionHandler(g_watch_veh);
-            g_watch_veh = NULL;
-        }
-        g_watch_page = NULL;
-        fprintf(stderr, "  WATCH: cannot trap 0x%08X; not armed\n",
-                g_watch_va);
+    page = (void *)(((uintptr_t)((const uint8_t *)g_memory_offset + va))
+                    & ~(uintptr_t)4095);
+    if (!g_watch_veh)
+        g_watch_veh = AddVectoredExceptionHandler(1, watch_veh);
+    if (!g_watch_veh || !VirtualProtect(page, 4096, PAGE_READONLY, &old)) {
+        fprintf(stderr, "  WATCH: cannot trap 0x%08X; not armed\n", va);
         return 0;
     }
+    w->page = page;     /* published last: the VEH keys on it */
     fprintf(stderr, "  WATCH: writes to the page of 0x%08X are trapped "
-                    "(current %08X)\n", g_watch_va, g_watch_last);
+                    "(current %08X)\n", va, w->last);
     fflush(stderr);
     return 1;
 }
@@ -2123,6 +2185,10 @@ static void watchdog_sample(const char *tag)
 #undef WD_NV2A
     }
 
+    /* The real call chain of every guest thread, in an instrumented build;
+     * the GS scan below remains the fallback for an ordinary one. */
+    recomp_prof_print_all_stacks(stderr, "  ");
+
     for (i = 0; i < 400 && esp; i++) {
         uint32_t a = esp + i * 4;
         if (a < XBOX_STACK_BASE || a >= XBOX_STACK_TOP) break;
@@ -2132,11 +2198,21 @@ static void watchdog_sample(const char *tag)
     fflush(stderr);
 }
 
+/* RECOMP_HANG_DUMP=1: write a minidump (and guest memory, with
+ * RECOMP_CRASH_RAM=1) when the watchdog fires or a stall episode starts. */
+static void hang_dump(const char *why)
+{
+    const char *on = getenv("RECOMP_HANG_DUMP");
+    if (on && *on && *on != '0')
+        xbox_CrashDump(NULL, why, 1);
+}
+
 static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 {
     (void)unused;
     Sleep(s_watchdog_secs * 1000u);
     watchdog_sample("WATCHDOG");
+    hang_dump("watchdog");
     _exit(3);
     return 0;
 }
@@ -2166,6 +2242,8 @@ static DWORD WINAPI xbox_stalldump_thread(LPVOID unused)
                 fprintf(stderr, "[STALLDUMP] seq=%u no present for %us; g_present_flips=%u\n",
                         ++seq, still, g_present_flips);
                 watchdog_sample("STALLDUMP");
+                if (seq == 1)
+                    hang_dump("stall");
             }
         } else {
             if (still >= 3)
