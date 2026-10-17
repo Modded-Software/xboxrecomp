@@ -2421,6 +2421,31 @@ static int s_drawn_dumps;
 
 static void dump_surface_bmp(void);
 
+/* Capture the drawn surface once per draw, up to FB_DUMP_AFTER_DRAW files.
+ * Runs on both rasteriser paths: the native one returns before the fall-through
+ * code at the end of raster_batch, so it calls this itself. On the native path
+ * the pixels live in a D3D11 texture and guest RAM only catches up at a readback
+ * point, so pull the surface back first (the same targeted publish the 2D blit
+ * uses); on the software path the pixels are already in guest RAM and the
+ * publish matches no surface. */
+static void fb_dump_after_draw(void)
+{
+    uint32_t bpp, offset;
+    uint8_t *memory;
+
+    if (s_drawn_dumps >= FB_DUMP_AFTER_DRAW || !dump_enabled("RECOMP_FB_DUMP"))
+        return;
+    bpp = surface_bpp();
+    offset = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
+    if (offset && s_gpu.pitch && s_gpu.clip_h && (bpp == 2 || bpp == 4)) {
+        memory = (uint8_t *)xbox_GetMemoryOffset();
+        nv2a_gpu_surface_publish(memory + dma_resolve(offset),
+                                 (size_t)s_gpu.clip_h * s_gpu.pitch);
+    }
+    s_drawn_dumps++;
+    dump_surface_bmp();
+}
+
 /* One triangle by vertex index: gather position and, if the batch has one,
  * texture coordinate 0. A vertex whose position cannot be read is not drawn;
  * a batch whose texcoords cannot be read is drawn untextured rather than not
@@ -3083,7 +3108,10 @@ static void raster_batch(void)
     double prior_submit = s_gpu.gpu_submit_seconds;
     int rendered = gpu_raster_batch();
     s_gpu.gpu_prepare_seconds += gpu_clock_seconds() - started - (s_gpu.gpu_submit_seconds - prior_submit);
-    if (rendered) return;
+    if (rendered) {
+        fb_dump_after_draw();
+        return;
+    }
     {
         static uint32_t unsupported_shown;
         if (unsupported_shown++ < 32) {
@@ -3146,14 +3174,10 @@ static void raster_batch(void)
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
 #endif
 
-    /* RECOMP_FB_DUMP=<prefix>: capture the surface after a draw, so the file
-     * is what the rasteriser produced rather than what was presented. Bounded
-     * to FB_DUMP_AFTER_DRAW captures: this is a bring-up tool, and an
-     * unbounded one at 1080p writes ~6 MB per frame. */
-    if (s_drawn_dumps < FB_DUMP_AFTER_DRAW && dump_enabled("RECOMP_FB_DUMP")) {
-        s_drawn_dumps++;
-        dump_surface_bmp();
-    }
+    /* RECOMP_FB_DUMP=<prefix>: capture the surface after a software draw. The
+     * native path captures from its own branch above; this is the fall-through
+     * for the CPU rasteriser. */
+    fb_dump_after_draw();
 }
 
 /* What a batch actually contains. Before anything can be rasterised, the
