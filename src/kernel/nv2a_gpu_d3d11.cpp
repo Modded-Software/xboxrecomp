@@ -3219,7 +3219,29 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         }
         if (dependent && (binding.cube || binding.linear)) return reject("dependent texture dimensionality");
         if (mode == 9 && (binding.cube || binding.linear)) return reject("dot texture dimensionality");
-        for (uint32_t vertex = 0; !dependent && !state->vertex_program && vertex < count; vertex++) {
+        /* Sanitize texcoords the shader should never see. This runs once per
+         * vertex per sampled stage, so it is per-draw CPU cost on the same
+         * scale as the draw itself: 2,000-vertex batches made it ~9 s of every
+         * 100 s in a busy scene. Test all four components with one SSE
+         * exponent compare and only fall back to the per-component walk (and
+         * its log line) when one is actually inf/NaN. The bit test is the
+         * same one nv_cpu_finite makes. */
+        const bool any_scan = state->texgen[stage][0] == 0 || state->texgen[stage][1] == 0 ||
+                              state->texgen[stage][2] == 0 || state->texgen[stage][3] == 0;
+        const bool projective = mode == 1 || mode == 2;
+        for (uint32_t vertex = 0; (any_scan || projective) && !dependent &&
+                                  !state->vertex_program && vertex < count; vertex++) {
+            bool suspect = any_scan;
+#if defined(__SSE2__) || defined(_M_X64)
+            if (any_scan) {
+                __m128i bits = _mm_castps_si128(
+                    _mm_loadu_ps(vertices[vertex].texture[stage]));
+                __m128i expo = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
+                __m128i special = _mm_cmpeq_epi32(expo, _mm_set1_epi32(0x7F800000));
+                suspect = _mm_movemask_ps(_mm_castsi128_ps(special)) != 0;
+            }
+#endif
+            if (suspect)
             for (uint32_t component = 0; component < 4; component++)
                 if (state->texgen[stage][component] == 0 &&
                     !nv_cpu_finite(vertices[vertex].texture[stage][component])) {
