@@ -32,6 +32,13 @@
 extern void xbox_GammaDacInit(void);
 extern void xbox_Nv2aDacWrite(uint32_t off, uint32_t val);
 
+/* Trapped APU register accounting (src/apu/apu_mmio_hook.c). Declared here
+ * rather than including the APU headers, which this file does not otherwise
+ * need, to report how much a title's register traffic costs per second. */
+extern void apu_hook_mmio_stats(uint64_t *accesses, uint64_t *ns,
+                                uint64_t *reads, uint64_t *writes);
+extern void apu_hook_mmio_top(int n);
+
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
 #define XBE_BASE_ADDR_OFFSET    0x0104
@@ -1140,6 +1147,12 @@ static void event_signals_tick(void)
 
 static int s_nv2a_trace = 0;
 
+/* RECOMP_APU_TRAPSTATS: report the trapped APU register traffic once every five
+ * seconds -- accesses per second, the exception path's cost per access, and the
+ * share of a core it burns. Off by default; it exists to attribute audio-side
+ * stalls with numbers instead of stacks alone. */
+static int s_apu_trapstats = -1;
+
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
  * presenter: is the guest putting pixels anywhere at all, and do they change
@@ -1491,6 +1504,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             }
         }
 fence_mirrors_tick();
+        if (s_apu_trapstats < 0) {
+            const char *e = getenv("RECOMP_APU_TRAPSTATS");
+            s_apu_trapstats = (e && *e && *e != '0') ? 1 : 0;
+        }
         event_signals_tick();
         if (s_nv2a_trace) {
             static uint32_t last_start = 0xFFFFFFFFu;
@@ -1518,6 +1535,34 @@ fence_mirrors_tick();
          * millisecond unit, so the rate matches. */
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
+
+        if (s_apu_trapstats) {
+            static uint32_t last_report;
+            static uint64_t prev_accesses, prev_ns;
+            uint32_t now_ms = GetTickCount();
+            if (now_ms - last_report >= 5000u) {
+                uint64_t accesses, ns, reads, writes;
+                double elapsed = last_report ? (now_ms - last_report) / 1000.0 : 0.0;
+                apu_hook_mmio_stats(&accesses, &ns, &reads, &writes);
+                if (elapsed > 0.0) {
+                    uint64_t da = accesses - prev_accesses;
+                    uint64_t dn = ns - prev_ns;
+                    fprintf(stderr, "[APU-TRAP] %.0f accesses/s, %.1f us each,"
+                            " %.1f%% of a core; total %llu accesses"
+                            " (%llu reads %llu writes)\n",
+                            da / elapsed,
+                            da ? (double)dn / 1000.0 / (double)da : 0.0,
+                            (double)dn / (elapsed * 1e9) * 100.0,
+                            (unsigned long long)accesses,
+                            (unsigned long long)reads, (unsigned long long)writes);
+                    apu_hook_mmio_top(8);
+                    fflush(stderr);
+                }
+                prev_accesses = accesses;
+                prev_ns = ns;
+                last_report = now_ms;
+            }
+        }
 
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
@@ -2328,10 +2373,66 @@ static DWORD WINAPI xbox_stalldump_thread(LPVOID unused)
     return 0;
 }
 
+/* Slow-frame sampler.
+ *
+ * The stall sampler above needs whole seconds, which misses exactly the case
+ * that matters in a busy scene: 300-600 ms lost once every few seconds. This
+ * one watches the same completed-present counter at 20 ms and, the first time
+ * a frame has been in flight for longer than RECOMP_SLOWFRAME_MS, prints every
+ * guest shadow stack -- which names the code that frame is inside, the one
+ * thing a framerate cannot say. The stacks need the profiled build; a plain
+ * build says so once per frame and stays quiet.
+ */
+static DWORD WINAPI xbox_slowframe_thread(LPVOID unused)
+{
+    const char *env = getenv("RECOMP_SLOWFRAME_MS");
+    unsigned long long threshold_ms = env && *env ? strtoull(env, NULL, 10) : 0;
+    LARGE_INTEGER freq, now, last_change;
+    uint32_t last;
+    int reported = 0;
+
+    (void)unused;
+    if (!threshold_ms)
+        return 0;
+    if (!QueryPerformanceFrequency(&freq) || freq.QuadPart <= 0)
+        return 0;
+    QueryPerformanceCounter(&last_change);
+    last = g_present_flips;
+    for (;;) {
+        double ms;
+
+        Sleep(20);
+        QueryPerformanceCounter(&now);
+        ms = (double)(now.QuadPart - last_change.QuadPart) * 1000.0 /
+             (double)freq.QuadPart;
+        if (g_present_flips != last) {
+            if (reported)
+                fprintf(stderr, "[SLOWFRAME] resumed after %.1f ms (flip %u)\n",
+                        ms, g_present_flips);
+            last = g_present_flips;
+            last_change = now;
+            reported = 0;
+            continue;
+        }
+        if (reported || ms < (double)threshold_ms)
+            continue;
+        fprintf(stderr, "[SLOWFRAME] no present for %.1f ms (flip %u); guest stacks:\n",
+                ms, last);
+        if (recomp_prof_active())
+            recomp_prof_print_all_stacks(stderr, "    ");
+        else
+            fprintf(stderr, "    (profiled build needed for stacks: PROF=1)\n");
+        fflush(stderr);
+        reported = 1;
+    }
+    return 0;
+}
+
 void xbox_WatchdogStart(void)
 {
     const char *secs = getenv("RECOMP_WATCHDOG_SECS");
     const char *stall = getenv("RECOMP_STALL_DUMP");
+    const char *slow = getenv("RECOMP_SLOWFRAME_MS");
     HANDLE h;
 
     /* Taken on the guest thread: g_esp is thread-local, so every sampler has
@@ -2344,6 +2445,12 @@ void xbox_WatchdogStart(void)
 
     if (stall && *stall) {
         h = CreateThread(NULL, 0, xbox_stalldump_thread, NULL, 0, NULL);
+        if (h)
+            CloseHandle(h);
+    }
+
+    if (slow && *slow) {
+        h = CreateThread(NULL, 0, xbox_slowframe_thread, NULL, 0, NULL);
         if (h)
             CloseHandle(h);
     }

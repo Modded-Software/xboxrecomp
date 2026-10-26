@@ -30,6 +30,16 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
 /* MMIO write to APU register space (addr is offset from 0xFE800000). */
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size);
 
+/* Trapped-access accounting from the MMIO hook: number of guest accesses
+ * taken through the exception path and the wall time they cost. Every APU
+ * register touch is a fault, so this is the number that says whether a title
+ * is paying for its register traffic. */
+void apu_hook_mmio_stats(uint64_t *accesses, uint64_t *ns,
+                         uint64_t *reads, uint64_t *writes);
+
+/* Print and clear the n most-accessed APU register offsets of the interval. */
+void apu_hook_mmio_top(int n);
+
 int mcpx_apu_irq_pending(void);
 
 /* A diagnostic switch (RECOMP_APU_TRACE, RECOMP_APU_RING, ...) is on when

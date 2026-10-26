@@ -17,6 +17,50 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
+/* Cost of the exception path, filled in by the platform hook and read by the
+ * stats thread. Every APU register touch from the title is a fault, so these
+ * numbers are what tell a working model from a cheap one. */
+static uint64_t g_apu_trap_calls;
+static uint64_t g_apu_trap_ns;
+static int g_apu_mmio_read_count;
+static int g_apu_mmio_write_count;
+
+/* Per-register access counts, so a report can name the registers a title
+ * hammers instead of only the total. Indexed by offset/4 (offsets are
+ * dword-aligned). */
+#define APU_HOOK_OFF_DWORDS (0x00080000u / 4u)
+static uint32_t g_apu_off_count[APU_HOOK_OFF_DWORDS];
+
+void apu_hook_mmio_top(int n)
+{
+    int i, k;
+    for (k = 0; k < n; k++) {
+        uint32_t best = 0, best_i = 0;
+        for (i = 0; i < (int)APU_HOOK_OFF_DWORDS; i++) {
+            if (g_apu_off_count[i] > best) {
+                best = g_apu_off_count[i];
+                best_i = (uint32_t)i;
+            }
+        }
+        if (!best)
+            break;
+        fprintf(stderr, "[APU-TRAP]   top: 0x%05X x%u\n",
+                best_i * 4u, best);
+        g_apu_off_count[best_i] = 0;
+    }
+    fflush(stderr);
+}
+
+
+void apu_hook_mmio_stats(uint64_t *accesses, uint64_t *ns,
+                         uint64_t *reads, uint64_t *writes)
+{
+    if (accesses) *accesses = g_apu_trap_calls;
+    if (ns) *ns = g_apu_trap_ns;
+    if (reads) *reads = (uint64_t)g_apu_mmio_read_count;
+    if (writes) *writes = (uint64_t)g_apu_mmio_write_count;
+}
+
 /* Windows: a VEH hands over the CONTEXT. POSIX arm64: a SIGBUS/SIGSEGV
  * handler hands over the ucontext (apu_hook_handle_mmio_posix, at the end).
  * x86-64 Linux has no trap yet. */
@@ -31,8 +75,6 @@ MCPXAPUState *g_apu_state = NULL;
 /* (g_apu_state is defined above, outside the Win32 guard) */
 
 /* Statistics */
-static int g_apu_mmio_read_count = 0;
-static int g_apu_mmio_write_count = 0;
 static int g_apu_mmio_decode_fail = 0;
 
 /* ============================================================
@@ -95,8 +137,27 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
 bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)
 {
+    /* Timing costs two QueryPerformanceCounter calls per trapped access, so
+     * it is only paid when the report it feeds is switched on. */
+    static int timing = -1;
+    LARGE_INTEGER t0, t1, freq;
+    if (timing < 0) {
+        const char *e = getenv("RECOMP_APU_TRAPSTATS");
+        timing = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (timing) QueryPerformanceCounter(&t0);
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
+    if ((mmio_offset >> 2) < APU_HOOK_OFF_DWORDS)
+        g_apu_off_count[mmio_offset >> 2]++;
     bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+    if (timing) {
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&freq);
+        g_apu_trap_calls++;
+        if (freq.QuadPart)
+            g_apu_trap_ns += (uint64_t)((t1.QuadPart - t0.QuadPart) * 1000000000ULL
+                                        / (uint64_t)freq.QuadPart);
+    }
 
     /* What the title actually asks the APU for. With the DSP56300 engine off
      * (RECOMP_APU_DSP=0) a title that waits on a DSP command waits forever,

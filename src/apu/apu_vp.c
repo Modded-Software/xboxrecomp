@@ -260,17 +260,27 @@ static void voice_off_at(MCPXAPUState *d, uint16_t v, int line)
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    qemu_mutex_lock(&d->lock);
 
-    uint64_t mask = 1ULL << (v % 64);
-    if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
-    } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
+    /* DirectSound locks and unlocks a voice around every parameter update --
+     * measured at 25,000 writes a second in a busy scene, all through the
+     * trapped-MMIO path. Taking the global APU mutex here put each of those
+     * behind the frame thread, which holds it for a whole frame; the guest's
+     * audio commits then waited milliseconds per voice and the title's main
+     * loop (which takes the same guest locks) stopped presenting. The bit
+     * only has to be visible to the mixer, so set it atomically and drop the
+     * mutex. The condition signal went with it: every wait on d->cond is
+     * timed (throttle, wait-for-idle), and waking the frame thread 25,000
+     * times a second was pure overhead. */
+    {
+        int half = (v % 64) >= 32;
+        uint32_t bit = 1u << ((v % 64) - (half ? 32 : 0));
+        volatile uint32_t *word =
+            &((volatile uint32_t *)&d->vp.voice_locked[v / 64])[half];
+        if (lock)
+            qatomic_or(word, bit);
+        else
+            qatomic_and(word, ~bit);
     }
-
-    qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
@@ -730,7 +740,20 @@ uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size)
 
     switch (addr) {
     case NV1BA0_PIO_FREE:
-        return 0x80; /* Always pretend queue is empty */
+        /* DirectSound's CMcpxVoiceClient::SetVolume (0x002F8E85) spins here
+         * once per volume change until the reported free space covers
+         * 6 dwords per pending voice:
+         *
+         *     mov edx,[0xFE820010] / shr edx,2 / cmp edx,eax / jb back
+         *
+         * Entries are consumed the instant they are written (fe_method
+         * handles the method and drops it), so the ring never backs up. The
+         * old 0x80 answered "32 dwords free", which is under what a batch of
+         * six or more voices asks for: the guest then re-read the register
+         * for hundreds of microseconds per call, through the VEH, while
+         * holding DISPATCH -- which is what starved presentation. Report a
+         * ring far larger than any batch instead. */
+        return 0x10000; /* 16384 dwords: never the reason to wait */
     default:
         break;
     }

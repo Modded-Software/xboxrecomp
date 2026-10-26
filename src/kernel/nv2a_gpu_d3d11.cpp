@@ -52,6 +52,7 @@ static struct {
     double vertex_compile, pixel_compile;
     uint64_t vertex_shader_hits, vertex_shader_misses, pixel_shader_hits, pixel_shader_misses, shader_evictions;
     uint64_t vertex_shader_failures, pixel_shader_failures;
+    uint64_t shader_cache_hits, shader_cache_stores;
     uint64_t hash_bytes;
     uint64_t blend_created, depth_created, sampler_created;
     uint64_t color_created, depth_surface_created, color_refreshed, depth_refreshed;
@@ -94,6 +95,8 @@ struct GpuTimer {
 };
 
 static void report_gpu_samples();
+static bool shader_cache_enabled();
+static const std::string &shader_cache_dir();
 
 extern "C" void nv2a_gpu_report(void)
 {
@@ -169,6 +172,10 @@ extern "C" void nv2a_gpu_report(void)
                  (unsigned long long)gpu_timing.pixel_shader_misses,
                  (unsigned long long)gpu_timing.pixel_shader_failures, gpu_timing.pixel_compile,
                  (unsigned long long)gpu_timing.shader_evictions);
+    std::fprintf(stderr, "[GPU-D3D11] shader cache: %llu hits, %llu stores, %s\n",
+                 (unsigned long long)gpu_timing.shader_cache_hits,
+                 (unsigned long long)gpu_timing.shader_cache_stores,
+                 shader_cache_enabled() ? shader_cache_dir().c_str() : "off");
     std::fprintf(stderr, "[GPU-D3D11] fixed function: %llu draws, %llu lit, %llu skinned, %llu texgen, %llu texture-matrix\n",
                  (unsigned long long)gpu_timing.fixed_draws, (unsigned long long)gpu_timing.lit_draws,
                  (unsigned long long)gpu_timing.skinned_draws, (unsigned long long)gpu_timing.texgen_draws,
@@ -639,6 +646,137 @@ static std::string vertex_program_source(const std::vector<uint32_t> &key, bool 
     return source;
 }
 
+/* Compiled-shader disk cache.
+ *
+ * D3DCompile costs 50-80 ms for the guest shaders this title uses, and every
+ * new variant (a new cutscene, a new effect) lands in the middle of a frame:
+ * the guest thread sits in BlockOnTime while the compile runs and the frame
+ * loses a few hundred milliseconds. The variants never change between runs,
+ * so the bytecode is kept beside the executable, keyed by everything that
+ * feeds the compile. A hit skips D3DCompile and the driver's pipeline creation
+ * still runs, which is what the guest expects; RECOMP_SHADER_CACHE_DIR moves
+ * the directory and RECOMP_SHADER_CACHE=0 turns the cache off.
+ */
+static uint64_t shader_cache_hash(uint64_t hash, const void *data, size_t size)
+{
+    const unsigned char *bytes = (const unsigned char *)data;
+    for (size_t i = 0; i < size; i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static const std::string &shader_cache_dir()
+{
+    static std::string dir;
+    if (dir.empty()) {
+        const char *env = std::getenv("RECOMP_SHADER_CACHE_DIR");
+        if (env && *env) {
+            dir = env;
+        } else {
+            char module[MAX_PATH] = {};
+            DWORD length = GetModuleFileNameA(nullptr, module, (DWORD)sizeof module);
+            std::string exe(module, length && length < sizeof module ? length : 0);
+            size_t slash = exe.find_last_of("\\/");
+            dir = (slash == std::string::npos ? std::string(".") : exe.substr(0, slash)) + "\\shader-cache";
+        }
+        CreateDirectoryA(dir.c_str(), nullptr);
+    }
+    return dir;
+}
+
+static bool shader_cache_enabled()
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = std::getenv("RECOMP_SHADER_CACHE");
+        enabled = !(env && *env == '0');
+    }
+    return enabled;
+}
+
+static bool shader_cache_load(uint64_t key, std::vector<unsigned char> &bytes)
+{
+    if (!shader_cache_enabled()) return false;
+    char name[40];
+    std::snprintf(name, sizeof name, "\\%016llx.dxbc", (unsigned long long)key);
+    FILE *file = std::fopen((shader_cache_dir() + name).c_str(), "rb");
+    if (!file) return false;
+    unsigned char header[8];
+    bool ok = std::fread(header, 1, sizeof header, file) == sizeof header;
+    if (ok) {
+        uint32_t magic = (uint32_t)header[0] | ((uint32_t)header[1] << 8) | ((uint32_t)header[2] << 16) | ((uint32_t)header[3] << 24);
+        uint32_t size = (uint32_t)header[4] | ((uint32_t)header[5] << 8) | ((uint32_t)header[6] << 16) | ((uint32_t)header[7] << 24);
+        ok = magic == 0x42434458u && size > 0 && size <= (64u << 20);
+        if (ok) {
+            bytes.resize(size);
+            ok = std::fread(bytes.data(), 1, size, file) == size;
+        }
+    }
+    std::fclose(file);
+    if (!ok) bytes.clear();
+    return ok;
+}
+
+static void shader_cache_store(uint64_t key, const unsigned char *data, size_t size)
+{
+    if (!shader_cache_enabled() || !size || size > (64u << 20)) return;
+    char name[40];
+    std::snprintf(name, sizeof name, "\\%016llx.dxbc", (unsigned long long)key);
+    std::string path = shader_cache_dir() + name;
+    std::string temporary = path + ".tmp";
+    FILE *file = std::fopen(temporary.c_str(), "wb");
+    if (!file) return;
+    unsigned char header[8] = {
+        'X', 'D', 'C', 'B',
+        (unsigned char)(size & 255u), (unsigned char)((size >> 8) & 255u),
+        (unsigned char)((size >> 16) & 255u), (unsigned char)((size >> 24) & 255u)
+    };
+    bool ok = std::fwrite(header, 1, sizeof header, file) == sizeof header &&
+              std::fwrite(data, 1, size, file) == size;
+    ok = std::fclose(file) == 0 && ok;
+    if (!ok) {
+        std::remove(temporary.c_str());
+        return;
+    }
+    if (!MoveFileExA(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+        std::remove(temporary.c_str());
+    else
+        gpu_timing.shader_cache_stores++;
+}
+
+static HRESULT compile_shader_blob(const char *label, const char *source, size_t source_size,
+                                   const D3D_SHADER_MACRO *definitions,
+                                   const char *entry, const char *target, UINT flags,
+                                   std::vector<unsigned char> &bytecode, ComPtr<ID3DBlob> &errors)
+{
+    static const uint32_t cache_version = 1;
+    uint64_t key = 1469598103934665603ull;
+    key = shader_cache_hash(key, &cache_version, sizeof cache_version);
+    key = shader_cache_hash(key, label, std::strlen(label));
+    key = shader_cache_hash(key, entry, std::strlen(entry));
+    key = shader_cache_hash(key, target, std::strlen(target));
+    key = shader_cache_hash(key, &flags, sizeof flags);
+    key = shader_cache_hash(key, source, source_size);
+    for (const D3D_SHADER_MACRO *definition = definitions; definition && definition->Name; definition++) {
+        key = shader_cache_hash(key, definition->Name, std::strlen(definition->Name));
+        if (definition->Definition)
+            key = shader_cache_hash(key, definition->Definition, std::strlen(definition->Definition));
+    }
+    if (shader_cache_load(key, bytecode)) {
+        gpu_timing.shader_cache_hits++;
+        return S_OK;
+    }
+    ComPtr<ID3DBlob> code;
+    HRESULT result = D3DCompile(source, source_size, label, definitions, nullptr, entry, target, flags, 0, &code, &errors);
+    if (FAILED(result)) return result;
+    bytecode.assign((const unsigned char *)code->GetBufferPointer(),
+                    (const unsigned char *)code->GetBufferPointer() + code->GetBufferSize());
+    shader_cache_store(key, bytecode.data(), bytecode.size());
+    return S_OK;
+}
+
 static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state)
 {
     uint32_t words = vertex_program_word_count(state);
@@ -656,9 +794,10 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state)
     GpuTimer compile_timer(gpu_timing.vertex_compile);
     std::string source = vertex_program_source(variant.key, false);
     if (source.empty()) return nullptr;
-    ComPtr<ID3DBlob> code, errors;
-    HRESULT result = D3DCompile(source.data(), source.size(), "NV2A-vertex", nullptr, nullptr, "vs_guest", "vs_5_0",
-                               D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
+    std::vector<unsigned char> bytecode;
+    ComPtr<ID3DBlob> errors;
+    HRESULT result = compile_shader_blob("NV2A-vertex", source.data(), source.size(), nullptr, "vs_guest", "vs_5_0",
+                                         D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, bytecode, errors);
     if (FAILED(result)) {
         gpu_timing.vertex_shader_failures++;
         std::fprintf(stderr, "[GPU-D3D11] vertex compile: %s\n", errors ? (const char *)errors->GetBufferPointer() : "failed");
@@ -671,9 +810,9 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state)
         elements[attribute].AlignedByteOffset = (UINT)offsetof(Nv2aGpuVertex, attributes) + attribute * 16;
         elements[attribute].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
     }
-    if (FAILED(device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &variant.shader)) ||
-        FAILED(device->CreateInputLayout(elements, 16, code->GetBufferPointer(), code->GetBufferSize(), &variant.layout))) return nullptr;
-    variant.bytecode_bytes = code->GetBufferSize();
+    if (FAILED(device->CreateVertexShader(bytecode.data(), bytecode.size(), nullptr, &variant.shader)) ||
+        FAILED(device->CreateInputLayout(elements, 16, bytecode.data(), (SIZE_T)bytecode.size(), &variant.layout))) return nullptr;
+    variant.bytecode_bytes = bytecode.size();
     return cache_shader_variant(vertex_variants, std::move(variant));
 }
 
@@ -793,16 +932,18 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
         {"NV_DEPTH_ENABLED",variant.key[37] ? "1" : "0"},
         {"NV_DEPTH_SEMANTIC",variant.key[36] ? "SV_DepthGreaterEqual" : "SV_DEPTH"}, {nullptr,nullptr}
     };
-    ComPtr<ID3DBlob> code, errors;
-    HRESULT result = D3DCompile(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A-guest", definitions, nullptr,
-                               "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
+    std::vector<unsigned char> bytecode;
+    ComPtr<ID3DBlob> errors;
+    HRESULT result = compile_shader_blob("NV2A-guest", nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1,
+                                         definitions, "ps_main", "ps_5_0",
+                                         D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, bytecode, errors);
     if (FAILED(result)) {
         gpu_timing.pixel_shader_failures++;
         std::fprintf(stderr, "[GPU-D3D11] guest shader compile: %s\n", errors ? (const char *)errors->GetBufferPointer() : "failed");
         return nullptr;
     }
-    if (FAILED(device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &variant.shader))) return nullptr;
-    variant.bytecode_bytes = code->GetBufferSize();
+    if (FAILED(device->CreatePixelShader(bytecode.data(), bytecode.size(), nullptr, &variant.shader))) return nullptr;
+    variant.bytecode_bytes = bytecode.size();
     auto *cached = cache_shader_variant(shader_variants, std::move(variant));
     return cached ? cached->shader.Get() : nullptr;
 }

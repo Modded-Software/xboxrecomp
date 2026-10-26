@@ -805,7 +805,25 @@ static void *mcpx_apu_frame_thread(void *arg)
              * cadence stays in lockstep. Ticking ep_frame_div on those frames
              * WITHOUT running the GP is what let the EP reader overtake the GP
              * writer -- a 48000/256 = 187.5 Hz comb ("modem" buzz). */
-            se_frame(d);
+            {
+                /* d->lock is held across se_frame, and every guest voice
+                 * method (VOICE_ON/OFF/RELEASE, and the writes DirectSound's
+                 * CMcpxVoiceClient::SetVolume makes) needs that lock. A frame
+                 * that takes tens of ms is therefore a title-visible stall:
+                 * the pushbuffer thread waits on a guest critical section the
+                 * audio thread's holder is waiting on. Report the outlier
+                 * frames rather than leaving the attribution to guesswork. */
+                static int s_slow_frames;
+                int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+                se_frame(d);
+                int64_t spent = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0;
+                if (spent > 15000 && s_slow_frames < 60) {
+                    s_slow_frames++;
+                    fprintf(stderr, "[APU-DSP] slow se_frame %.1f ms"
+                            " (frame %d)\n", spent / 1000.0, s_slow_frames);
+                    fflush(stderr);
+                }
+            }
         } else {
             /* APU truly disabled (XCNTMODE off): no DSP runs, so it is safe to
              * advance the frame clock here. Emit a silent window so the XAudio2
