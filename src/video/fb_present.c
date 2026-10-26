@@ -285,6 +285,10 @@ static void fb_inject_poll(void)
         if (getenv("RECOMP_KEY_TRACE"))
             fprintf(stderr, "  [KEY] inject %s vk=0x%02X\n",
                     next[i] ? "down" : "up", i);
+        /* Same shortcut on the injection path, so an automated run can turn
+         * the frametime overlay on and off without a keyboard. */
+        if (next[i] && (i == VK_F9 || i == VK_F11))
+            xbox_OverlayToggle();
     }
 }
 

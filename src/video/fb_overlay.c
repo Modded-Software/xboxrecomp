@@ -34,11 +34,12 @@
 #include "fb_overlay.h"
 
 #define FT_SAMPLES 600           /* ~10 s at 60 Hz */
-#define FT_PANEL_UNITS 312       /* panel width in unscaled pixels */
-#define FT_PANEL_H_UNITS 126     /* four text lines + graph */
-#define FT_GRAPH_H_UNITS 70
-#define FT_LINE_H_UNITS 11
+#define FT_PANEL_UNITS 300       /* panel width in unscaled pixels */
+#define FT_PANEL_H_UNITS 122     /* four text lines + graph */
+#define FT_GRAPH_H_UNITS 62
+#define FT_LINE_H_UNITS 12
 #define FT_PAD_UNITS 6
+#define FT_TEXT_SCALE 2          /* glyph pixels: 3x5 * 2 */
 
 static volatile LONG s_enabled;
 static volatile LONG s_init;
@@ -65,6 +66,7 @@ static double   s_frame_start_ms;
 static unsigned s_total_frames;
 static float    s_last_interval, s_last_wait, s_last_present;
 static uint32_t s_last_draws;
+static uint32_t s_prev_draws;
 
 /* Window-thread copy of the ring, taken through the sequence counter. */
 static struct ft_sample s_snap[FT_SAMPLES];
@@ -239,8 +241,9 @@ static void fill_rect(uint32_t *px, int w, int h, int stride,
     }
 }
 
-/* 3x5 glyphs, one 3-bit row each (bit 0 is the left column), rows laid out in
- * bits 0..14 top first. Uppercase only; anything unknown draws as a space. */
+/* 3x5 glyphs, one 3-bit row each, rows laid out in bits 0..14 top first, the
+ * leftmost column in bit 2 of each row (the patterns below read left to
+ * right). Uppercase only; anything unknown draws as a space. */
 static const char s_glyph_chars[] = "0123456789ACDEFGIKLMNOPRSTVWXY:-./%";
 static const unsigned short s_glyph_rows[] = {
     31599, 29874, 31183, 29647, 5101, 29671, 31719, 4687, 31727, 29679,
@@ -271,7 +274,8 @@ static void draw_text(uint32_t *px, int w, int h, int stride, int x, int y,
         for (row = 0; row < 5; row++) {
             unsigned bits = (rows >> (row * 3)) & 7u;
             for (col = 0; col < 3; col++) {
-                if ((bits & (1u << col)) && c != ' ')
+                /* bit 2 is the leftmost column, as the tables read */
+                if ((bits & (1u << (2 - col))) && c != ' ')
                     fill_rect(px, w, h, stride,
                               x + (int)i * 4 * scale + col * scale,
                               y + row * scale, scale, scale, color, 256);
@@ -305,9 +309,12 @@ void xbox_OverlayComposite(uint32_t *px, int w, int h, int stride)
 
     if (!px || w <= 0 || h <= 0 || !xbox_OverlayEnabled())
         return;
-    scale = h / 360;
+    /* The panel is sized to be readable but unobtrusive: the constants are
+     * already in screen pixels, so it stays the same physical size from 480p
+     * to 1080p and only doubles past 4K. */
+    scale = h / 900;
     if (scale < 1) scale = 1;
-    if (scale > 3) scale = 3;
+    if (scale > 2) scale = 2;
     pad = FT_PAD_UNITS * scale;
     line_h = FT_LINE_H_UNITS * scale;
     panel_w = FT_PANEL_UNITS * scale;
@@ -371,17 +378,19 @@ void xbox_OverlayComposite(uint32_t *px, int w, int h, int stride)
 
     {
         int y = pad;
-        snprintf(s_text[0], sizeof(s_text[0]), "FRAME %.1fMS %.0fFPS",
+        snprintf(s_text[0], sizeof(s_text[0]), "FRAME %.1f %.0fFPS",
                  (double)s_last_interval,
                  s_last_interval > 0.01f ? (double)(1000.0f / s_last_interval) : 0.0);
-        snprintf(s_text[1], sizeof(s_text[1]), "AVG %.1f MAX %.1f P99 %.1f",
-                 (double)s_stat_avg, (double)s_stat_max, (double)s_stat_p99);
-        snprintf(s_text[2], sizeof(s_text[2]), "1%%LOW %.0fFPS SPK %u",
-                 (double)s_stat_low1, s_stat_spikes);
-        snprintf(s_text[3], sizeof(s_text[3]), "WAIT %.1f PRES %.1f DRW %u",
-                 (double)s_last_wait, (double)s_last_present, s_last_draws);
+        snprintf(s_text[1], sizeof(s_text[1]), "AVG %.1f MAX %.1f",
+                 (double)s_stat_avg, (double)s_stat_max);
+        snprintf(s_text[2], sizeof(s_text[2]), "P99 %.1f 1%%LOW %.0f",
+                 (double)s_stat_p99, (double)s_stat_low1);
+        snprintf(s_text[3], sizeof(s_text[3]), "W %.1f P %.1f D %u SPK %u",
+                 (double)s_last_wait, (double)s_last_present, s_last_draws,
+                 s_stat_spikes);
         for (i = 0; i < 4; i++) {
-            draw_text(px, w, h, stride, gx, y, scale, s_text[i], 0xE8E8E8);
+            draw_text(px, w, h, stride, gx, y, FT_TEXT_SCALE * scale,
+                      s_text[i], 0xE8E8E8);
             y += line_h;
         }
         /* A flip that never came is the one thing the bars cannot show: they
@@ -391,7 +400,7 @@ void xbox_OverlayComposite(uint32_t *px, int w, int h, int stride)
             snprintf(stall, sizeof(stall), "NO FRAME %.1fS",
                      (now_ms - s_last_flip_ms) / 1000.0);
             draw_text(px, w, h, stride, gx, pad + 4 * line_h + gh + pad / 2,
-                      scale, stall, 0xFF4040);
+                      FT_TEXT_SCALE * scale, stall, 0xFF4040);
         }
     }
 }
@@ -413,7 +422,10 @@ void xbox_OverlayFlip(double wait_ms, uint32_t draws, uint32_t vertices)
     s_last_flip_ms = now_ms;
     s_last_interval = interval;
     s_last_wait = (float)wait_ms;
-    s_last_draws = draws;
+    /* The guest counter is cumulative; per-frame is what says how busy the
+     * frame was. */
+    s_last_draws = draws >= s_prev_draws ? draws - s_prev_draws : draws;
+    s_prev_draws = draws;
     s_total_frames++;
     if (s_log_time == 0.0)
         s_log_time = now_ms / 1000.0;
@@ -423,7 +435,7 @@ void xbox_OverlayFlip(double wait_ms, uint32_t draws, uint32_t vertices)
     s->interval_ms = interval;
     s->wait_ms = (float)wait_ms;
     s->present_ms = s_last_present;
-    s->draws = draws;
+    s->draws = s_last_draws;
     s->vertices = vertices;
     s_head = (s_head + 1) % FT_SAMPLES;
     if (s_count < FT_SAMPLES)
@@ -432,7 +444,8 @@ void xbox_OverlayFlip(double wait_ms, uint32_t draws, uint32_t vertices)
 
     if (s_csv) {
         fprintf(s_csv, "%u,%.3f,%.3f,%.3f,%u,%u\n", s_total_frames,
-                (double)interval, wait_ms, s_last_present, draws, vertices);
+                (double)interval, wait_ms, s_last_present, s_last_draws,
+                vertices);
         if (++s_csv_rows % 60u == 0)
             fflush(s_csv);
     }
