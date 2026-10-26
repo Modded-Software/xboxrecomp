@@ -239,6 +239,7 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
  * xbox_FramebufferMouseCapture), so motion never runs into a screen edge.
  */
 extern int xbox_FramebufferMouseDelta(int *dx, int *dy);
+extern void xbox_FramebufferMousePushback(int dx, int dy);
 extern int xbox_FramebufferMouseButton(int which);
 extern int xbox_FramebufferMouseWheel(void);
 
@@ -469,12 +470,20 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
 
     /* Right stick: the mouse delta scaled straight to the stick. Clamp each
      * poll's delta so a focus change or a stuck cursor cannot slam it to full,
-     * while real flicks still scale; the inlet deadzone drops sub-count noise. */
+     * while real flicks still scale; the inlet deadzone drops sub-count noise.
+     * Whatever the clamp shaves off is handed back, not dropped: a fast flick
+     * between two polls, or a replayed hitch's worth of motion, used to turn
+     * the camera less than the hand did. */
     xbox_FramebufferMouseDelta(&dx, &dy);
-    if (dx >  (int)maxdelta) dx =  (int)maxdelta;
-    if (dx < -(int)maxdelta) dx = -(int)maxdelta;
-    if (dy >  (int)maxdelta) dy =  (int)maxdelta;
-    if (dy < -(int)maxdelta) dy = -(int)maxdelta;
+    {
+        int carry_x = 0, carry_y = 0;
+        if (dx >  (int)maxdelta) { carry_x = dx - (int)maxdelta; dx =  (int)maxdelta; }
+        if (dx < -(int)maxdelta) { carry_x = dx + (int)maxdelta; dx = -(int)maxdelta; }
+        if (dy >  (int)maxdelta) { carry_y = dy - (int)maxdelta; dy =  (int)maxdelta; }
+        if (dy < -(int)maxdelta) { carry_y = dy + (int)maxdelta; dy = -(int)maxdelta; }
+        if (carry_x || carry_y)
+            xbox_FramebufferMousePushback(carry_x, carry_y);
+    }
     if (dx > -(int)deadzone && dx < (int)deadzone) dx = 0;
     if (dy > -(int)deadzone && dy < (int)deadzone) dy = 0;
 

@@ -139,6 +139,15 @@ int xbox_OverlayEnabled(void)
     return InterlockedCompareExchange(&s_enabled, 1, 1) != 0;
 }
 
+/* Sampling is not the same as drawing. A run with RECOMP_FRAMETIME_CSV wants
+ * every frame measured and written even when the panel is not on screen --
+ * before this, the CSV and the [FRAMETIME] summary were gated on the overlay
+ * being visible, so an automated run with the graph off logged nothing. */
+static int ft_sampling(void)
+{
+    return s_csv != NULL || xbox_OverlayEnabled();
+}
+
 void xbox_OverlayToggle(void)
 {
     int on;
@@ -414,7 +423,7 @@ void xbox_OverlayFlip(double wait_ms, uint32_t draws, uint32_t vertices)
     float interval;
     struct ft_sample *s;
 
-    if (!xbox_OverlayEnabled())
+    if (!ft_sampling())
         return;
     now_ms = host_ms();
     s_frame_start_ms = now_ms;
@@ -494,7 +503,7 @@ void xbox_OverlayPresentDone(void)
 {
     double present_ms;
 
-    if (!xbox_OverlayEnabled())
+    if (!ft_sampling() || s_frame_start_ms <= 0.0)
         return;
     present_ms = host_ms() - s_frame_start_ms;
     if (present_ms < 0.0)

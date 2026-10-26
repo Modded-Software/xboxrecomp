@@ -320,6 +320,20 @@ int xbox_FramebufferMouseDelta(int *dx, int *dy)
     return (x || y);
 }
 
+/* Hand back the part of a delta the input layer could not use this poll. The
+ * per-poll clamp exists to stop a stuck cursor slamming the stick, but the
+ * motion above it is real and used to be discarded: a flick between two slow
+ * polls (or a whole hitch's worth of replayed motion) then turned the camera
+ * less than the hand did. Carrying the excess to the next poll keeps the total
+ * while still bounding any single poll. */
+void xbox_FramebufferMousePushback(int dx, int dy)
+{
+    if (dx)
+        InterlockedExchangeAdd(&s_mouse_dx, (LONG)dx);
+    if (dy)
+        InterlockedExchangeAdd(&s_mouse_dy, (LONG)dy);
+}
+
 int xbox_FramebufferMouseButton(int which)
 {
     if ((unsigned)which > 2)
@@ -396,6 +410,13 @@ static FILE *s_rec;
 static DWORD s_rec_start;
 static int s_rec_state = -1;
 
+/* Completed guest presents, published by the pushbuffer executor. A recording
+ * is anchored to this, not just to the wall clock: the same input at the same
+ * wall time lands in a different menu state when loading paced differently,
+ * which is how a replay ends up choosing another mission. The guest frame the
+ * event was captured in is the unit the menu logic actually counts. */
+extern volatile uint32_t g_present_flips;
+
 static void rec_init(void)
 {
     const char *path;
@@ -410,7 +431,7 @@ static void rec_init(void)
     }
     s_rec_start = GetTickCount();
     s_rec_state = 1;
-    fprintf(s_rec, "# recomp input record v1: t_ms type args\n");
+    fprintf(s_rec, "# recomp input record v2: t_ms frame type args\n");
     fflush(s_rec);
     fprintf(stderr, "[REC] recording input to %s\n", path);
 }
@@ -422,7 +443,8 @@ static void rec_event(const char *fmt, ...)
         rec_init();
     if (!s_rec)
         return;
-    fprintf(s_rec, "%lu ", (unsigned long)(GetTickCount() - s_rec_start));
+    fprintf(s_rec, "%lu %u ", (unsigned long)(GetTickCount() - s_rec_start),
+            (unsigned)g_present_flips);
     va_start(ap, fmt);
     vfprintf(s_rec, fmt, ap);
     va_end(ap);
@@ -430,11 +452,24 @@ static void rec_event(const char *fmt, ...)
     fflush(s_rec);
 }
 
-struct RecEvent { DWORD t; char type; long a, b; };
+struct RecEvent { DWORD t; uint32_t frame; char type; long a, b; };
 static struct RecEvent *s_rep;
 static int s_rep_n, s_rep_cap, s_rep_i;
+static int s_rep_framed;   /* 1: file carries guest frames (v2) */
 static DWORD s_rep_start;
 static int s_rep_state = -1;
+static unsigned long s_rep_keys_down, s_rep_keys_up, s_rep_buttons, s_rep_moves;
+static long s_rep_mouse_dx, s_rep_mouse_dy;
+
+/* A replay owns the input state. Live keyboard and mouse events otherwise mix
+ * into the same s_key_down / s_mouse_dx the recording feeds, so a stray move,
+ * a held key, or the compositor recentring the cursor changes the run and the
+ * replay no longer matches what was recorded. */
+static int rep_input_locked(void)
+{
+    const char *path = getenv("RECOMP_INPUT_REPLAY");
+    return path && *path;
+}
 
 static void rep_load(void)
 {
@@ -452,20 +487,41 @@ static void rep_load(void)
     while (fgets(line, sizeof line, f)) {
         struct RecEvent e;
         char ty = 0;
-        if (line[0] == '#' || line[0] == '\n')
+        if (line[0] == '#') {
+            if (strstr(line, "record v2"))
+                s_rep_framed = 1;
             continue;
-        e.a = e.b = 0;
-        if (sscanf(line, "%lu %c", &e.t, &ty) < 2)
+        }
+        if (line[0] == '\n')
             continue;
-        /* Key codes are recorded in hex ("k %x"); everything else is decimal. */
-        if (ty == 'k') {
-            unsigned long vk = 0;
-            long down = 0;
-            sscanf(line, "%lu %c %lx %li", &e.t, &ty, &vk, &down);
-            e.a = (long)vk;
-            e.b = down;
+        memset(&e, 0, sizeof e);
+        if (s_rep_framed) {
+            unsigned long frame = 0;
+            if (sscanf(line, "%lu %lu %c", &e.t, &frame, &ty) < 3)
+                continue;
+            e.frame = (uint32_t)frame;
+            if (ty == 'k') {
+                unsigned long vk = 0;
+                long down = 0;
+                sscanf(line, "%lu %lu %c %lx %li", &e.t, &frame, &ty, &vk, &down);
+                e.a = (long)vk;
+                e.b = down;
+            } else {
+                sscanf(line, "%lu %lu %c %li %li", &e.t, &frame, &ty, &e.a, &e.b);
+            }
         } else {
-            sscanf(line, "%lu %c %li %li", &e.t, &ty, &e.a, &e.b);
+            if (sscanf(line, "%lu %c", &e.t, &ty) < 2)
+                continue;
+            /* Key codes are recorded in hex ("k %x"); everything else is decimal. */
+            if (ty == 'k') {
+                unsigned long vk = 0;
+                long down = 0;
+                sscanf(line, "%lu %c %lx %li", &e.t, &ty, &vk, &down);
+                e.a = (long)vk;
+                e.b = down;
+            } else {
+                sscanf(line, "%lu %c %li %li", &e.t, &ty, &e.a, &e.b);
+            }
         }
         e.type = ty;
         if (s_rep_n == s_rep_cap) {
@@ -489,17 +545,37 @@ static void rep_load(void)
             xbox_FramebufferMouseCapture(1);
     }
     fprintf(stderr, "[REP] replaying %d events from %s\n", s_rep_n, path);
+    {
+        unsigned long down = 0, up = 0, buttons = 0, moves = 0;
+        long mdx = 0, mdy = 0;
+        for (int i = 0; i < s_rep_n; i++) {
+            if (s_rep[i].type == 'k') {
+                if (s_rep[i].b) down++; else up++;
+            } else if (s_rep[i].type == 'b') {
+                buttons++;
+            } else if (s_rep[i].type == 'm') {
+                moves++; mdx += s_rep[i].a; mdy += s_rep[i].b;
+            }
+        }
+        fprintf(stderr, "[REP] file holds: keys %lu down/%lu up, %lu button edges, "
+                        "%lu moves totalling %ld,%ld\n", down, up, buttons, moves, mdx, mdy);
+        fflush(stderr);
+    }
 }
 
-static void rep_apply(const struct RecEvent *e)
+static int rep_apply(const struct RecEvent *e)
 {
     switch (e->type) {
     case 'k':
         if ((unsigned)e->a < 256)
             s_key_down[e->a] = e->b ? 1 : 0;
+        if (e->b)
+            s_rep_keys_down++;
+        else
+            s_rep_keys_up++;
         if (getenv("RECOMP_KEY_TRACE")) {
             static unsigned n;
-            if (n++ < 80)
+            if (n++ < 400)
                 fprintf(stderr, "  [KEY] replay %s vk=0x%02X\n",
                         e->b ? "down" : "up", (unsigned)e->a);
         }
@@ -511,10 +587,14 @@ static void rep_apply(const struct RecEvent *e)
     case 'm':
         InterlockedExchangeAdd(&s_mouse_dx, (LONG)e->a);
         InterlockedExchangeAdd(&s_mouse_dy, (LONG)e->b);
+        s_rep_moves++;
+        s_rep_mouse_dx += e->a;
+        s_rep_mouse_dy += e->b;
         break;
     case 'b':
         if ((unsigned)e->a < 3)
             s_mouse_btn[e->a] = e->b ? 1 : 0;
+        s_rep_buttons++;
         break;
     case 'w':
         InterlockedExchangeAdd(&s_mouse_wheel, (LONG)e->a);
@@ -522,6 +602,7 @@ static void rep_apply(const struct RecEvent *e)
     default:
         break;
     }
+    return 1;
 }
 
 void fb_replay_poll(void)
@@ -532,8 +613,24 @@ void fb_replay_poll(void)
     if (!s_rep)
         return;
     now = GetTickCount() - s_rep_start;
-    while (s_rep_i < s_rep_n && s_rep[s_rep_i].t <= now)
-        rep_apply(&s_rep[s_rep_i++]);
+    /* Wall clock only. The title's logic is decoupled from the rendering
+     * framerate, so a frame count is not an input clock: gating on it made the
+     * replayed keys land in a different menu state as soon as this run drew at
+     * a different rate. The recording's own timestamps are the ground truth. */
+    while (s_rep_i < s_rep_n && s_rep[s_rep_i].t <= now) {
+        rep_apply(&s_rep[s_rep_i]);
+        s_rep_i++;
+    }
+    if (s_rep_i == s_rep_n && s_rep_n) {
+        static int reported;
+        if (!reported++) {
+            fprintf(stderr, "[REP] audit: %d events loaded, %d applied; keys %lu down/%lu up, "
+                            "%lu button edges, %lu moves totalling %ld,%ld; %d unapplied\n",
+                    s_rep_n, s_rep_i, s_rep_keys_down, s_rep_keys_up, s_rep_buttons,
+                    s_rep_moves, s_rep_mouse_dx, s_rep_mouse_dy, s_rep_n - s_rep_i);
+            fflush(stderr);
+        }
+    }
 }
 
 static void fb_exit_process(void)
@@ -572,6 +669,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 fprintf(stderr, "[FBWIN] failed to capture framebuffer to %s\n", path);
             return 0;
         }
+        /* The overlay toggles above stay live for the operator; game input does
+         * not. A replay must not have a live keypress join it. */
+        if (rep_input_locked())
+            return 0;
         /* Alt+Esc releases the mouse so the window can be moved or the desktop
          * reached; clicking the client grabs it again. Bare Esc is the game's
          * Back, so it must not release on its own. Alt is the only modifier the
@@ -620,6 +721,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYUP:
     case WM_SYSKEYUP:
+        if (rep_input_locked())
+            return 0;
         rec_event("k %x 0", (unsigned)w);
         if ((unsigned)w < 256)
             s_key_down[w] = 0;
@@ -627,6 +730,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_MOUSEMOVE: {
         int x = (int)(short)LOWORD(l), y = (int)(short)HIWORD(l);
+        if (rep_input_locked())
+            return 0;
         if (s_mouse_capture) {
             RECT c;
             int cx, cy;
@@ -672,7 +777,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
 
     case WM_INPUT: {
-        if (s_mouse_capture && s_mouse_raw) {
+        if (!rep_input_locked() && s_mouse_capture && s_mouse_raw) {
             RAWINPUT raw;
             UINT size = sizeof(raw);
             if (GetRawInputData((HRAWINPUT)l, RID_INPUT, &raw, &size,
@@ -698,18 +803,22 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_LBUTTONDOWN:
         /* Clicking into the game grabs the mouse for mouse-look; Esc releases
          * it again so the window can be dragged. */
+        if (rep_input_locked())
+            return 0;
         if (getenv("RECOMP_KBM"))
             xbox_FramebufferMouseCapture(1);
         rec_event("b 0 1");
         s_mouse_btn[0] = 1;
         return 0;
-    case WM_LBUTTONUP:   rec_event("b 0 0"); s_mouse_btn[0] = 0; return 0;
-    case WM_RBUTTONDOWN: rec_event("b 1 1"); s_mouse_btn[1] = 1; return 0;
-    case WM_RBUTTONUP:   rec_event("b 1 0"); s_mouse_btn[1] = 0; return 0;
-    case WM_MBUTTONDOWN: rec_event("b 2 1"); s_mouse_btn[2] = 1; return 0;
-    case WM_MBUTTONUP:   rec_event("b 2 0"); s_mouse_btn[2] = 0; return 0;
+    case WM_LBUTTONUP:   if (rep_input_locked()) return 0; rec_event("b 0 0"); s_mouse_btn[0] = 0; return 0;
+    case WM_RBUTTONDOWN: if (rep_input_locked()) return 0; rec_event("b 1 1"); s_mouse_btn[1] = 1; return 0;
+    case WM_RBUTTONUP:   if (rep_input_locked()) return 0; rec_event("b 1 0"); s_mouse_btn[1] = 0; return 0;
+    case WM_MBUTTONDOWN: if (rep_input_locked()) return 0; rec_event("b 2 1"); s_mouse_btn[2] = 1; return 0;
+    case WM_MBUTTONUP:   if (rep_input_locked()) return 0; rec_event("b 2 0"); s_mouse_btn[2] = 0; return 0;
 
     case WM_MOUSEWHEEL:
+        if (rep_input_locked())
+            return 0;
         rec_event("w %d", (int)(GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA));
         InterlockedExchangeAdd(&s_mouse_wheel,
                                (LONG)(GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA));
@@ -718,12 +827,15 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_SETFOCUS:
         return 0;
 
-    /* Alt-tabbing away with a key held would leave it held for ever. */
+    /* Alt-tabbing away with a key held would leave it held for ever. A replay
+     * owns the key state, so a focus change must not wipe it. */
     case WM_KILLFOCUS:
+        xbox_FramebufferMouseCapture(0);
+        if (rep_input_locked())
+            return 0;
         rec_event("u");
         memset((void *)s_key_down, 0, sizeof s_key_down);
         s_mouse_btn[0] = s_mouse_btn[1] = s_mouse_btn[2] = 0;
-        xbox_FramebufferMouseCapture(0);
         return 0;
 
     /* The window is never maximized. The WM force-fits a window larger than
@@ -1169,6 +1281,16 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         Sleep(4);
     }
 
+    if (s_rep) {
+        /* Proof that the replay delivered what the recording holds: the applied
+         * counts must match rep_load's total, and the mouse sum must match the
+         * file. A shortfall is the "input was dropped" case, named. */
+        fprintf(stderr, "[REP] audit: %d events loaded, %d applied; keys %lu down/%lu up, "
+                        "%lu button edges, %lu moves totalling %ld,%ld; %d unapplied\n",
+                s_rep_n, s_rep_i, s_rep_keys_down, s_rep_keys_up, s_rep_buttons,
+                s_rep_moves, s_rep_mouse_dx, s_rep_mouse_dy, s_rep_n - s_rep_i);
+        fflush(stderr);
+    }
     ReleaseDC(hwnd, hdc);
     DestroyWindow(hwnd);
     free(caption);
@@ -1211,6 +1333,7 @@ int xbox_FramebufferWindowSize(uint32_t *width, uint32_t *height)
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 int xbox_FramebufferMouseDelta(int *dx, int *dy) { if (dx) *dx = 0; if (dy) *dy = 0; return 0; }
+void xbox_FramebufferMousePushback(int dx, int dy) { (void)dx; (void)dy; }
 int xbox_FramebufferMouseButton(int which) { (void)which; return 0; }
 int xbox_FramebufferMouseWheel(void) { return 0; }
 void xbox_FramebufferMouseCapture(int on) { (void)on; }

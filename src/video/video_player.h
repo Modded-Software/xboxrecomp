@@ -68,6 +68,8 @@ int xbox_FramebufferKeyDown(int vk);
  * 2=M; wheel is in notches. Capture clips and recentres the cursor so movement
  * is unbounded. All zero when there is no window. */
 int xbox_FramebufferMouseDelta(int *dx, int *dy);
+/* Return motion the caller could not consume this poll; carried to the next. */
+void xbox_FramebufferMousePushback(int dx, int dy);
 int xbox_FramebufferMouseButton(int which);
 int xbox_FramebufferMouseWheel(void);
 void xbox_FramebufferMouseCapture(int on);
