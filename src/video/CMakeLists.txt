@@ -3,6 +3,7 @@ add_library(xbox_video STATIC
     video_player.c
     video_pump.c
     fb_present.c
+    fb_overlay.c
 )
 target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

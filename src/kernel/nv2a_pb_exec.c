@@ -4339,10 +4339,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * per-frame re-decode of render-to-texture surfaces. */
         if (s_gpu.pitch) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
+            extern void xbox_OverlayFlip(double, uint32_t, uint32_t);
+            extern void xbox_OverlayPresentDone(void);
+            extern int  xbox_OverlayEnabled(void);
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                : s_gpu.color_offset;
+            double wait_ms = 0.0;
+
             if (done) {
                 uint32_t show = done;
+                LARGE_INTEGER t0, t1;
+                QueryPerformanceCounter(&t0);
                 if (lazy_flip()) {
                     uint8_t *base = (uint8_t *)xbox_GetMemoryOffset() + dma_resolve(done);
                     uint32_t h = s_gpu.clip_y + s_gpu.clip_h;
@@ -4355,15 +4362,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 } else {
                     nv2a_pb_exec_flush();
                 }
+                QueryPerformanceCounter(&t1);
+                if (xbox_OverlayEnabled()) {
+                    LARGE_INTEGER freq;
+                    QueryPerformanceFrequency(&freq);
+                    wait_ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 /
+                              (double)freq.QuadPart;
+                }
                 present_pvideo_overlay(show);
                 xbox_FramebufferWindowSet(dma_resolve(show), s_gpu.pitch);
                 /* Keep publishing the finished frame (window-title FPS counter,
                  * F12 dump); the GDI blit itself is suspended when a hook is
                  * installed. The hook then presents the same frame through its
                  * own swap chain (e.g. for ReShade). */
+                xbox_OverlayFlip(wait_ms, s_gpu.draws, s_gpu.gpu_unique_vertices);
                 xbox_FramebufferWindowPresent(dma_resolve(show), s_gpu.pitch);
                 if (g_present_hook)
                     g_present_hook(dma_resolve(show), s_gpu.pitch, g_present_user);
+                xbox_OverlayPresentDone();
             } else {
                 nv2a_pb_exec_flush();
             }

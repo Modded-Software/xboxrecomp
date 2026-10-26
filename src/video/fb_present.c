@@ -31,6 +31,7 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern int xbox_VideoDesiredResolution(uint32_t *width, uint32_t *height);
 int xbox_FramebufferDumpBmp(const char *path);
+#include "fb_overlay.h"
 /* Display gamma ramp the guest programmed into the NV2A VGA DAC palette
  * (IDirect3DDevice8::SetGammaRamp -> CMiniport::DacProgramGammaRamp, captured
  * by the PRMDIO handler). Returns nonzero when the ramp is not identity. */
@@ -553,6 +554,13 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
         rec_event("k %x 1", (unsigned)w);
+        /* F9 (or F11): frametime overlay. Its graph and numbers are the only
+         * way to see pacing on the screen; the periodic log line carries the
+         * rest. */
+        if (w == VK_F9 || w == VK_F11) {
+            xbox_OverlayToggle();
+            return 0;
+        }
         if (w == VK_F12) {
             const char *path = getenv("RECOMP_FB_CAPTURE");
             if (!path || !path[0]) path = "framebuffer.bmp";
@@ -824,6 +832,14 @@ int xbox_FramebufferDumpBmp(const char *path)
 
     if (!s_rgb || !s_fb_va)
         return -1;
+    /* The overlay is composited into s_rgb for the screen; a capture should
+     * show the frame, not the diagnostic. Rebuild it from the finished frame. */
+    {
+        LONG idx = s_present_idx;
+        if (idx >= 0 && s_present[idx])
+            fb_gamma_apply(s_rgb, s_present[idx],
+                           (size_t)s_fb_width * s_fb_height);
+    }
     f = fopen(path, "wb");
     if (!f)
         return -1;
@@ -945,6 +961,18 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
     InterlockedExchange(&s_frame_draws, (LONG)draws);
 }
 
+/* Hand s_rgb to GDI, with the frametime panel composited over it when the
+ * overlay is on. s_rgb is also what the F12 dump reads, so the dump restores
+ * the clean frame first. */
+static void fb_blit(HDC hdc, const BITMAPINFO *bi)
+{
+    xbox_OverlayComposite(s_rgb, (int)s_fb_width, (int)s_fb_height,
+                          (int)s_fb_width);
+    StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+                  0, 0, (int)s_fb_width, (int)s_fb_height,
+                  s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
@@ -963,6 +991,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     FbWindowIcons icons = {0};
 
     (void)unused;
+    xbox_OverlayInit();
     if (!caption)
         fprintf(stderr, "[FBWIN] cannot allocate window-title statistics buffer\n");
     else if (!QueryPerformanceFrequency(&title_frequency) || title_frequency.QuadPart <= 0 ||
@@ -1057,6 +1086,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             s_fb_width, s_fb_height);
 
     long last_drawn = -2;
+    DWORD last_blit = 0;
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         MSG msg;
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -1100,10 +1130,21 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 if (s_present[idx])
                     fb_gamma_apply(s_rgb, s_present[idx],
                                    (size_t)s_fb_width * s_fb_height);
-                StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                              0, 0, (int)s_fb_width, (int)s_fb_height,
-                              s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+                fb_blit(hdc, &bi);
                 last_drawn = idx;
+                last_blit = GetTickCount();
+            } else if (xbox_OverlayEnabled() && s_present[idx]) {
+                /* Frames have stopped: keep the overlay's stall clock moving
+                 * so a freeze is visible on screen instead of just frozen
+                 * bars. Re-render the clean frame first, since the previous
+                 * blit baked the panel into s_rgb. */
+                DWORD now = GetTickCount();
+                if (now - last_blit >= 200) {
+                    fb_gamma_apply(s_rgb, s_present[idx],
+                                   (size_t)s_fb_width * s_fb_height);
+                    fb_blit(hdc, &bi);
+                    last_blit = now;
+                }
             }
         } else if (!InterlockedCompareExchange(&s_fb_suspend, 0, 0) &&
                    s_fb_va && s_fb_pitch && s_rgb) {
@@ -1112,9 +1153,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            fb_blit(hdc, &bi);
         }
         /* Pump often enough to sample WM_INPUT/WM_KEYDOWN smoothly, but not
          * so tightly that the window thread monopolises a core. Rendering is

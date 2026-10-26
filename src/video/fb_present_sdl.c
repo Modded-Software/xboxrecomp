@@ -45,6 +45,7 @@
 #include <time.h>
 
 #include "video_player.h"
+#include "fb_overlay.h"
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -148,6 +149,11 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
     for (y = 0; y < FB_H; y++)
         memcpy(s->px + (size_t)y * FB_W * bpp, src + (size_t)y * pitch,
                (size_t)FB_W * bpp);
+    /* Frametime panel, on the copy rather than the guest surface. Only 32-bit
+     * frames: the RGB565 path has no matching pixel layout here. */
+    if (bpp == 4)
+        xbox_OverlayComposite((uint32_t *)s->px, (int)FB_W, (int)FB_H,
+                              (int)FB_W);
     publish(bpp);
 }
 
@@ -361,6 +367,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 /* Keys for the pad stand-in, and the window events that
                  * release them; it only reads the event. */
                 xbox_InputSdlEvent(&ev);
+                /* F9 (or F11): frametime overlay, as on the GDI window. */
+                if (ev.type == SDL_KEYDOWN
+                    && (ev.key.keysym.sym == SDLK_F9
+                        || ev.key.keysym.sym == SDLK_F11))
+                    xbox_OverlayToggle();
                 if (ev.type == SDL_QUIT)
                     quit = 1;
                 else if (ev.type == s_guest_done_event)
