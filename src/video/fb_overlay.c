@@ -321,10 +321,13 @@ void xbox_OverlayComposite(uint32_t *px, int w, int h, int stride)
     panel_h = FT_PANEL_H_UNITS * scale;
     if (panel_w > w) panel_w = w;
     if (panel_h > h) panel_h = h;
-    gx = pad;
+    /* Top right: the safe corners of a HUD are the upper ones, but the left
+     * one sits over the title's own readouts. */
+    gx = w - panel_w + pad / 2;
     gy = pad + 4 * line_h;
     gw = panel_w - 2 * pad;
     gh = panel_h - gy - pad;
+    if (gx < pad) gx = pad;
     if (gw < 16 || gh < 8)
         return;
 
@@ -339,7 +342,7 @@ void xbox_OverlayComposite(uint32_t *px, int w, int h, int stride)
     if (ymax > (float)(s_target_ms * 8.0))
         ymax = (float)(s_target_ms * 8.0);
 
-    fill_rect(px, w, h, stride, pad / 2, pad / 2, panel_w - pad / 3,
+    fill_rect(px, w, h, stride, gx - pad / 2, pad / 2, panel_w - pad / 3,
               panel_h, 0x000000, 190);
     fill_rect(px, w, h, stride, gx, gy, gw, gh, 0x101010, 110);
     {
