@@ -358,6 +358,7 @@ struct CachedTexture {
     uint32_t mip_levels;
     uint64_t bytes;
     uint64_t validated_serial;   /* frame serial this entry's memcmp last matched */
+    uint64_t full_serial;        /* frame serial of the last whole-image compare */
     bool force_validate;         /* a GPU blit overwrote this image; re-check now */
     std::vector<uint8_t> source_snapshot;
     ComPtr<ID3D11ShaderResourceView> view;
@@ -1305,6 +1306,40 @@ static void publish_known_clear(SurfaceType &surface, uint32_t bytes)
  */
 static uint64_t s_texture_validate_serial = 1;
 static int s_tex_validate_once = -1;
+
+/* Comparing every cached texture against its snapshot costs real time: a busy
+ * scene re-validates ~37 textures a frame, 37 GiB of memcmp per 100 s.
+ *
+ * Sample first and only walk the whole image when something looks wrong. The
+ * samples are cache lines spread over the image, so a texture the title has
+ * rewritten is caught immediately; a title that rewrote a few bytes between
+ * sample points is not. To bound that, each entry still gets a full compare
+ * once every kTextureFullValidateFrames frames (about a second at 40-60 FPS),
+ * so a missed edit is corrected within a frame or two instead of never.
+ * RECOMP_TEX_SAMPLE_VALIDATE=0 restores the always-full behaviour. */
+static const uint64_t kTextureFullValidateFrames = 32;
+static int s_tex_sample_validate = -1;
+static bool tex_sample_validate(void)
+{
+    if (s_tex_sample_validate < 0) {
+        const char *value = std::getenv("RECOMP_TEX_SAMPLE_VALIDATE");
+        s_tex_sample_validate = (value && value[0] == '0') ? 0 : 1;
+    }
+    return s_tex_sample_validate != 0;
+}
+
+static bool texture_samples_match(const uint8_t *snapshot, const uint8_t *source, size_t bytes)
+{
+    const size_t chunk = 64;
+    const size_t slots = 16;
+    if (bytes < chunk * slots) return false;
+    for (size_t slot = 0; slot < slots; slot++) {
+        size_t at = (bytes - chunk) * slot / (slots - 1);
+        if (std::memcmp(snapshot + at, source + at, chunk) != 0) return false;
+    }
+    return true;
+}
+
 static bool tex_validate_once(void)
 {
     if (s_tex_validate_once < 0) {
@@ -2397,26 +2432,20 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
             if (tex_validate_once() && !texture.force_validate &&
                     texture.validated_serial == s_texture_validate_serial)
                 return texture.view.Get();
-            gpu_timing.memcmp_bytes += binding.source_bytes;
-            if (hash_debug() && binding.source_bytes >= 262144u) {
-                static std::vector<uintptr_t> seen;
-                if (seen.size() < 64 && std::find(seen.begin(), seen.end(), (uintptr_t)binding.source) == seen.end()) {
-                    seen.push_back((uintptr_t)binding.source);
-                    const Surface *match = nullptr;
-                    for (const auto &surface : surfaces)
-                        if (surface.memory == binding.source) { match = &surface; break; }
-                    std::fprintf(stderr, "[HASHDBG] src=0x%08llX bytes=%llu %ux%u fmt=%X linear=%u pitch=%u; surface=%s",
-                                 (unsigned long long)(uintptr_t)binding.source,
-                                 (unsigned long long)binding.source_bytes,
-                                 binding.width, binding.height, binding.format, binding.linear, binding.pitch,
-                                 match ? "yes" : "no");
-                    if (match)
-                        std::fprintf(stderr, " (w%u h%u pitch%u dirty%u)",
-                                     match->width, match->height, match->pitch, (unsigned)match->dirty);
-                    std::fprintf(stderr, "\n");
-                }
+            bool same;
+            if (binding.source_bytes >= 1024 && tex_sample_validate() &&
+                    s_texture_validate_serial - texture.full_serial < kTextureFullValidateFrames) {
+                same = texture_samples_match(texture.source_snapshot.data(),
+                                             binding.source, binding.source_bytes);
+                if (same) gpu_timing.memcmp_bytes += 16 * 64;
+                else gpu_timing.memcmp_bytes += binding.source_bytes;
+            } else {
+                gpu_timing.memcmp_bytes += binding.source_bytes;
+                same = std::memcmp(texture.source_snapshot.data(), binding.source,
+                                   binding.source_bytes) == 0;
+                if (same) texture.full_serial = s_texture_validate_serial;
             }
-            if (std::memcmp(texture.source_snapshot.data(), binding.source, binding.source_bytes) == 0) {
+            if (same) {
                 texture.validated_serial = s_texture_validate_serial;
                 texture.force_validate = false;
                 return texture.view.Get();
@@ -2538,6 +2567,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                                       data[subresource].pSysMem, data[subresource].SysMemPitch, data[subresource].SysMemSlicePitch);
         refresh->source_snapshot.assign(binding.source, binding.source + binding.source_bytes);
         refresh->validated_serial = s_texture_validate_serial;
+        refresh->full_serial = s_texture_validate_serial;
         gpu_timing.texture_updated++;
         gpu_timing.texture_update_bytes += resource_bytes;
         return refresh->view.Get();
@@ -2555,6 +2585,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     entry.depth = binding.depth;
     entry.mip_levels = levels; entry.bytes = resource_bytes;
     entry.validated_serial = s_texture_validate_serial;
+    entry.full_serial = s_texture_validate_serial;
     if (binding.depth) {
         D3D11_TEXTURE3D_DESC volume_description = {};
         volume_description.Width = binding.width; volume_description.Height = binding.height;
