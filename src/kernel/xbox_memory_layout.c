@@ -14,6 +14,7 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "nv2a_gpu.h"
 #include "guest_vmem.h"
 #include "recomp_prof.h"
 #include "crash_dump.h"
@@ -1408,6 +1409,38 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                             kick_n = 0;
                             kick_walk_ticks = 0;
                             kick_window = GetTickCount();
+                        }
+                    }
+                    /* RECOMP_GPU_STATS=1: the D3D11 backend's own timers
+                     * (draw / texture / sync / readback / publish), cumulative
+                     * since launch, every ten seconds. The same summary prints
+                     * at exit, but a session that ends in a kill never gets
+                     * there -- and a session that is stuttering is the one
+                     * whose summary is wanted. */
+                    {
+                        static int gpu_stats = -1;
+                        static DWORD gpu_window;
+                        DWORD gpu_now = GetTickCount();
+                        if (gpu_stats < 0) {
+                            gpu_stats = getenv("RECOMP_GPU_STATS") != NULL;
+                            gpu_window = gpu_now;
+                        }
+                        if (gpu_stats && gpu_now - gpu_window >= 10000) {
+                            extern void nv2a_pb_exec_times(double *, double *,
+                                    unsigned long long *, unsigned long long *,
+                                    unsigned long long *);
+                            double prepare = 0.0, submit = 0.0;
+                            unsigned long long vertices = 0, memset_bytes = 0, fetches = 0;
+                            gpu_window = gpu_now;
+                            nv2a_pb_exec_times(&prepare, &submit, &vertices,
+                                               &memset_bytes, &fetches);
+                            fprintf(stderr, "  [PB-PROF] prepare %.3fs backend %.3fs; "
+                                    "vertex staging %llu (%.0f MiB memset), "
+                                    "%llu attribute fetches (cumulative)\n",
+                                    prepare, submit, vertices,
+                                    (double)memset_bytes / 1048576.0, fetches);
+                            nv2a_gpu_report();
+                            fflush(stderr);
                         }
                     }
                     /* Periodic, because what the title submits at init is not

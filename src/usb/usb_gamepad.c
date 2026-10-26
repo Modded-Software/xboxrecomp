@@ -571,7 +571,8 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
 
     /* A disconnected host pad is not an error here: the device is present on
      * the bus either way, it just reports nothing pressed. */
-    /* RECOMP_INPUT_DIAG: the whole chain on one line, once a second.
+    /* RECOMP_INPUT_DIAG: the whole chain on one line, once a second, plus the
+     * peaks seen since the previous line.
      *
      * "Nothing happens when I press a key" has several candidate causes and
      * guessing between them costs a rebuild each: the variable not read,
@@ -579,9 +580,12 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
      * not receiving the key, or the report going out without it. Printing
      * all four together answers it in one run.
      *
-     * It samples the held state, so pair it with the window's own
-     * RECOMP_KEY_TRACE: that answers "did the key arrive", this answers
-     * "is the chain wired". */
+     * The peak columns exist because the instantaneous ones miss a tap: a
+     * one-second sample of held state prints 0x0000 for every short press,
+     * which reads as "input is dead" when the chain is fine. The instantaneous
+     * columns still answer "is the key down right now"; the peaks answer "did
+     * anything arrive at all". Pair with RECOMP_KEY_TRACE for the arrival side.
+     */
     {
         static int diag = -1;
         if (diag < 0)
@@ -589,15 +593,36 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
         if (diag) {
             extern int xbox_FramebufferKeyDown(int vk);
             static unsigned long last;
+            static unsigned peak_buttons;
+            static unsigned peak_ab[4];
+            static int peak_lx, peak_ly, peak_rx, peak_ry;
+            XBOX_INPUT_STATE probe;
+            DWORD rc = xbox_InputGetState(0, &probe);
             unsigned long now = (unsigned long)GetTickCount();
+            int i;
+
+            if (rc == 0) {
+                int v;
+                peak_buttons |= probe.Gamepad.wButtons;
+                for (i = 0; i < 4; i++)
+                    if (probe.Gamepad.bAnalogButtons[i] > peak_ab[i])
+                        peak_ab[i] = probe.Gamepad.bAnalogButtons[i];
+                v = probe.Gamepad.sThumbLX; if (v < 0) v = -v;
+                if (v > peak_lx) peak_lx = v;
+                v = probe.Gamepad.sThumbLY; if (v < 0) v = -v;
+                if (v > peak_ly) peak_ly = v;
+                v = probe.Gamepad.sThumbRX; if (v < 0) v = -v;
+                if (v > peak_rx) peak_rx = v;
+                v = probe.Gamepad.sThumbRY; if (v < 0) v = -v;
+                if (v > peak_ry) peak_ry = v;
+            }
             if (now - last > 1000) {
-                XBOX_INPUT_STATE probe;
-                DWORD rc = xbox_InputGetState(0, &probe);
                 last = now;
                 fprintf(stderr, "  [INPUT] t=%lu kbd_env=%s window_has_RETURN=%d "
                         "window_has_SPACE=%d InputGetState=%lu buttons=0x%04X "
                         "A=%u B=%u X=%u Y=%u BL=%u WH=%u LT=%u RT=%u "
-                        "LX=%d LY=%d RX=%d RY=%d\n",
+                        "LX=%d LY=%d RX=%d RY=%d "
+                        "| peak=0x%04X A%u B%u X%u Y%u |LX|%d |LY|%d |RX|%d |RY|%d\n",
                         now,
                         getenv("RECOMP_KEYBOARD") ? getenv("RECOMP_KEYBOARD") : "(unset)",
                         xbox_FramebufferKeyDown(0x0D),
@@ -615,8 +640,13 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
                         rc == 0 ? probe.Gamepad.sThumbLX : 0,
                         rc == 0 ? probe.Gamepad.sThumbLY : 0,
                         rc == 0 ? probe.Gamepad.sThumbRX : 0,
-                        rc == 0 ? probe.Gamepad.sThumbRY : 0);
+                        rc == 0 ? probe.Gamepad.sThumbRY : 0,
+                        peak_buttons, peak_ab[0], peak_ab[1], peak_ab[2], peak_ab[3],
+                        peak_lx, peak_ly, peak_rx, peak_ry);
                 fflush(stderr);
+                peak_buttons = 0;
+                peak_ab[0] = peak_ab[1] = peak_ab[2] = peak_ab[3] = 0;
+                peak_lx = peak_ly = peak_rx = peak_ry = 0;
             }
         }
     }

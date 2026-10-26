@@ -4645,6 +4645,19 @@ static void peek_chain(void)
     fflush(stderr);
 }
 
+/* Cheap read of the executor's own clocks, for a periodic report: the summary
+ * above only prints at shutdown, which a killed session never reaches. */
+void nv2a_pb_exec_times(double *prepare, double *submit,
+                        unsigned long long *vertices, unsigned long long *mem_bytes,
+                        unsigned long long *attribute_fetches)
+{
+    *prepare = s_gpu.gpu_prepare_seconds;
+    *submit = s_gpu.gpu_submit_seconds;
+    *vertices = (unsigned long long)s_gpu.gpu_unique_vertices;
+    *mem_bytes = (unsigned long long)s_gpu.gpu_memset_bytes;
+    *attribute_fetches = (unsigned long long)s_gpu.gpu_attribute_fetches;
+}
+
 void nv2a_pb_exec_report(void)
 {
     s_gpu.flush_report++;
