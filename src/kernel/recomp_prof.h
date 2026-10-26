@@ -43,6 +43,10 @@ int recomp_prof_active(void);
 void recomp_prof_print_stack(FILE *out, const char *indent);
 /* Print every registered thread's shadow stack (racy snapshot; diagnostic). */
 void recomp_prof_print_all_stacks(FILE *out, const char *indent);
+/* Entry count for one guest function VA, across threads; 0 when the build is
+ * not instrumented. For a hang: two samples a second apart say whether a call
+ * is still being made, which a stack alone cannot. */
+unsigned long long recomp_prof_calls(uint32_t va);
 /* Write the profile table now (stderr summary + CSV). */
 void recomp_prof_report(void);
 

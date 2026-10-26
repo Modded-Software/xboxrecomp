@@ -1428,17 +1428,18 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         if (gpu_stats && gpu_now - gpu_window >= 10000) {
                             extern void nv2a_pb_exec_times(double *, double *,
                                     unsigned long long *, unsigned long long *,
-                                    unsigned long long *);
+                                    unsigned long long *, unsigned long long *);
                             double prepare = 0.0, submit = 0.0;
                             unsigned long long vertices = 0, memset_bytes = 0, fetches = 0;
+                            unsigned long long batches = 0;
                             gpu_window = gpu_now;
                             nv2a_pb_exec_times(&prepare, &submit, &vertices,
-                                               &memset_bytes, &fetches);
+                                               &memset_bytes, &fetches, &batches);
                             fprintf(stderr, "  [PB-PROF] prepare %.3fs backend %.3fs; "
                                     "vertex staging %llu (%.0f MiB memset), "
-                                    "%llu attribute fetches (cumulative)\n",
+                                    "%llu attribute fetches, %llu batches (cumulative)\n",
                                     prepare, submit, vertices,
-                                    (double)memset_bytes / 1048576.0, fetches);
+                                    (double)memset_bytes / 1048576.0, fetches, batches);
                             nv2a_gpu_report();
                             fflush(stderr);
                         }
@@ -2179,12 +2180,49 @@ static void watchdog_sample(const char *tag)
         fprintf(stderr, "  icalls so far: %llu\n",
                 (unsigned long long)g_icall_count);
         fprintf(stderr, "  recent ICALL targets:");
-        for (k = 0; k < 16; k++)
-            fprintf(stderr, " %08X",
-                    g_icall_trace[(g_icall_trace_idx + k) & 15]);
+        for (k = 0; k < 16; k++) {
+            uint32_t t = g_icall_trace[(g_icall_trace_idx + k) & 15];
+            ULONG ord = xbox_KernelSlotOrdinal(t);
+            /* A synthetic thunk VA names the export being called, which is the
+             * whole point of the trace for a spin inside a kernel wait. */
+            if (ord)
+                fprintf(stderr, " %08X(ord %lu)", t, (unsigned long)ord);
+            else
+                fprintf(stderr, " %08X", t);
+        }
         fprintf(stderr, "\n");
         fprintf(stderr, "  ack phase: %d\n", g_ack_phase);
     }
+    /* Is the title still calling its swap? A frozen window with the renderer
+     * still drawing is either "swap is called and gated" or "swap is never
+     * called", and only the per-second delta on these counters tells them
+     * apart. Instrumented build only; a plain build reports zeros. */
+    {
+        static const struct { uint32_t va; const char *name; } sites[] = {
+            { 0x002CF0F0u, "Swap" },
+            { 0x002CEDB0u, "SwapCopy" },
+            { 0x002CEFA0u, "SwapFlip" },
+            { 0x002C6490u, "BlockOnTime" },
+            { 0x002C62B0u, "KickOff" },
+        };
+        static unsigned long long prev[sizeof sites / sizeof sites[0]];
+        size_t i;
+
+        fprintf(stderr, "  swap gate, calls per second:");
+        for (i = 0; i < sizeof sites / sizeof sites[0]; i++) {
+            unsigned long long n = recomp_prof_calls(sites[i].va);
+            unsigned long long d = n >= prev[i] ? n - prev[i] : 0;
+            prev[i] = n;
+            fprintf(stderr, " %s +%llu", sites[i].name, d);
+        }
+        fprintf(stderr, "\n");
+    }
+    /* While stalled, the backend's cumulative counters once a second: the
+     * deltas name the host-side subsystem that is eating the frame. Guest
+     * self time alone cannot: a thread waiting inside the emulator spends no
+     * guest time at all, so a stalled frame looks idle in the profile. */
+    if (getenv("RECOMP_GPU_STATS"))
+        nv2a_gpu_report();
     /* Guest globals worth seeing at the moment of the hang.
      *
      * RECOMP_PEEK is otherwise only sampled by the pushbuffer reporter, which

@@ -509,6 +509,10 @@ void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
  * zeroed if never configured.
  */
 void xbox_kernel_get_thunk_address(uint32_t *xbox_va, uint32_t *count);
+/* Ordinal behind a synthetic thunk VA (0xFE000000 + slot*4), 0 if not one.
+ * Diagnostics only: lets a hang report say which kernel export is being
+ * called in a loop, from an indirect-call trace that holds only VAs. */
+ULONG xbox_KernelSlotOrdinal(uint32_t va);
 
 extern ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE];
 

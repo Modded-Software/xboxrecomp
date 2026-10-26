@@ -10058,6 +10058,13 @@ void xbox_kernel_get_thunk_address(uint32_t *xbox_va, uint32_t *count)
     if (count)  *count  = g_thunk_table_count;
 }
 
+ULONG xbox_KernelSlotOrdinal(uint32_t va)
+{
+    if (va < KERNEL_VA_BASE || va >= KERNEL_VA_END)
+        return 0;
+    return g_slot_ordinals[(va - KERNEL_VA_BASE) / 4];
+}
+
 void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
 {
     if (!xbox_va) {

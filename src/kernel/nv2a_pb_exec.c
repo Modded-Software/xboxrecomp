@@ -4649,13 +4649,14 @@ static void peek_chain(void)
  * above only prints at shutdown, which a killed session never reaches. */
 void nv2a_pb_exec_times(double *prepare, double *submit,
                         unsigned long long *vertices, unsigned long long *mem_bytes,
-                        unsigned long long *attribute_fetches)
+                        unsigned long long *attribute_fetches, unsigned long long *batches)
 {
     *prepare = s_gpu.gpu_prepare_seconds;
     *submit = s_gpu.gpu_submit_seconds;
     *vertices = (unsigned long long)s_gpu.gpu_unique_vertices;
     *mem_bytes = (unsigned long long)s_gpu.gpu_memset_bytes;
     *attribute_fetches = (unsigned long long)s_gpu.gpu_attribute_fetches;
+    *batches = (unsigned long long)s_gpu.gpu_batches;
 }
 
 void nv2a_pb_exec_report(void)

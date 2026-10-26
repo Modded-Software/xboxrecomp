@@ -300,6 +300,27 @@ void recomp_prof_print_all_stacks(FILE *out, const char *indent)
 
 typedef struct { uint32_t va; const char *name; uint64_t calls, incl, self; } merged;
 
+unsigned long long recomp_prof_calls(uint32_t va)
+{
+    unsigned long long total = 0;
+    long nt = g_nthreads, ti;
+    unsigned i;
+
+    if (!g_active)
+        return 0;
+    if (nt > PROF_THREADS)
+        nt = PROF_THREADS;
+    for (ti = 0; ti < nt; ti++) {
+        const prof_thread *t = g_threads[ti];
+        if (!t)
+            continue;
+        for (i = 0; i < PROF_SLOTS; i++)
+            if (t->table[i].name && t->table[i].calls && t->table[i].va == va)
+                total += t->table[i].calls;
+    }
+    return total;
+}
+
 static int by_self(const void *a, const void *b)
 {
     const merged *x = (const merged *)a, *y = (const merged *)b;
