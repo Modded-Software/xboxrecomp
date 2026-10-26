@@ -2078,6 +2078,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    xbox_IrqlNoteDpc(routine);
     { int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     return 1;
 }
@@ -2763,8 +2764,8 @@ static void kernel_nv2a_software_tick(void)
     g_ecx = g_nv2a_software.context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = g_nv2a_software.parameter;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    old_irql = xbox_IrqlEnterInterrupt(2);  /* DISPATCH_LEVEL */
-    {
+    xbox_IrqlNoteSoftwareMethod();
+    old_irql = xbox_IrqlEnterInterrupt(2);  /* DISPATCH_LEVEL */    {
         /* A routine that blocks wedges the shared timer thread (DPCs, audio). */
         static unsigned slow_n;
         long long t0 = kernel_counter(), dt;

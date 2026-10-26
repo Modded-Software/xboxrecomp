@@ -843,6 +843,9 @@ int     xbox_IrqlBlocksInterrupts(void);
 int     xbox_IrqlRaisedCount(void);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
 void    xbox_IrqlLeaveInterrupt(int saved);
+/* Name the deferred work about to run at DISPATCH, for the long-hold report. */
+void    xbox_IrqlNoteDpc(uint32_t routine_va);
+void    xbox_IrqlNoteSoftwareMethod(void);
 
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
  * A depth that is non-zero while this stops moving is stuck, not busy. */

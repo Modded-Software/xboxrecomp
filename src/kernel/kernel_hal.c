@@ -16,6 +16,7 @@
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -76,18 +77,81 @@ static int g_dispatch_enabled = 1;
 static volatile LONG g_dispatch_owner;          /* host tid, 0 = free */
 static RECOMP_TLS int t_dispatch_held;           /* recursion depth on this thread */
 
-/* Who holds the processor and since when, for the long-hold report. */
+/* Who holds the processor and since when, for the long-hold report.
+ *
+ * The guest stack top was printed as a "guest return address" before, but
+ * MEM32(esp) is only a return address at a call boundary: mid-function it is
+ * whatever data the routine parked there, which is how a heap pointer
+ * (0x04C07F74, above the 64 MB RAM end) ended up named as code. Scan the stack
+ * for words in the loaded code range instead, and name the raise path and the
+ * DPC routine, which the holder knows and nothing had recorded. */
 extern RECOMP_TLS uint32_t g_esp;
 extern ptrdiff_t g_xbox_mem_offset;
 static volatile DWORD g_dispatch_since;          /* GetTickCount at acquire */
-static volatile uint32_t g_dispatch_owner_ra;    /* guest return address at acquire */
+static volatile uint32_t g_dispatch_owner_esp;   /* owner's guest esp at acquire */
 static volatile LONG g_dispatch_owner_kind;      /* 0 guest raise, 1 DPC */
+static volatile uint32_t g_dispatch_owner_dpc;   /* DPC routine VA, 0 for a raise */
+static char g_dispatch_owner_site[40];           /* "KfRaiseIrql", "KeAcquireSpinLock", ... */
 #define DISPATCH_LONG_MS 50
 
-static uint32_t dispatch_guest_ra(void)
+/* Loaded code sections run from .text at 0x00012000 to the end of XPP; .rdata
+ * starts at 0x00361740, so anything below that is a plausible call target. */
+#define GUEST_CODE_LO 0x00012000u
+#define GUEST_CODE_HI 0x00361740u
+
+/* Up to four stack words that look like return addresses, nearest first. The
+ * lift keeps no frame chain, so this is a heuristic -- but a better one than
+ * trusting one slot. */
+static int dispatch_scan_stack(uint32_t esp, uint32_t out[4])
 {
-    return g_esp ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
+    int n = 0;
+    uint32_t off;
+
+    if (!esp)
+        return 0;
+    for (off = 0; off < 1024 && n < 4; off += 4) {
+        uint32_t v = *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + esp + off);
+        if (v >= GUEST_CODE_LO && v < GUEST_CODE_HI)
+            out[n++] = v;
+    }
+    return n;
 }
+
+static void dispatch_print_code(uint32_t esp)
+{
+    uint32_t code[4];
+    int n = dispatch_scan_stack(esp, code);
+    int i;
+
+    if (!n) {
+        fprintf(stderr, "(no code words near esp %08X)", esp);
+        return;
+    }
+    for (i = 0; i < n; i++)
+        fprintf(stderr, "%s%08X", i ? " " : "", code[i]);
+}
+
+/* TLS note set by the caller: which deferred routine is about to run at
+ * DISPATCH, and what kind it is. */
+static RECOMP_TLS uint32_t t_pending_dpc;
+static RECOMP_TLS const char *t_pending_site;
+
+void xbox_IrqlNoteDpc(uint32_t routine_va)
+{
+    t_pending_dpc = routine_va;
+    t_pending_site = "DPC";
+}
+
+void xbox_IrqlNoteSoftwareMethod(void)
+{
+    t_pending_dpc = 0;
+    t_pending_site = "software-method";
+}
+
+/* Shadow-stack module: an ordinary build links it but never enters it, and
+ * these queries then report "not available" rather than an empty stack. */
+int recomp_prof_active(void);
+void recomp_prof_print_all_stacks(FILE *out, const char *indent);
 
 static BOOL CALLBACK dispatch_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
@@ -101,7 +165,7 @@ static BOOL CALLBACK dispatch_init(PINIT_ONCE o, PVOID p, PVOID *c)
     return TRUE;
 }
 
-static void dispatch_acquire(int kind)
+static void dispatch_acquire(int kind, const char *site)
 {
     LONG me;
     DWORD start;
@@ -133,14 +197,18 @@ static void dispatch_acquire(int kind)
                             "PMC_INTR_0=%08X PCRTC_INTR_0=%08X\n",
                             g_ack_phase, pmc ? *pmc : 0xDEADu,
                             crtc ? *crtc : 0xDEADu);
-                    fprintf(stderr, "  [DISPATCH-WAIT] tid %lu (%s, guest ra %08X) "
-                            "blocked %d ms by owner tid %lu (%s, guest ra %08X, "
-                            "held %lu ms)\n",
-                            (unsigned long)me, kind ? "dpc" : "raise",
-                            dispatch_guest_ra(), DISPATCH_LONG_MS,
+                    fprintf(stderr, "  [DISPATCH-WAIT] tid %lu (%s %s) blocked %d ms "
+                            "by owner tid %lu (%s%s, esp %08X, code ",
+                            (unsigned long)me, kind ? "dpc" : "raise", site,
+                            DISPATCH_LONG_MS,
                             (unsigned long)g_dispatch_owner,
-                            g_dispatch_owner_kind ? "dpc" : "raise",
-                            g_dispatch_owner_ra,
+                            g_dispatch_owner_kind ? "dpc " : "raise ",
+                            g_dispatch_owner_site,
+                            g_dispatch_owner_esp);
+                    if (g_dispatch_owner_dpc)
+                        fprintf(stderr, "0x%08X ", g_dispatch_owner_dpc);
+                    dispatch_print_code(g_dispatch_owner_esp);
+                    fprintf(stderr, ", held %lu ms)\n",
                             (unsigned long)(GetTickCount() - g_dispatch_since));
                     fflush(stderr);
                 }
@@ -160,8 +228,18 @@ static void dispatch_acquire(int kind)
         }
     }
     g_dispatch_since = GetTickCount();
-    g_dispatch_owner_ra = dispatch_guest_ra();
+    g_dispatch_owner_esp = g_esp;
     g_dispatch_owner_kind = kind;
+    g_dispatch_owner_dpc = kind ? t_pending_dpc : 0;
+    t_pending_dpc = 0;
+    {
+        size_t n = site ? strlen(site) : 0;
+        if (n >= sizeof g_dispatch_owner_site)
+            n = sizeof g_dispatch_owner_site - 1;
+        if (n)
+            memcpy(g_dispatch_owner_site, site, n);
+        g_dispatch_owner_site[n] = 0;
+    }
     InterlockedExchange(&g_dispatch_owner, me);
     t_dispatch_held = 1;
 }
@@ -177,13 +255,30 @@ static void dispatch_release(void)
     if (held >= DISPATCH_LONG_MS) {
         static volatile LONG nh;
         if (InterlockedIncrement(&nh) <= 200) {
-            fprintf(stderr, "  [DISPATCH-HOLD] tid %lu (%s) held DISPATCH %lu ms, "
-                    "acquired at guest ra %08X, released at guest ra %08X\n",
-                    (unsigned long)GetCurrentThreadId(),
-                    g_dispatch_owner_kind ? "dpc" : "raise",
-                    (unsigned long)held, g_dispatch_owner_ra,
-                    dispatch_guest_ra());
+            if (g_dispatch_owner_dpc)
+                fprintf(stderr, "  [DISPATCH-HOLD] tid %lu (dpc 0x%08X, esp %08X) "
+                        "held DISPATCH %lu ms, code ",
+                        (unsigned long)GetCurrentThreadId(), g_dispatch_owner_dpc,
+                        g_dispatch_owner_esp, (unsigned long)held);
+            else
+                fprintf(stderr, "  [DISPATCH-HOLD] tid %lu (raise %s, esp %08X) "
+                        "held DISPATCH %lu ms, code ",
+                        (unsigned long)GetCurrentThreadId(), g_dispatch_owner_site,
+                        g_dispatch_owner_esp, (unsigned long)held);
+            dispatch_print_code(g_dispatch_owner_esp);
+            fprintf(stderr, "\n");
             fflush(stderr);
+            /* Long enough to matter, and a profiled build can name the guests
+             * on every thread -- including the holder, which cannot report
+             * itself from inside the guest. */
+            if (held >= 100 && recomp_prof_active()) {
+                static volatile LONG ns;
+                if (InterlockedIncrement(&ns) <= 20) {
+                    fprintf(stderr, "  [DISPATCH-HOLD] guest shadow stacks:\n");
+                    recomp_prof_print_all_stacks(stderr, "    ");
+                    fflush(stderr);
+                }
+            }
         }
     }
     InterlockedExchange(&g_dispatch_owner, 0);
@@ -215,14 +310,14 @@ static int dispatch_on(void)
     return g_dispatch_enabled;
 }
 
-static KIRQL irql_swap(KIRQL v)
+static KIRQL irql_swap(KIRQL v, const char *site)
 {
     if (t_isr_irql >= 0) { KIRQL o = (KIRQL)t_isr_irql; t_isr_irql = v; return o; }
     if (dispatch_on()) {
         KIRQL o = (KIRQL)t_guest_irql;
         /* Take the processor before the level says we have it. */
         if (v >= DISPATCH_LEVEL && o < DISPATCH_LEVEL)
-            dispatch_acquire(0);
+            dispatch_acquire(0, site);
         t_guest_irql = v;
         InterlockedExchange(&g_cpu_irql, (LONG)v);   /* diagnostics only */
         if (v < DISPATCH_LEVEL && o >= DISPATCH_LEVEL)
@@ -415,8 +510,10 @@ int xbox_IrqlEnterInterrupt(int level)
      * thread that raised. A device ISR (above DISPATCH) preempts it on
      * hardware and does not. */
     int take = (level == DISPATCH_LEVEL) && dispatch_on();
-    if (take)
-        dispatch_acquire(1);
+    if (take) {
+        dispatch_acquire(1, t_pending_site ? t_pending_site : "DPC");
+        t_pending_site = NULL;
+    }
     if (t_isr_depth < 32) {
         if (take)
             t_isr_lock_bits |= 1u << t_isr_depth;
@@ -460,7 +557,7 @@ void xbox_IrqlLeaveInterrupt(int saved)
  */
 KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 {
-    KIRQL old = irql_swap(NewIrql);
+    KIRQL old = irql_swap(NewIrql, "KfRaiseIrql");
 
     if (NewIrql < old) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
@@ -494,7 +591,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
         NewIrql = cur;
 
     {
-        KIRQL old = irql_swap(NewIrql);
+        KIRQL old = irql_swap(NewIrql, "KfLowerIrql(clamped)");
 
         if (requested > old) {
             static volatile LONG n;
@@ -520,7 +617,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
  */
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
-    KIRQL old = irql_swap(DISPATCH_LEVEL);
+    KIRQL old = irql_swap(DISPATCH_LEVEL, "KeRaiseIrqlToDpcLevel");
 
     irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
     irql_publish();
