@@ -627,76 +627,28 @@ failure:
     _Exit(EXIT_FAILURE);
 }
 
-/* ZPASS occlusion report. The title writes a 64-bit stamp into the report
- * buffer, rings GET_REPORT, then spins until the stamp changes; the GPU is
- * meant to overwrite it with a fresh timestamp plus the number of pixels that
- * passed the depth test. xemu answers exactly that way
- * (pgraph_write_zpass_pixel_cnt_report: u64 timestamp, u32 result, u32 done).
- * There is no real occlusion counter behind the D3D11 path, so report the
- * whole surface as visible -- never cull geometry a real query would have
- * kept. ponytail: fixed count, feed the rasteriser's passing-pixel count here
- * if a title ever needs true occlusion culling. */
-static void report_zpass(uint32_t offset)
+/* Write a completed ZPASS report straight to the query slot the guest polls.
+ * The driver passes the slot's physical address in the contiguous window (bit
+ * 24 is an enable flag). The title polls the slot through its guest VA alias,
+ * which is XBOX_CONTIG_BASE above the physical address, and treats
+ * 0xFFFFFFFF in the done word as "still in flight". */
+static void report_zpass_address(uint32_t address, uint32_t result)
 {
-    uint32_t ramin_offset = s_gpu.report_context;
-    if (!ramin_offset)
-        goto failure;
-    if (ramin_offset >= 0x100000u) {
-        uint32_t instance;
-        if (!ramht_instance(ramin_offset, &instance))
-            goto failure;
-        ramin_offset = instance;
-    }
-    volatile uint32_t *descriptor = xbox_Nv2aRegisterPointer(0x700000 + ramin_offset, 12);
-    if (!descriptor)
-        goto failure;
-    uint32_t flags = descriptor[0];
-    uint32_t limit = descriptor[1];
-    uint32_t frame = descriptor[2];
-    uint32_t dma_class = flags & 0xFFFu;
-    uint32_t target = flags & 0x30000u;
-    uint64_t address = (frame & 0xFFFFF000u) + (flags >> 20);
-    if ((dma_class != 0x03u && dma_class != 0x3Du) ||
-            (target != 0 && target != 0x20000u) || (offset & 3u) ||
-            (uint64_t)offset + 16 > (uint64_t)limit + 1)
-        goto failure;
-    uint8_t *destination = xbox_DmaPhysicalPointer(address + offset, 16);
-    if (!destination)
-        goto failure;
-    uint64_t timestamp = ++s_gpu.report_timestamp;
-    uint32_t result = 0xFFFFFFFFu;
-    /* done must be 1: the guest treats the record as in flight until the GPU
-     * marks the query complete. Leaving it 0 makes GetVisibilityTestResult
-     * report "not ready", which the title reads as fully occluded and uses to
-     * cull every glow/lens-flare billboard. */
-    uint32_t done = 1;
-    memcpy(destination, &timestamp, 8);
-    memcpy(destination + 8, &result, 4);
-    memcpy(destination + 12, &done, 4);
-    return;
-
-failure:
-    {
-        static unsigned warned;
-        if (warned++ < 4)
-            fprintf(stderr, "[GPU] zpass report unresolved: handle 0x%08X offset 0x%08X\n",
-                    s_gpu.report_context, offset);
-    }
-}
-
-/* Write a completed ZPASS report straight to the address the title passed in
- * SET_ZPASS_PIXEL_COUNT_ENABLE (bit 24 is an enable flag, not part of the
- * address). This is the path the D3D8 visibility query actually uses: it does
- * not ring GET_REPORT, it polls the query slot and treats 0xFFFFFFFF in the
- * done word as "still in flight". Answering there keeps glows and lens flares
- * visible instead of making the guest cull them as occluded. */
-static void report_zpass_address(uint32_t address)
-{
-    uint8_t *destination = xbox_DmaPhysicalPointer(address, 16);
-    if (!destination)
+    /* The guest passes the query slot's *physical* address in the contiguous
+     * window (bit 24 is the enable flag). The title itself polls the slot
+     * through its guest virtual alias, which lives at XBOX_CONTIG_BASE plus
+     * the physical offset -- 0x80000000 + 0x01000000 above the value it
+     * submits. Convert to guest VA and write through the guest memory base. */
+    uint32_t physical = (address & 0xFEFFFFFFu) | 0x01000000u;
+    if (physical >= XBOX_CONTIG_SIZE || physical + 16u > XBOX_CONTIG_SIZE)
         return;
+    /* The guest VA alias sits in the contiguous window, which is mapped as its
+     * own host allocation (not guest_va + g_memory_offset). */
+    uint8_t *base = xbox_DmaPhysicalPointer((uint64_t)XBOX_CONTIG_BASE + physical, 16);
+    if (!base)
+        return;
+    uint8_t *destination = base;
     uint64_t timestamp = ++s_gpu.report_timestamp;
-    uint32_t result = 0xFFFFFFFFu;
     uint32_t done = 1;
     memcpy(destination, &timestamp, 8);
     memcpy(destination + 8, &result, 4);
@@ -4180,16 +4132,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     switch (method) {
     case NV097_CLEAR_REPORT_VALUE:
+        return;
     case NV097_SET_ZPASS_PIXEL_COUNT_ENABLE:
-        /* The D3D8 query sends two data dwords: 0 disables, then the enable
-         * flag plus the guest query-slot address. Answer that slot here. */
+        /* The D3D8 query submits 0x817CC with two data words: 0 for method
+         * 0x17CC, then the query-slot address for the next method word
+         * 0x17D0. This word only starts/stops the visibility test. */
         if (param)
-            report_zpass_address(param & 0xFEFFFFFFu);
+            nv2a_gpu_occlusion_begin();
         return;
-    case NV097_GET_REPORT:
-        if ((param & NV097_GET_REPORT_TYPE) == NV097_GET_REPORT_TYPE_ZPASS_PIXEL_CNT)
-            report_zpass(param & NV097_GET_REPORT_OFFSET);
+    case NV097_GET_REPORT: {
+        /* The D3D8 query's second word lands here (0x17D0). The title does
+         * not pass an offset into the report DMA object: the low 24 bits are
+         * the guest address of the query slot it polls, and the top byte is
+         * the report type (bit 24 is an enable flag). End the real occlusion
+         * query and answer that slot with its passing-sample count. */
+        uint32_t samples = nv2a_gpu_occlusion_end();
+        report_zpass_address(param & 0xFEFFFFFFu, samples);
         return;
+    }
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;
         s_gpu.clip_w = (param >> 16) & 0xFFFF;

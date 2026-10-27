@@ -13,6 +13,7 @@
 #include <string>
 #include <cstddef>
 #include <chrono>
+#include <thread>
 #include <algorithm>
 #include <set>
 #include <unordered_map>
@@ -204,7 +205,49 @@ static ComPtr<ID3D11DeviceContext> context;
  * Map(DISCARD)/Unmap rename per draw. Null => fall back to the single buffer. */
 static ComPtr<ID3D11DeviceContext1> context1;
 static ComPtr<ID3D11Query> completion_event;
+static ComPtr<ID3D11Query> occlusion_query;
+static bool occlusion_active;
 static bool pending_draws;
+
+/* Visibility (ZPASS) queries: the guest draws its occlusion-test geometry
+ * between SET_ZPASS_PIXEL_COUNT_ENABLE and GET_REPORT. Wrapping those draws in
+ * a real D3D11 occlusion query gives the guest a true passing-sample count, so
+ * glows stay visible when in view and are culled when geometry covers them. */
+extern "C" void nv2a_gpu_occlusion_begin(void)
+{
+    if (!device || !context)
+        return;
+    if (!occlusion_query) {
+        D3D11_QUERY_DESC description = {D3D11_QUERY_OCCLUSION, 0};
+        if (FAILED(device->CreateQuery(&description, occlusion_query.GetAddressOf())))
+            return;
+    }
+    context->Begin(occlusion_query.Get());
+    occlusion_active = true;
+}
+
+/* Returns the number of samples that passed the depth test, or 0xFFFFFFFF when
+ * the backend cannot answer (caller then keeps the old always-visible result). */
+extern "C" uint32_t nv2a_gpu_occlusion_end(void)
+{
+    if (!occlusion_active || !occlusion_query || !context)
+        return 0xFFFFFFFFu;
+    occlusion_active = false;
+    context->End(occlusion_query.Get());
+    context->Flush();
+    UINT64 samples = 0;
+    HRESULT hr = S_FALSE;
+    for (int attempt = 0; attempt < 50; attempt++) {
+        hr = context->GetData(occlusion_query.Get(), &samples, sizeof samples,
+                              attempt ? D3D11_ASYNC_GETDATA_DONOTFLUSH : 0);
+        if (hr == S_OK || hr != S_FALSE)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (hr != S_OK)
+        return 0xFFFFFFFFu;
+    return samples > 0xFFFFFFFEu ? 0xFFFFFFFEu : (uint32_t)samples;
+}
 
 struct GpuDrawSample {
     ComPtr<ID3D11Query> disjoint, begin, end, statistics;
