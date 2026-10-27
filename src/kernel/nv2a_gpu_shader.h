@@ -73,20 +73,26 @@ struct Pixel {
  float depthW:TEXCOORD4;
  noperspective float depthZ:TEXCOORD5;
  float fog:TEXCOORD6;
- nointerpolation float depthSlope:TEXCOORD7;
+  nointerpolation float depthSlope:TEXCOORD7;
 };
+bool nv_isnan(float value) { return value != value; }
+bool nv_isinf(float value) { return abs(value) > 3.402823466e38; }
+bool nv_isfinite(float value) { return !nv_isnan(value) && !nv_isinf(value); }
+bool nv_isfinite4(float4 value) {
+ return nv_isfinite(value.x) && nv_isfinite(value.y) && nv_isfinite(value.z) && nv_isfinite(value.w);
+}
 float fog_factor(float distance) {
  if(textureControl.z==0)return 1;
  uint mode=textureControl.w;
  bool absolute=mode==0x802 || mode==0x803 || mode==0x804;
  float exceptional=mode==0x2601 || mode==0x804 || mode==0x800?1:0;
- if(isinf(distance))return exceptional;
+ if(nv_isinf(distance))return exceptional;
  float factor;
  if(mode==0x2601 || mode==0x804)factor=fogParameters.x+distance*fogParameters.y-1;
  else if(mode==0x800 || mode==0x802)factor=fogParameters.x+exp2(distance*fogParameters.y*16)-1.5;
  else factor=fogParameters.x+exp2(-distance*distance*fogParameters.y*fogParameters.y*32)-1.5;
  if(absolute)factor=abs(factor);
- if(isnan(factor))factor=exceptional;
+ if(nv_isnan(factor))factor=exceptional;
  return clamp(factor,-3.402823466e38,3.402823466e38);
 }
 float4 guest_multiply(float4 left,float4 right) {
@@ -94,7 +100,7 @@ float4 guest_multiply(float4 left,float4 right) {
                left.z==0||right.z==0?0:left.z*right.z,left.w==0||right.w==0?0:left.w*right.w);
 }
 float guest_clip_w(float value) {
- if(!isfinite(value))return value;
+ if(!nv_isfinite(value))return value;
  float magnitude=clamp(abs(value),5.421010862427522e-20,1.8446744073709552e19);
  return (asuint(value)&0x80000000u)?-magnitude:magnitude;
 }
@@ -238,7 +244,7 @@ Pixel vs_main(Vertex input) {
 [maxvertexcount(3)]
 void gs_main(triangle Pixel vertices[3],inout TriangleStream<Pixel> stream) {
  [unroll]for(uint vertex=0;vertex<3;vertex++)
-  if(!all(isfinite(vertices[vertex].position)))return;
+  if(!nv_isfinite4(vertices[vertex].position))return;
  float slope=0;
  if(depthOffset.x!=0 && (depthOffset.z!=0 || depthOffset.w!=0)) {
   float2 screenPoints[3];
@@ -252,7 +258,7 @@ void gs_main(triangle Pixel vertices[3],inout TriangleStream<Pixel> stream) {
   float3 secondEdge=float3(screenPoints[2]-screenPoints[0],depths.z-depths.x);
   float3 plane=cross(firstEdge,secondEdge);
   if(plane.z!=0)slope=max(abs(plane.x),abs(plane.y))/abs(plane.z);
-  if(!isfinite(slope))slope=0;
+  if(!nv_isfinite(slope))slope=0;
  }
  [unroll]for(uint vertex=0;vertex<3;vertex++) {
   Pixel result=vertices[vertex];
@@ -265,7 +271,7 @@ void gs_main(triangle Pixel vertices[3],inout TriangleStream<Pixel> stream) {
 [maxvertexcount(2)]
 void gs_lines_main(line Pixel vertices[2],inout LineStream<Pixel> stream) {
  [unroll]for(uint vertex=0;vertex<2;vertex++)
-  if(!all(isfinite(vertices[vertex].position)))return;
+  if(!nv_isfinite4(vertices[vertex].position))return;
  [unroll]for(uint vertex=0;vertex<2;vertex++) {
   Pixel result=vertices[vertex];
   if(misc.w!=0) {result.diffuse=vertices[1].diffuse;result.specular=vertices[1].specular;}
@@ -275,7 +281,7 @@ void gs_lines_main(line Pixel vertices[2],inout LineStream<Pixel> stream) {
 }
 [maxvertexcount(1)]
 void gs_points_main(point Pixel vertices[1],inout PointStream<Pixel> stream) {
- if(all(isfinite(vertices[0].position)))stream.Append(vertices[0]);
+ if(nv_isfinite4(vertices[0].position))stream.Append(vertices[0]);
 }
 float4 mapped(float4 registers[16], uint encoded, bool alpha) {
  encoded &=255; float4 value=registers[encoded&15];
@@ -342,7 +348,7 @@ PixelOutput finish_pixel(float4 color,Pixel input,bool frontFacing) {
  PixelOutput output;
  output.color=color;
  float depth=NV_W_DEPTH?input.depthW:input.depthZ;
- if(NV_W_DEPTH && (!(depth>0) || !isfinite(depth)))depth=3.402823466e38;
+ if(NV_W_DEPTH && (!(depth>0) || !nv_isfinite(depth)))depth=3.402823466e38;
  else if((frontFacing?depthOffset.z:depthOffset.w)!=0) {
   float slopeOffset=0;
   if(depthOffset.x!=0) {
@@ -351,7 +357,7 @@ PixelOutput finish_pixel(float4 color,Pixel input,bool frontFacing) {
   }
   depth+=depthOffset.y;
   depth+=slopeOffset;
-  if(NV_W_DEPTH && isnan(depth))depth=3.402823466e38;
+  if(NV_W_DEPTH && nv_isnan(depth))depth=3.402823466e38;
  }
  if(depthRange.z==0) {
   if(depth<depthRange.x || depth>depthRange.y)discard;
