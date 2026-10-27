@@ -222,6 +222,12 @@ extern "C" void nv2a_gpu_occlusion_begin(void)
         if (FAILED(device->CreateQuery(&description, occlusion_query.GetAddressOf())))
             return;
     }
+    /* A begin without its GET_REPORT must never leave the query active: a
+     * second Begin on an active query is invalid and can kill the device. */
+    if (occlusion_active) {
+        context->End(occlusion_query.Get());
+        occlusion_active = false;
+    }
     context->Begin(occlusion_query.Get());
     occlusion_active = true;
 }
@@ -237,9 +243,14 @@ extern "C" uint32_t nv2a_gpu_occlusion_end(void)
     context->Flush();
     UINT64 samples = 0;
     HRESULT hr = S_FALSE;
-    for (int attempt = 0; attempt < 50; attempt++) {
+    /* Never call GetData with flags 0: that blocks until the GPU retires the
+     * query, and a query that never retires (device lost, a draw the GPU
+     * cannot finish) would freeze the presenting thread forever -- the title
+     * then shows NO FRAME while the guest keeps running. Poll without
+     * flushing for at most a few milliseconds, then fall back to visible. */
+    for (int attempt = 0; attempt < 8; attempt++) {
         hr = context->GetData(occlusion_query.Get(), &samples, sizeof samples,
-                              attempt ? D3D11_ASYNC_GETDATA_DONOTFLUSH : 0);
+                              D3D11_ASYNC_GETDATA_DONOTFLUSH);
         if (hr == S_OK || hr != S_FALSE)
             break;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
