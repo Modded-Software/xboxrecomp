@@ -685,6 +685,26 @@ failure:
     }
 }
 
+/* Write a completed ZPASS report straight to the address the title passed in
+ * SET_ZPASS_PIXEL_COUNT_ENABLE (bit 24 is an enable flag, not part of the
+ * address). This is the path the D3D8 visibility query actually uses: it does
+ * not ring GET_REPORT, it polls the query slot and treats 0xFFFFFFFF in the
+ * done word as "still in flight". Answering there keeps glows and lens flares
+ * visible instead of making the guest cull them as occluded. */
+static void report_zpass_address(uint32_t address)
+{
+    uint8_t *destination = xbox_DmaPhysicalPointer(address, 16);
+    if (!destination)
+        return;
+    uint64_t timestamp = ++s_gpu.report_timestamp;
+    uint32_t result = s_gpu.clip_w && s_gpu.clip_h
+                    ? s_gpu.clip_w * s_gpu.clip_h : 1;
+    uint32_t done = 1;
+    memcpy(destination, &timestamp, 8);
+    memcpy(destination + 8, &result, 4);
+    memcpy(destination + 12, &done, 4);
+}
+
 /* Every texture-stage register, as the title last set it.
  * Texturing is not implemented yet; knowing which formats and sizes a title
  * actually programs is what decides which ones are worth implementing. */
@@ -4163,8 +4183,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     switch (method) {
     case NV097_CLEAR_REPORT_VALUE:
     case NV097_SET_ZPASS_PIXEL_COUNT_ENABLE:
-        /* Recorded only to keep the occlusion query trio out of the unhandled
-         * report; the count itself is answered in report_zpass. */
+        /* The D3D8 query sends two data dwords: 0 disables, then the enable
+         * flag plus the guest query-slot address. Answer that slot here. */
+        if (param)
+            report_zpass_address(param & 0xFEFFFFFFu);
         return;
     case NV097_GET_REPORT:
         if ((param & NV097_GET_REPORT_TYPE) == NV097_GET_REPORT_TYPE_ZPASS_PIXEL_CNT)
