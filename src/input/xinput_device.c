@@ -355,6 +355,57 @@ static void kbm_cam_setf(uint32_t camera, uint32_t offset, float v)
                         + (uintptr_t)xbox_GetMemoryOffset()) = v;
 }
 
+/* Mounted controls (turrets and vehicles) do not read the camera's live yaw
+ * and pitch: every one of them rebuilds the camera angles from the right
+ * stick through cControl::GetCameraYaw/GetCameraPitch. Direct-look writes and
+ * the zeroed stick therefore leave them frozen. tThing::PreFinalize stores the
+ * current control at thing+0x3F8; identify the class by its vtable. */
+#define KBM_VT_GUN           0x3658E8u
+#define KBM_VT_FLAME_GUN     0x365A10u
+#define KBM_VT_TANK          0x366238u
+#define KBM_VT_VULTURE       0x366368u
+#define KBM_VT_GOLIATH       0x366530u
+
+static uint32_t kbm_control(void)
+{
+    uint32_t thing = kbm_u32(0x439DE8u);
+    uint32_t control;
+    if (!kbm_valid(thing)) return 0;
+    control = kbm_u32(thing + 0x3F8u);
+    return kbm_valid(control) ? control : 0;
+}
+
+/* Vtable of the active mounted control, or 0 when on foot. */
+static uint32_t kbm_mounted_control(void)
+{
+    uint32_t control = kbm_control();
+    uint32_t vtable;
+    if (!control) return 0;
+    vtable = kbm_u32(control);
+    switch (vtable) {
+    case KBM_VT_GUN:
+    case KBM_VT_FLAME_GUN:
+    case KBM_VT_TANK:
+    case KBM_VT_VULTURE:
+    case KBM_VT_GOLIATH:
+        return vtable;
+    default:
+        return 0;
+    }
+}
+
+static const char *kbm_control_name(uint32_t vtable)
+{
+    switch (vtable) {
+    case KBM_VT_GUN:       return "gun";
+    case KBM_VT_FLAME_GUN: return "flame-gun";
+    case KBM_VT_TANK:      return "tank";
+    case KBM_VT_VULTURE:   return "vulture";
+    case KBM_VT_GOLIATH:   return "goliath";
+    default:               return "on-foot";
+    }
+}
+
 /* Face/triggers, matching what the build actually does (not what the docs
  * guess): A is jump, B is use, X is melee, LT is crouch. So jump is on Space,
  * melee on F, crouch on Control. A pad is expected to be the primary device,
@@ -418,12 +469,14 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     static float look_gain, look_gain_y;
     static float dbg_last_pitch, dbg_last_yaw;
     static int dbg_have;
+    static uint32_t dbg_mount;
     /* Scroll -> left-stick alias: a notch is a single poll, which the title's
      * per-frame integration barely sees, so hold the deflection for a beat. */
     static int wheel_dir;
     static DWORD wheel_until;
     WORD b = 0;
     int dx, dy, wheel;
+    uint32_t mount;
 
     if (!configured) {
         /* The right stick is just the mouse delta scaled straight through:
@@ -495,6 +548,18 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
         pState->Gamepad.sThumbRY = kbm_deadzone_expand(sy, stick_deadzone);
     }
 
+    /* Mounted controls (gun, flame gun, tank, vulture, Goliath) rebuild the
+     * camera angles from the right stick every tick and ignore the camera
+     * fields below. Keep the mouse-derived stick for them; the game's own
+     * camera code then supplies the class-specific handling (rate limits,
+     * clamps, body-relative yaw, aim assist). */
+    mount = kbm_mounted_control();
+    if (mount != dbg_mount) {
+        fprintf(stderr, "[KBM] look source: %s (control vtable=%08x)\n",
+                kbm_control_name(mount), mount);
+        dbg_mount = mount;
+    }
+
     /* Direct camera look: the mouse delta IS the look input, added straight
      * to the local camera's yaw/pitch. No stick, no ball. The right stick is
      * zeroed so the game does not also turn. In the free-look branch the game
@@ -502,7 +567,7 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
      * branch (UpdateYaw/UpdatePitch) it instead lerps them toward a look
      * target at *(camera+0x188)+0x14/+0x10, so that target is turned by the
      * same delta too and the camera ends the frame where the mouse put it. */
-    if (look_direct) {
+    if (look_direct && !mount) {
         uint32_t camera;
         pState->Gamepad.sThumbRX = 0;
         pState->Gamepad.sThumbRY = 0;
