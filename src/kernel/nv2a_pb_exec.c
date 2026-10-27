@@ -666,7 +666,11 @@ static void report_zpass(uint32_t offset)
     uint64_t timestamp = ++s_gpu.report_timestamp;
     uint32_t result = s_gpu.clip_w && s_gpu.clip_h
                     ? s_gpu.clip_w * s_gpu.clip_h : 1;
-    uint32_t done = 0;
+    /* done must be 1: the guest treats the record as in flight until the GPU
+     * marks the query complete. Leaving it 0 makes GetVisibilityTestResult
+     * report "not ready", which the title reads as fully occluded and uses to
+     * cull every glow/lens-flare billboard. */
+    uint32_t done = 1;
     memcpy(destination, &timestamp, 8);
     memcpy(destination + 8, &result, 4);
     memcpy(destination + 12, &done, 4);
