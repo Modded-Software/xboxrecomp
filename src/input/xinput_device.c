@@ -538,7 +538,7 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
         invert_y  = kbm_number("RECOMP_KBM_INVERT_Y", 1, 0);
         maxdelta  = kbm_number("RECOMP_KBM_MAXDELTA", 8192, 512);
         sens      = kbm_number("RECOMP_KBM_SENS", 32767, 300);
-        mount_sens = kbm_number("RECOMP_KBM_MOUNT_SENS", 32767, 80);
+        mount_sens = kbm_number("RECOMP_KBM_MOUNT_SENS", 32767, 30);
         /* per-axis output ratio (Y as a percent of X) */
         ratio     = kbm_number("RECOMP_KBM_RATIO", 1000, 100);
         /* Direct camera look: add the mouse delta straight to the camera's
@@ -597,19 +597,19 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
         /* GetCameraYaw squares (stick - 0.1), and the caller then ignores
          * anything <= 0.1. A stick barely over 0.1 still turns nothing: the
          * useful range starts near 0.4. Map the mouse through the square root
-         * of a 0.42..1.0 band so normal movement lands in that range. */
+         * of a 0.50..1.0 band so normal movement lands in that range. */
         float ax = (float)(dx < 0 ? -dx : dx);
         float ay = (float)(dy < 0 ? -dy : dy) * (float)ratio / 100.0f;
         float nx = 0.0f, ny = 0.0f;
         if (ax > 0.0f) {
             float m = ax / (float)mount_sens;
             if (m > 1.0f) m = 1.0f;
-            nx = 0.42f + 0.58f * sqrtf(m);
+            nx = 0.50f + 0.50f * sqrtf(m);
         }
         if (ay > 0.0f) {
             float m = ay / (float)mount_sens;
             if (m > 1.0f) m = 1.0f;
-            ny = 0.42f + 0.58f * sqrtf(m);
+            ny = 0.50f + 0.50f * sqrtf(m);
         }
         pState->Gamepad.sThumbRX = nx > 0.0f
             ? (SHORT)((dx < 0 ? -1.0f : 1.0f)
