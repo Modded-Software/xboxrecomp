@@ -519,6 +519,8 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
      * per-frame integration barely sees, so hold the deflection for a beat. */
     static int wheel_dir;
     static DWORD wheel_until;
+    static SHORT mount_hold_x, mount_hold_y;
+    static DWORD mount_hold_until;
     WORD b = 0;
     int dx, dy, wheel;
     uint32_t mount;
@@ -538,7 +540,7 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
         invert_y  = kbm_number("RECOMP_KBM_INVERT_Y", 1, 0);
         maxdelta  = kbm_number("RECOMP_KBM_MAXDELTA", 8192, 512);
         sens      = kbm_number("RECOMP_KBM_SENS", 32767, 300);
-        mount_sens = kbm_number("RECOMP_KBM_MOUNT_SENS", 32767, 30);
+        mount_sens = kbm_number("RECOMP_KBM_MOUNT_SENS", 32767, 15);
         /* per-axis output ratio (Y as a percent of X) */
         ratio     = kbm_number("RECOMP_KBM_RATIO", 1000, 100);
         /* Direct camera look: add the mouse delta straight to the camera's
@@ -611,14 +613,27 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
             if (m > 1.0f) m = 1.0f;
             ny = 0.50f + 0.50f * sqrtf(m);
         }
-        pState->Gamepad.sThumbRX = nx > 0.0f
-            ? (SHORT)((dx < 0 ? -1.0f : 1.0f)
-                      * (7700.0f + nx * (32767.0f - 7700.0f)))
-            : 0;
-        pState->Gamepad.sThumbRY = ny > 0.0f
-            ? (SHORT)((!invert_y ? -1.0f : 1.0f)
-                      * (7700.0f + ny * (32767.0f - 7700.0f)))
-            : 0;
+        if (nx > 0.0f || ny > 0.0f) {
+            if (nx > 0.0f)
+                mount_hold_x = (SHORT)((dx < 0 ? -1.0f : 1.0f)
+                    * (7700.0f + nx * (32767.0f - 7700.0f)));
+            else
+                mount_hold_x = 0;
+            if (ny > 0.0f)
+                mount_hold_y = (SHORT)((!invert_y ? -1.0f : 1.0f)
+                    * (7700.0f + ny * (32767.0f - 7700.0f)));
+            else
+                mount_hold_y = 0;
+            mount_hold_until = GetTickCount() + 150;
+        }
+        if ((long)(GetTickCount() - mount_hold_until) < 0) {
+            pState->Gamepad.sThumbRX = mount_hold_x;
+            pState->Gamepad.sThumbRY = mount_hold_y;
+        } else {
+            mount_hold_x = mount_hold_y = 0;
+            pState->Gamepad.sThumbRX = 0;
+            pState->Gamepad.sThumbRY = 0;
+        }
     } else {
         float scale = 32767.0f / (float)sens;
         float sy = (float)dy * scale * (float)ratio / 100.0f;
