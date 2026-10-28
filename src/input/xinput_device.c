@@ -620,7 +620,8 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
             else
                 mount_hold_x = 0;
             if (ny > 0.0f)
-                mount_hold_y = (SHORT)((!invert_y ? -1.0f : 1.0f)
+                mount_hold_y = (SHORT)(((dy < 0 ? -1.0f : 1.0f)
+                    * (!invert_y ? -1.0f : 1.0f))
                     * (7700.0f + ny * (32767.0f - 7700.0f)));
             else
                 mount_hold_y = 0;
