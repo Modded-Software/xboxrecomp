@@ -509,6 +509,7 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     static DWORD packet;
     static int configured;
     static unsigned deadzone, invert_y, maxdelta, stick_deadzone, sens, ratio;
+    static unsigned mount_sens;
     static unsigned look_direct, look_trace;
     static float look_gain, look_gain_y;
     static float dbg_last_pitch, dbg_last_yaw;
@@ -537,6 +538,7 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
         invert_y  = kbm_number("RECOMP_KBM_INVERT_Y", 1, 0);
         maxdelta  = kbm_number("RECOMP_KBM_MAXDELTA", 8192, 512);
         sens      = kbm_number("RECOMP_KBM_SENS", 32767, 300);
+        mount_sens = kbm_number("RECOMP_KBM_MOUNT_SENS", 32767, 80);
         /* per-axis output ratio (Y as a percent of X) */
         ratio     = kbm_number("RECOMP_KBM_RATIO", 1000, 100);
         /* Direct camera look: add the mouse delta straight to the camera's
@@ -550,10 +552,10 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
         kbm_load_map();
         configured = 1;
         fprintf(stderr, "[KBM] profile: deadzone=%u stick_deadzone=%u invert_y=%u maxdelta=%u "
-                "sens=%u ratio=%u look_direct=%u look_gain=%.4f look_gain_y=%.4f "
+                "sens=%u mount_sens=%u ratio=%u look_direct=%u look_gain=%.4f look_gain_y=%.4f "
                 "A=%d B=%d X=%d Y=%d BLACK=%d WHITE=%d LT=%d START=%d BACK=%d "
                 "LTHUMB=%d RTHUMB=%d\n",
-                deadzone, stick_deadzone, invert_y, maxdelta, sens, ratio,
+                deadzone, stick_deadzone, invert_y, maxdelta, sens, mount_sens, ratio,
                 look_direct, look_gain, look_gain_y,
                 k_a, k_b, k_x, k_y, k_black, k_white, k_lt, k_start, k_back,
                 k_lthumb, k_rthumb);
@@ -591,24 +593,38 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
      * clamps, body-relative yaw, aim assist). */
     mount = kbm_mounted_control();
 
-    {
+    if (mount) {
+        /* GetCameraYaw squares (stick - 0.1), and the caller then ignores
+         * anything <= 0.1. A stick barely over 0.1 still turns nothing: the
+         * useful range starts near 0.4. Map the mouse through the square root
+         * of a 0.42..1.0 band so normal movement lands in that range. */
+        float ax = (float)(dx < 0 ? -dx : dx);
+        float ay = (float)(dy < 0 ? -dy : dy) * (float)ratio / 100.0f;
+        float nx = 0.0f, ny = 0.0f;
+        if (ax > 0.0f) {
+            float m = ax / (float)mount_sens;
+            if (m > 1.0f) m = 1.0f;
+            nx = 0.42f + 0.58f * sqrtf(m);
+        }
+        if (ay > 0.0f) {
+            float m = ay / (float)mount_sens;
+            if (m > 1.0f) m = 1.0f;
+            ny = 0.42f + 0.58f * sqrtf(m);
+        }
+        pState->Gamepad.sThumbRX = nx > 0.0f
+            ? (SHORT)((dx < 0 ? -1.0f : 1.0f)
+                      * (7700.0f + nx * (32767.0f - 7700.0f)))
+            : 0;
+        pState->Gamepad.sThumbRY = ny > 0.0f
+            ? (SHORT)((!invert_y ? -1.0f : 1.0f)
+                      * (7700.0f + ny * (32767.0f - 7700.0f)))
+            : 0;
+    } else {
         float scale = 32767.0f / (float)sens;
         float sy = (float)dy * scale * (float)ratio / 100.0f;
-        unsigned out_deadzone = stick_deadzone;
         if (!invert_y) sy = -sy;
-
-        /* XReadGamepad subtracts the raw deadzone (~7700), then
-         * GetCameraYaw/GetCameraPitch ignore normalized stick magnitudes
-         * below 0.1. Expand through both, otherwise slow mouse movement
-         * normalizes under 0.1 and mounted controls see no aim input. */
-        if (mount) {
-            unsigned cam_floor = (unsigned)(7700.0f
-                + 0.1f * (32767.0f - 7700.0f));
-            if (out_deadzone < cam_floor) out_deadzone = cam_floor;
-        }
-
-        pState->Gamepad.sThumbRX = kbm_deadzone_expand((float)dx * scale, out_deadzone);
-        pState->Gamepad.sThumbRY = kbm_deadzone_expand(sy, out_deadzone);
+        pState->Gamepad.sThumbRX = kbm_deadzone_expand((float)dx * scale, stick_deadzone);
+        pState->Gamepad.sThumbRY = kbm_deadzone_expand(sy, stick_deadzone);
     }
 
     kbm_mount_trace(mount, pState, dx, dy);
