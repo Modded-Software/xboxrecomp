@@ -358,8 +358,10 @@ static void kbm_cam_setf(uint32_t camera, uint32_t offset, float v)
 /* Mounted controls (turrets and vehicles) do not read the camera's live yaw
  * and pitch: every one of them rebuilds the camera angles from the right
  * stick through cControl::GetCameraYaw/GetCameraPitch. Direct-look writes and
- * the zeroed stick therefore leave them frozen. tThing::PreFinalize stores the
- * current control at thing+0x3F8; identify the class by its vtable. */
+ * the zeroed stick therefore leave them frozen. 0x439DE8 is the local-player
+ * info; its first dword is the thing currently driven, and that thing's +0x3F8
+ * is its control. On foot the info points back at the player, so the same path
+ * yields the walk control. Identify the class by its vtable. */
 #define KBM_VT_GUN           0x3658E8u
 #define KBM_VT_FLAME_GUN     0x365A10u
 #define KBM_VT_TANK          0x366238u
@@ -368,8 +370,10 @@ static void kbm_cam_setf(uint32_t camera, uint32_t offset, float v)
 
 static uint32_t kbm_control(void)
 {
-    uint32_t thing = kbm_u32(0x439DE8u);
-    uint32_t control;
+    uint32_t info = kbm_u32(0x439DE8u);
+    uint32_t thing, control;
+    if (!kbm_valid(info)) return 0;
+    thing = kbm_u32(info);
     if (!kbm_valid(thing)) return 0;
     control = kbm_u32(thing + 0x3F8u);
     return kbm_valid(control) ? control : 0;
@@ -392,6 +396,46 @@ static uint32_t kbm_mounted_control(void)
     default:
         return 0;
     }
+}
+
+static uint32_t kbm_u8val(uint32_t va)
+{
+    return *(volatile uint8_t *)((uintptr_t)va + (uintptr_t)xbox_GetMemoryOffset());
+}
+
+static void kbm_mount_trace(uint32_t mount, const XBOX_INPUT_STATE *pState,
+                            int dx, int dy)
+{
+    static unsigned n, on = 2;
+    uint32_t ap, player, pctl, info, thing, ctl, camera, input;
+    if (on == 2) on = getenv("RECOMP_KBM_MOUNT_TRACE") != NULL;
+    if (!on || (++n % (mount ? 10u : 60u)) != 0) return;
+    ap = kbm_u32(0x439DE0u);
+    player = kbm_valid(ap) ? kbm_u32(ap) : 0;
+    pctl = kbm_valid(player) ? kbm_u32(player + 0x3F8u) : 0;
+    info = kbm_u32(0x439DE8u);
+    thing = kbm_valid(info) ? kbm_u32(info) : 0;
+    ctl = kbm_valid(thing) ? kbm_u32(thing + 0x3F8u) : 0;
+    camera = kbm_camera();
+    input = kbm_u32(0x491C74u);
+    fprintf(stderr, "[KBM] mount=%08x player=%08x pctl=%08x pvt=%08x p5e=%u "
+            "p2d8=%08x info=%08x thing=%08x ctl=%08x vt=%08x c5e=%u "
+            "input=%08x in=%.3f,%.3f ctl=%.3f,%.3f cam=%.3f,%.3f "
+            "stick=%d,%d dx=%d dy=%d\n",
+            mount, player, pctl,
+            kbm_valid(pctl) ? kbm_u32(pctl) : 0,
+            kbm_valid(pctl) ? kbm_u8val(pctl + 0x5Eu) : 0,
+            kbm_valid(pctl) ? kbm_u32(pctl + 0x2D8u) : 0,
+            info, thing, ctl, kbm_valid(ctl) ? kbm_u32(ctl) : 0,
+            kbm_valid(ctl) ? kbm_u8val(ctl + 0x5Eu) : 0,
+            input,
+            kbm_valid(input) ? kbm_camf(input, 0x5Cu) : 0.0f,
+            kbm_valid(input) ? kbm_camf(input, 0x60u) : 0.0f,
+            kbm_valid(ctl) ? kbm_camf(ctl, 0x1C0u) : 0.0f,
+            kbm_valid(ctl) ? kbm_camf(ctl, 0x1C4u) : 0.0f,
+            camera ? kbm_camf(camera, 0x20Cu) : 0.0f,
+            camera ? kbm_camf(camera, 0x204u) : 0.0f,
+            pState->Gamepad.sThumbRX, pState->Gamepad.sThumbRY, dx, dy);
 }
 
 static const char *kbm_control_name(uint32_t vtable)
@@ -540,20 +584,34 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     if (dx > -(int)deadzone && dx < (int)deadzone) dx = 0;
     if (dy > -(int)deadzone && dy < (int)deadzone) dy = 0;
 
-    {
-        float scale = 32767.0f / (float)sens;
-        float sy = (float)dy * scale * (float)ratio / 100.0f;
-        if (!invert_y) sy = -sy;
-        pState->Gamepad.sThumbRX = kbm_deadzone_expand((float)dx * scale, stick_deadzone);
-        pState->Gamepad.sThumbRY = kbm_deadzone_expand(sy, stick_deadzone);
-    }
-
     /* Mounted controls (gun, flame gun, tank, vulture, Goliath) rebuild the
      * camera angles from the right stick every tick and ignore the camera
      * fields below. Keep the mouse-derived stick for them; the game's own
      * camera code then supplies the class-specific handling (rate limits,
      * clamps, body-relative yaw, aim assist). */
     mount = kbm_mounted_control();
+
+    {
+        float scale = 32767.0f / (float)sens;
+        float sy = (float)dy * scale * (float)ratio / 100.0f;
+        unsigned out_deadzone = stick_deadzone;
+        if (!invert_y) sy = -sy;
+
+        /* XReadGamepad subtracts the raw deadzone (~7700), then
+         * GetCameraYaw/GetCameraPitch ignore normalized stick magnitudes
+         * below 0.1. Expand through both, otherwise slow mouse movement
+         * normalizes under 0.1 and mounted controls see no aim input. */
+        if (mount) {
+            unsigned cam_floor = (unsigned)(7700.0f
+                + 0.1f * (32767.0f - 7700.0f));
+            if (out_deadzone < cam_floor) out_deadzone = cam_floor;
+        }
+
+        pState->Gamepad.sThumbRX = kbm_deadzone_expand((float)dx * scale, out_deadzone);
+        pState->Gamepad.sThumbRY = kbm_deadzone_expand(sy, out_deadzone);
+    }
+
+    kbm_mount_trace(mount, pState, dx, dy);
     if (mount != dbg_mount) {
         fprintf(stderr, "[KBM] look source: %s (control vtable=%08x)\n",
                 kbm_control_name(mount), mount);
