@@ -257,12 +257,6 @@ extern "C" uint32_t nv2a_gpu_occlusion_end(void)
     }
     if (hr != S_OK)
         return 0xFFFFFFFFu;
-    /* A zero sample count is what the title reads as "fully occluded"; it then
-     * culls its glow and lens-flare billboards. This path often tests sprites
-     * with no depth prepass, so keep zero as visible rather than deleting the
-     * halos. Positive counts still come from the real query. */
-    if (samples == 0)
-        return 0xFFFFFFFFu;
     return samples > 0xFFFFFFFEu ? 0xFFFFFFFEu : (uint32_t)samples;
 }
 
