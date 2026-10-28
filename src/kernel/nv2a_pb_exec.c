@@ -634,20 +634,14 @@ failure:
  * 0xFFFFFFFF in the done word as "still in flight". */
 static void report_zpass_address(uint32_t address, uint32_t result)
 {
-    /* The guest passes the query slot's *physical* address in the contiguous
-     * window (bit 24 is the enable flag). The title itself polls the slot
-     * through its guest virtual alias, which lives at XBOX_CONTIG_BASE plus
-     * the physical offset -- 0x80000000 + 0x01000000 above the value it
-     * submits. Convert to guest VA and write through the guest memory base. */
-    uint32_t physical = (address & 0xFEFFFFFFu) | 0x01000000u;
-    if (physical >= XBOX_CONTIG_SIZE || physical + 16u > XBOX_CONTIG_SIZE)
+    /* The guest passes the query slot's physical address in the contiguous
+     * window (bit 24 is the enable flag). Do not add the guest alias base:
+     * xbox_DmaPhysicalPointer already resolves a physical offset and rejects
+     * anything outside the window, which made every report unreachable. */
+    uint32_t physical = address & 0xFEFFFFFFu;
+    uint8_t *destination = xbox_DmaPhysicalPointer(physical, 16);
+    if (!destination)
         return;
-    /* The guest VA alias sits in the contiguous window, which is mapped as its
-     * own host allocation (not guest_va + g_memory_offset). */
-    uint8_t *base = xbox_DmaPhysicalPointer((uint64_t)XBOX_CONTIG_BASE + physical, 16);
-    if (!base)
-        return;
-    uint8_t *destination = base;
     uint64_t timestamp = ++s_gpu.report_timestamp;
     uint32_t done = 1;
     memcpy(destination, &timestamp, 8);
