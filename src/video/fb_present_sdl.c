@@ -367,11 +367,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
                 /* Keys for the pad stand-in, and the window events that
                  * release them; it only reads the event. */
                 xbox_InputSdlEvent(&ev);
-                /* F9 (or F11): frametime overlay, as on the GDI window. */
-                if (ev.type == SDL_KEYDOWN
-                    && (ev.key.keysym.sym == SDLK_F9
-                        || ev.key.keysym.sym == SDLK_F11))
+                /* F9: frametime overlay. F11: borderless fullscreen. */
+                if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F9)
                     xbox_OverlayToggle();
+                else if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F11)
+                    SDL_SetWindowFullscreen(win,
+                        (SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN)
+                            ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
                 if (ev.type == SDL_QUIT)
                     quit = 1;
                 else if (ev.type == s_guest_done_event)

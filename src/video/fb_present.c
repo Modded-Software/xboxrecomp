@@ -38,6 +38,8 @@ int xbox_FramebufferDumpBmp(const char *path);
 extern int xbox_GammaRampGet(uint8_t *out);
 
 static volatile LONG s_fb_running;
+static HWND s_fb_hwnd;
+static void fb_toggle_fullscreen(HWND h);
 /* Set while an external presenter (xbox_SetPresentHook) owns the window: the
  * window thread keeps pumping messages but skips its StretchDIBits blit. */
 static volatile LONG s_fb_suspend;
@@ -285,10 +287,11 @@ static void fb_inject_poll(void)
         if (getenv("RECOMP_KEY_TRACE"))
             fprintf(stderr, "  [KEY] inject %s vk=0x%02X\n",
                     next[i] ? "down" : "up", i);
-        /* Same shortcut on the injection path, so an automated run can turn
-         * the frametime overlay on and off without a keyboard. */
-        if (next[i] && (i == VK_F9 || i == VK_F11))
+        /* Same shortcuts on the injection path. */
+        if (next[i] && i == VK_F9)
             xbox_OverlayToggle();
+        if (next[i] && i == VK_F11 && s_fb_hwnd)
+            fb_toggle_fullscreen(s_fb_hwnd);
     }
 }
 
@@ -309,7 +312,13 @@ static volatile unsigned char s_mouse_btn[3];   /* 0=L, 1=R, 2=M */
 static int s_mouse_x, s_mouse_y, s_mouse_have;
 static int s_mouse_capture, s_cursor_hidden;
 static int s_mouse_raw;      /* WM_INPUT deltas are authoritative when set */
-static HWND s_fb_hwnd;
+
+/* Borderless fullscreen (F11). The window keeps its GDI blit: the guest frame
+ * is stretched over the monitor rect, no swap chain or display mode change. */
+static LONG s_windowed_style;
+static RECT s_windowed_rect;
+static int  s_windowed_saved;
+static int  s_fb_fullscreen;
 
 int xbox_FramebufferMouseDelta(int *dx, int *dy)
 {
@@ -641,6 +650,48 @@ static void fb_exit_process(void)
     ExitProcess(EXIT_SUCCESS);
 }
 
+/* F11: borderless fill of the monitor the window is on, or back to the saved
+ * windowed rect. The fullscreen flag is set before SetWindowPos so the
+ * maximize guards below can tell the two states apart. */
+static void fb_toggle_fullscreen(HWND h)
+{
+    if (!s_fb_fullscreen) {
+        MONITORINFO mi;
+        HMONITOR monitor;
+        if (!s_windowed_saved) {
+            s_windowed_style = GetWindowLongA(h, GWL_STYLE);
+            if (!GetWindowRect(h, &s_windowed_rect))
+                return;
+            s_windowed_saved = 1;
+        }
+        monitor = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        mi.cbSize = sizeof(mi);
+        if (!monitor || !GetMonitorInfoA(monitor, &mi))
+            return;
+        s_fb_fullscreen = 1;
+        SetWindowLongA(h, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(h, HWND_TOP,
+                     mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOACTIVATE);
+        fprintf(stderr, "[FBWIN] fullscreen on (%ldx%ld)\n",
+                (long)(mi.rcMonitor.right - mi.rcMonitor.left),
+                (long)(mi.rcMonitor.bottom - mi.rcMonitor.top));
+    } else {
+        s_fb_fullscreen = 0;
+        SetWindowLongA(h, GWL_STYLE, s_windowed_style);
+        SetWindowPos(h, NULL,
+                     s_windowed_rect.left, s_windowed_rect.top,
+                     s_windowed_rect.right - s_windowed_rect.left,
+                     s_windowed_rect.bottom - s_windowed_rect.top,
+                     SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
+        s_windowed_saved = 0;
+        fprintf(stderr, "[FBWIN] fullscreen off\n");
+    }
+    fflush(stderr);
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -655,11 +706,13 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
         rec_event("k %x 1", (unsigned)w);
-        /* F9 (or F11): frametime overlay. Its graph and numbers are the only
-         * way to see pacing on the screen; the periodic log line carries the
-         * rest. */
-        if (w == VK_F9 || w == VK_F11) {
+        /* F9: frametime overlay. F11: borderless fullscreen. */
+        if (w == VK_F9) {
             xbox_OverlayToggle();
+            return 0;
+        }
+        if (w == VK_F11) {
+            fb_toggle_fullscreen(h);
             return 0;
         }
         if (w == VK_F12) {
@@ -849,9 +902,21 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mmi = (MINMAXINFO *)l;
         RECT r;
-        r.left = 0; r.top = 0;
-        r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
-        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, FALSE);
+        if (s_fb_fullscreen) {
+            HMONITOR monitor = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi;
+            mi.cbSize = sizeof(mi);
+            if (monitor && GetMonitorInfoA(monitor, &mi))
+                r = mi.rcMonitor;
+            else {
+                r.left = 0; r.top = 0;
+                r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
+            }
+        } else {
+            r.left = 0; r.top = 0;
+            r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
+            AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, FALSE);
+        }
         mmi->ptMaxSize.x = mmi->ptMaxTrackSize.x = r.right - r.left;
         mmi->ptMaxSize.y = mmi->ptMaxTrackSize.y = r.bottom - r.top;
         return 0;
@@ -868,7 +933,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
      * 1:1. Handled alongside the other key chords below. */
 
     case WM_SIZE:
-        if (w == SIZE_MAXIMIZED || IsZoomed(h))
+        if (!s_fb_fullscreen && (w == SIZE_MAXIMIZED || IsZoomed(h)))
             ShowWindow(h, SW_RESTORE);
         return 0;
 
@@ -877,6 +942,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
      * window back to the 1:1 framebuffer size. */
     case WM_WINDOWPOSCHANGED: {
         RECT r, want;
+        if (s_fb_fullscreen)
+            break;
         want.left = 0; want.top = 0;
         want.right = (LONG)s_fb_width; want.bottom = (LONG)s_fb_height;
         AdjustWindowRect(&want, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, FALSE);
@@ -1082,9 +1149,31 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
  * the clean frame first. */
 static void fb_blit(HDC hdc, const BITMAPINFO *bi)
 {
+    RECT client;
+    int cw = (int)s_fb_width, ch = (int)s_fb_height;
+    int dw = cw, dh = ch, dx = 0, dy = 0;
+
     xbox_OverlayComposite(s_rgb, (int)s_fb_width, (int)s_fb_height,
                           (int)s_fb_width);
-    StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+    if (s_fb_hwnd && GetClientRect(s_fb_hwnd, &client)) {
+        if (client.right > client.left && client.bottom > client.top) {
+            cw = client.right - client.left;
+            ch = client.bottom - client.top;
+            if ((int64_t)cw * (int64_t)s_fb_height
+                    <= (int64_t)ch * (int64_t)s_fb_width) {
+                dw = cw;
+                dh = (int)((int64_t)s_fb_height * cw / s_fb_width);
+            } else {
+                dh = ch;
+                dw = (int)((int64_t)s_fb_width * ch / s_fb_height);
+            }
+            dx = (cw - dw) / 2;
+            dy = (ch - dh) / 2;
+        }
+    }
+    if (dw != cw || dh != ch)
+        PatBlt(hdc, 0, 0, cw, ch, BLACKNESS);
+    StretchDIBits(hdc, dx, dy, dw, dh,
                   0, 0, (int)s_fb_width, (int)s_fb_height,
                   s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
 }

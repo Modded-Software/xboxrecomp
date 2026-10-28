@@ -56,6 +56,22 @@ static LRESULT CALLBACK vp_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == SIZE_MAXIMIZED || IsZoomed(h))
             ShowWindow(h, SW_RESTORE);
         return 0;
+    case WM_WINDOWPOSCHANGED: {
+        RECT r, want;
+        want.left = 0; want.top = 0;
+        want.right = VP_WINDOW_W; want.bottom = VP_WINDOW_H;
+        AdjustWindowRect(&want, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, FALSE);
+        GetWindowRect(h, &r);
+        if (IsZoomed(h) ||
+            (r.right - r.left) > (want.right - want.left) ||
+            (r.bottom - r.top) > (want.bottom - want.top)) {
+            ShowWindow(h, SW_RESTORE);
+            SetWindowPos(h, NULL, 0, 0,
+                         want.right - want.left, want.bottom - want.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        break;
+    }
     case WM_SYSCOMMAND:
         if ((w & 0xFFF0) == SC_MAXIMIZE)
             return 0;
